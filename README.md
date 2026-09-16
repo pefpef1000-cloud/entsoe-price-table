@@ -19,4 +19,4 @@ main `entsoe_scraper` project.
 
 ## Deployed at
 
-Fill in the Streamlit Community Cloud URL here once it's live.
+https://entsoe-price-table.streamlit.app
