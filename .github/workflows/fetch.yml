@@ -1,0 +1,38 @@
+name: Refresh prices
+
+on:
+  schedule:
+    # Every 4 hours. Day-ahead prices really only change once a day
+    # (published early afternoon CET), but running a bit more often
+    # costs nothing and means a missed publish gets picked up sooner.
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}   # lets you trigger a refresh manually from the Actions tab
+
+permissions:
+  contents: write   # needed to commit the refreshed database back to the repo
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch recent prices
+        env:
+          ENTSOE_API_KEY: ${{ secrets.ENTSOE_API_KEY }}
+        run: python fetch_recent.py
+
+      - name: Commit updated database
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add entsoe_data.db
+          git diff --cached --quiet && echo "No changes to commit." || git commit -m "Refresh prices"
+          git push

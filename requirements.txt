@@ -1,0 +1,4 @@
+entsoe-py
+pandas
+numpy
+streamlit
