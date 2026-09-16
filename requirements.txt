@@ -2,3 +2,4 @@ entsoe-py
 pandas
 numpy
 streamlit
+tzdata
