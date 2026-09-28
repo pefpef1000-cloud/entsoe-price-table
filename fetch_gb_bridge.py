@@ -193,16 +193,26 @@ def save_bridge_prices(hourly: pd.Series, conn) -> tuple[int, int]:
     return written, skipped
 
 
-def existing_gb_min_date(conn) -> date | None:
-    """Earliest GB row on record, any source - used to decide whether
-    the GAP_START historical backfill still needs to run. None if GB
-    has no rows at all yet."""
-    row = conn.execute(
-        "SELECT MIN(timestamp) FROM day_ahead_prices WHERE zone = 'GB'"
-    ).fetchone()
-    if not row or not row[0]:
-        return None
-    return pd.Timestamp(row[0]).date()
+def missing_days_in_range(conn, start: date, end: date) -> int:
+    """How many calendar days in [start, end] have no GB row at all
+    (any source). This is the correct way to detect whether the
+    GAP_START backfill still has work to do - checking only
+    MIN(timestamp) is a trap: 2020 has real ENTSO-E data, so
+    MIN(timestamp) is always 2020-01-01 regardless of whether
+    2021-2025 (the actual gap) has ever been backfilled, which meant
+    an earlier version of this check never ran the backfill at all
+    (confirmed live, run #77, 2026-09-28 - only did the normal 32-day
+    trailing window, 0 historical days attempted)."""
+    total_days = (end - start).days + 1
+    covered = conn.execute(
+        """
+        SELECT COUNT(DISTINCT substr(timestamp, 1, 10))
+        FROM day_ahead_prices
+        WHERE zone = 'GB' AND timestamp >= ? AND timestamp < ?
+        """,
+        (start.isoformat(), (end + timedelta(days=1)).isoformat()),
+    ).fetchone()[0]
+    return max(total_days - covered, 0)
 
 
 def day_already_covered(conn, d: date) -> bool:
@@ -267,23 +277,23 @@ def main() -> None:
     backfill_published = backfill_unpublished = backfill_errored = 0
     backfill_written = backfill_skipped = 0
 
-    min_date = existing_gb_min_date(conn)
-    if min_date is None or min_date > GAP_START:
-        # See module docstring's "GAP_START backfill" section. Only
-        # true while the historical gap actually exists - skipped on
-        # every run after it's been fully backfilled.
-        backfill_end = date.today() - timedelta(days=TRAILING_DAYS + 1)
-        if backfill_end >= GAP_START:
+    backfill_end = date.today() - timedelta(days=TRAILING_DAYS + 1)
+    if backfill_end >= GAP_START:
+        missing = missing_days_in_range(conn, GAP_START, backfill_end)
+        if missing > 0:
+            # See module docstring's "GAP_START backfill" section.
+            # missing_days_in_range only counts actually-empty days, so
+            # this correctly stays 0 (and this branch is skipped) once
+            # the gap is fully filled, however early 2020's real
+            # ENTSO-E data makes MIN(timestamp) look.
             backfill_dates = [
                 (GAP_START + timedelta(days=i)).isoformat()
                 for i in range((backfill_end - GAP_START).days + 1)
             ]
             print(
-                f"GB's earliest saved row is after {GAP_START.isoformat()} "
-                f"(or missing entirely) - backfilling up to {len(backfill_dates)} "
-                f"historical day(s) from {GAP_START.isoformat()} through "
-                f"{backfill_end.isoformat()} (already-covered days are skipped). "
-                "This is a one-time job and may take a while."
+                f"{missing} day(s) missing between {GAP_START.isoformat()} and "
+                f"{backfill_end.isoformat()} - backfilling (already-covered days "
+                "are skipped). This may take a while."
             )
             (
                 backfill_published,
