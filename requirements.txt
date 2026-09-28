@@ -4,3 +4,5 @@ numpy
 streamlit
 tzdata
 matplotlib
+requests
+openpyxl

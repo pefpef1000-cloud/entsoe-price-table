@@ -65,10 +65,30 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             zone TEXT NOT NULL,
             timestamp TEXT NOT NULL,
             price_eur_mwh REAL NOT NULL,
+            source TEXT NOT NULL DEFAULT 'entsoe',
             PRIMARY KEY (zone, timestamp)
         )
         """
     )
+    # Migration: added once fetch_recent_years.py/fetch_gb_bridge.py
+    # started sharing this same database and needed to tell an official
+    # ENTSO-E price apart from a provisional Nord Pool one (see those
+    # files) - a database created by an earlier version of this script
+    # won't have this column yet. Every row this script itself ever
+    # writes is ENTSO-E's own official price, so defaulting existing rows
+    # to 'entsoe' is correct, not a guess. Same migration-safe pattern
+    # (and same "duplicate column name" race handling, in case another
+    # script's ensure_tables() gets there first) as the real project's
+    # fetch_data.py.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(day_ahead_prices)")}
+    if "source" not in existing_cols:
+        try:
+            conn.execute(
+                "ALTER TABLE day_ahead_prices ADD COLUMN source TEXT NOT NULL DEFAULT 'entsoe'"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
 
 
 def main() -> None:

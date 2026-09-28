@@ -9,7 +9,7 @@ on:
   workflow_dispatch: {}   # lets you trigger a refresh manually from the Actions tab
 
 permissions:
-  contents: write   # needed to commit the refreshed database back to the repo
+  contents: write   # needed to commit the refreshed databases back to the repo
 
 jobs:
   refresh:
@@ -24,15 +24,37 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch recent prices
+      - name: Fetch today's snapshot (all zones - price_table.py)
         env:
           ENTSOE_API_KEY: ${{ secrets.ENTSOE_API_KEY }}
         run: python fetch_recent.py
 
-      - name: Commit updated database
+      # The 3 steps below feed pages/Year_comparison.py. Each one is
+      # allowed to fail without blocking the others or the commit at the
+      # end - a temporary hiccup on one feed (e.g. JAO's API being briefly
+      # down) shouldn't stop the other 2 from refreshing, or stop the
+      # already-fetched snapshot above from being committed. A failed
+      # step still shows up as a warning in the Actions log.
+      - name: Fetch full history for DE_LU / FR / GB (year_comparison.py)
+        env:
+          ENTSOE_API_KEY: ${{ secrets.ENTSOE_API_KEY }}
+        run: python fetch_recent_years.py
+        continue-on-error: true
+
+      - name: Bridge GB's price from Nord Pool N2EX (post-2021 GB + interconnectors)
+        run: python fetch_gb_bridge.py
+        continue-on-error: true
+
+      - name: Fetch JAO corridor auction prices (interconnectors)
+        env:
+          JAO_API_KEY: ${{ secrets.JAO_API_KEY }}
+        run: python fetch_jao_corridors.py
+        continue-on-error: true
+
+      - name: Commit updated databases
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add entsoe_data.db
+          git add entsoe_data.db jao_data.db
           git diff --cached --quiet && echo "No changes to commit." || git commit -m "Refresh prices"
           git push
