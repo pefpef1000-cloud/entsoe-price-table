@@ -4,12 +4,13 @@ trimmed to just GB's N2EX auction (the online year-comparison dashboard
 doesn't need any of the other Nordic/Baltic zones fetch_nordpool_bridge.py
 also bridges).
 
-Why this exists: ENTSO-E stopped publishing a GB day-ahead price on
-15 June 2021 (see fetch_recent_years.py). GB's own N2EX auction (run by
-Nord Pool) is the same real auction result, published on Nord Pool's own
+Why this exists: ENTSO-E stopped publishing a GB day-ahead price after
+2020-12-31 (confirmed live via zone_fetch_log - "no_data" every check
+since; see fetch_recent_years.py). GB's own N2EX auction (run by Nord
+Pool) is the same real auction result, published on Nord Pool's own
 public Data Portal - this is what keeps the dashboard's 3
 GB-interconnector "countries" (IFA/IFA2/ElecLink, see year_comparison.py's
-INTERCONNECTOR_ENTSOE_ZONE) fed going forward.
+INTERCONNECTOR_ENTSOE_ZONE) fed.
 
 Saves into the SAME day_ahead_prices table fetch_recent_years.py uses,
 tagged source='nordpool' - but only for an hour that doesn't already have
@@ -19,19 +20,26 @@ fetch_nordpool_bridge.py itself uses: an 'entsoe' row always wins if one
 ever exists for the same hour).
 
 Nord Pool's API only takes ONE delivery date per request (no range
-parameter - see fetch_nordpool_bridge.py's own module docstring). Rather
-than an expensive one-time backfill of GB's entire 2021-2026 history
-(thousands of individual date requests - Peter's own local system doesn't
-do this either, it only ever bridges a trailing window forward from
-whenever it started running), this fetches a trailing TRAILING_DAYS-day
-window plus tomorrow, day by day, every time it runs. Since it runs on
-the same schedule as the rest of this cloud deployment (every 4 hours -
-see .github/workflows/fetch.yml) and TRAILING_DAYS is comfortably wider
-than the gap between runs, coverage is continuous from whenever this
-script first ran onward - it just never reaches back further than that
-(same real-world gap Peter's own local database has, between the
-2021-06-15 ENTSO-E cutoff and whenever fetch_nordpool_bridge.py started
-running there - see claude/entsoe-price-table-cloud-deploy.md).
+parameter - see fetch_nordpool_bridge.py's own module docstring). Every
+run fetches a trailing TRAILING_DAYS-day window plus tomorrow, day by
+day - since TRAILING_DAYS is comfortably wider than the gap between runs
+(every 4 hours - see .github/workflows/fetch.yml), coverage stays
+continuous once this has run at least once.
+
+GAP_START backfill (added after Peter noticed IFA/IFA2/ElecLink showing
+no price for most of their history): on top of the trailing window
+above, every run also checks whether GB's earliest saved row (any
+source) is later than GAP_START (2021-01-01, the day after ENTSO-E's
+last published GB price). If so, that means the historical gap between
+GAP_START and the start of the trailing window hasn't been backfilled
+yet, so this run also walks through EVERY missing day back to
+GAP_START, one request each, before doing the normal trailing window.
+That's a one-time ~2,000-request job the first time it runs after this
+was added - after that, GB's earliest row is <= GAP_START, so this
+branch is skipped on every future run (a single cheap MIN(timestamp)
+query) and only the normal trailing window runs. Same idea as Peter's
+own one-time local backfill_gb_history.py, just self-triggering here
+instead of something Peter has to remember to run once.
 
 Run it with:
     python fetch_gb_bridge.py
@@ -65,6 +73,16 @@ HEADERS = {
 # the 4-hourly run interval, so coverage never has a gap once this has
 # run at least once.
 TRAILING_DAYS = 30
+
+# The day after ENTSO-E's last published GB day-ahead price
+# (2020-12-31, confirmed live). See module docstring's "GAP_START
+# backfill" section.
+GAP_START = date(2021, 1, 1)
+
+# Pace requests to stay polite to Nord Pool's public API - matters far
+# more during a GAP_START backfill (up to ~2,000 requests in one run)
+# than for the normal ~32-day trailing window.
+REQUEST_PAUSE_SECONDS = 0.3
 
 
 def fetch_n2ex_day_ahead(delivery_date: str) -> dict | None:
@@ -141,38 +159,96 @@ def save_bridge_prices(hourly: pd.Series, conn) -> tuple[int, int]:
     return written, skipped
 
 
+def existing_gb_min_date(conn) -> date | None:
+    """Earliest GB row on record, any source - used to decide whether
+    the GAP_START historical backfill still needs to run. None if GB
+    has no rows at all yet."""
+    row = conn.execute(
+        "SELECT MIN(timestamp) FROM day_ahead_prices WHERE zone = 'GB'"
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    return pd.Timestamp(row[0]).date()
+
+
+def fetch_and_save_range(dates: list[str], conn) -> tuple[int, int, int, int]:
+    """Fetches and saves each date in order. Returns
+    (published, unpublished, total_written, total_skipped)."""
+    published = unpublished = total_written = total_skipped = 0
+    for d in dates:
+        data = fetch_n2ex_day_ahead(d)
+        if data is not None:
+            hourly = parse_hourly(data)
+            if not hourly.empty:
+                written, skipped = save_bridge_prices(hourly, conn)
+                total_written += written
+                total_skipped += skipped
+                published += 1
+            else:
+                unpublished += 1
+        else:
+            unpublished += 1
+        time.sleep(REQUEST_PAUSE_SECONDS)
+    return published, unpublished, total_written, total_skipped
+
+
 def main() -> None:
     import sqlite3
 
     conn = sqlite3.connect(DB_PATH)
     ensure_tables(conn)
 
-    # TRAILING_DAYS back through tomorrow.
-    dates = [
+    backfill_published = backfill_unpublished = 0
+    backfill_written = backfill_skipped = 0
+
+    min_date = existing_gb_min_date(conn)
+    if min_date is None or min_date > GAP_START:
+        # See module docstring's "GAP_START backfill" section. Only
+        # true while the historical gap actually exists - skipped on
+        # every run after the first one that completes it.
+        backfill_end = date.today() - timedelta(days=TRAILING_DAYS + 1)
+        if backfill_end >= GAP_START:
+            backfill_dates = [
+                (GAP_START + timedelta(days=i)).isoformat()
+                for i in range((backfill_end - GAP_START).days + 1)
+            ]
+            print(
+                f"GB's earliest saved row is after {GAP_START.isoformat()} "
+                f"(or missing entirely) - backfilling {len(backfill_dates)} "
+                f"historical day(s) from {GAP_START.isoformat()} through "
+                f"{backfill_end.isoformat()}. This is a one-time job and will "
+                "take a while (~15-25 min)."
+            )
+            (
+                backfill_published,
+                backfill_unpublished,
+                backfill_written,
+                backfill_skipped,
+            ) = fetch_and_save_range(backfill_dates, conn)
+            print(
+                f"Historical backfill done: {backfill_published} day(s) published, "
+                f"{backfill_unpublished} had no data, {backfill_written} hour(s) written."
+            )
+
+    # TRAILING_DAYS back through tomorrow - the normal, fast, every-run window.
+    trailing_dates = [
         (date.today() - timedelta(days=i)).isoformat()
         for i in range(TRAILING_DAYS, -2, -1)
     ]
-
-    total_written = total_skipped = 0
-    published = unpublished = 0
-    for d in dates:
-        data = fetch_n2ex_day_ahead(d)
-        if data is None:
-            unpublished += 1
-            time.sleep(0.3)
-            continue
-        hourly = parse_hourly(data)
-        if not hourly.empty:
-            written, skipped = save_bridge_prices(hourly, conn)
-            total_written += written
-            total_skipped += skipped
-            published += 1
-        time.sleep(0.3)
+    trailing_published, trailing_unpublished, trailing_written, trailing_skipped = (
+        fetch_and_save_range(trailing_dates, conn)
+    )
 
     rebuild_aggregate_tables(conn)
     conn.close()
+
+    total_published = backfill_published + trailing_published
+    total_unpublished = backfill_unpublished + trailing_unpublished
+    total_written = backfill_written + trailing_written
+    total_skipped = backfill_skipped + trailing_skipped
     print(
-        f"N2EX: {published} day(s) published and saved, {unpublished} not published/no data. "
+        f"N2EX: {total_published} day(s) published and saved, "
+        f"{total_unpublished} not published/no data. "
         f"{total_written} hour(s) written, {total_skipped} left untouched "
         "(already had an official ENTSO-E price)."
     )
