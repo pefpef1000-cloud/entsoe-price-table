@@ -29,7 +29,7 @@ jobs:
           ENTSOE_API_KEY: ${{ secrets.ENTSOE_API_KEY }}
         run: python fetch_recent.py
 
-      # The 3 steps below feed pages/Year_comparison.py. Each one is
+      # The 4 steps below feed pages/Year_comparison.py. Each one is
       # allowed to fail without blocking the others or the commit at the
       # end - a temporary hiccup on one feed (e.g. JAO's API being briefly
       # down) shouldn't stop the other 2 from refreshing, or stop the
@@ -41,8 +41,15 @@ jobs:
         run: python fetch_recent_years.py
         continue-on-error: true
 
-      - name: Bridge GB's price from Nord Pool N2EX (post-2021 GB + interconnectors)
+      - name: Bridge GB's recent price from Nord Pool N2EX (last ~3 weeks)
         run: python fetch_gb_bridge.py
+        continue-on-error: true
+
+      # Fills every GB day that has no price yet (2021 up to the start of
+      # the Nord Pool window) from Elexon's public API. Must run AFTER the
+      # Nord Pool step, so days Nord Pool covers keep their real N2EX price.
+      - name: Fill GB's history from Elexon APX (2021 up to the Nord Pool window)
+        run: python fetch_gb_apx.py
         continue-on-error: true
 
       - name: Fetch JAO corridor auction prices (interconnectors)

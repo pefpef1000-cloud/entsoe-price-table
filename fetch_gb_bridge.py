@@ -10,52 +10,39 @@ since; see fetch_recent_years.py). GB's own N2EX auction (run by Nord
 Pool) is the same real auction result, published on Nord Pool's own
 public Data Portal - this is what keeps the dashboard's 3
 GB-interconnector "countries" (IFA/IFA2/ElecLink, see year_comparison.py's
-INTERCONNECTOR_ENTSOE_ZONE) fed.
+INTERCONNECTOR_ENTSOE_ZONE) fed with the REAL N2EX price for recent days.
 
 Saves into the SAME day_ahead_prices table fetch_recent_years.py uses,
 tagged source='nordpool' - but only for an hour that doesn't already have
 an official 'entsoe' value (never happens for GB post-cutoff in practice,
 but this is the exact same safe ON CONFLICT precedence
 fetch_nordpool_bridge.py itself uses: an 'entsoe' row always wins if one
-ever exists for the same hour).
+ever exists for the same hour). A real N2EX price also replaces an
+'elexon_apx' stand-in for the same hour (see fetch_gb_apx.py).
+
+THIS SCRIPT ONLY COVERS RECENT DAYS - by design. Nord Pool's free Data
+Portal API refuses dates older than roughly a month or two with HTTP 401
+("Unauthorized"), from any IP and however slowly it is asked. Tested live
+2026-09-29: yesterday and 30 days ago -> HTTP 200; 90 days, 180 days,
+1 year ago and 2021-01-01 -> HTTP 401. (An earlier version of this file
+tried to backfill 2021 -> now from here; every one of those requests was
+refused, and the retries cost about an hour per workflow run.) The history
+from 2021 up to a few weeks ago is filled by fetch_gb_apx.py instead,
+from Elexon's public API.
 
 Nord Pool's API only takes ONE delivery date per request (no range
 parameter - see fetch_nordpool_bridge.py's own module docstring). Every
-run fetches a trailing TRAILING_DAYS-day window plus tomorrow, day by
-day - since TRAILING_DAYS is comfortably wider than the gap between runs
-(every 4 hours - see .github/workflows/fetch.yml), coverage stays
-continuous once this has run at least once.
-
-GAP_START backfill (added after Peter noticed IFA/IFA2/ElecLink showing
-no price for most of their history): on top of the trailing window
-above, every run also checks whether GB's earliest saved row (any
-source) is later than GAP_START (2021-01-01, the day after ENTSO-E's
-last published GB price). If so, that means the historical gap between
-GAP_START and the start of the trailing window hasn't been backfilled
-yet, so this run also walks through EVERY missing day back to
-GAP_START, one request each, before doing the normal trailing window.
-Each day already covered (any source) is skipped with a cheap check
-rather than re-fetched, so an interrupted run (job timeout, a bad
-deploy) resumes cheaply next time instead of starting over. Once fully
-backfilled, GB's earliest row is <= GAP_START, so this branch is
-skipped on every future run (a single MIN(timestamp) query) and only
-the normal trailing window runs.
-
-Rate limiting: Nord Pool's public API returned HTTP 401 Unauthorized
-after roughly 50 requests in quick succession during a real backfill
-run (2026-09-28) - not documented anywhere, discovered live. Treated
-like a temporary block: on 401 or 429, this waits and retries the SAME
-day (30s, then 60s, 120s, 240s) before giving up on that one day and
-moving on; after 3 straight days fail even after retrying, it also
-pauses an extra minute, since that's a sign the block is still active.
-A day that still fails after all of that is simply picked up on a
-later scheduled run (see "already covered" skip above - everything
-already fetched stays fetched).
+run fetches a trailing TRAILING_DAYS-day window plus tomorrow, day by day,
+newest day first - so if Nord Pool ever starts refusing the oldest days of
+the window, the days that matter most have already been fetched. Since
+TRAILING_DAYS is comfortably wider than the gap between runs (every 4
+hours - see .github/workflows/fetch.yml), coverage stays continuous.
 
 Run it with:
     python fetch_gb_bridge.py
 """
 
+import sqlite3
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -81,42 +68,29 @@ HEADERS = {
 }
 
 # How far back to (re)fetch every run - see module docstring. Wider than
-# the 4-hourly run interval, so coverage never has a gap once this has
-# run at least once.
-TRAILING_DAYS = 30
+# the 4-hourly run interval, and well inside the ~month-or-two of history
+# Nord Pool's free API serves.
+TRAILING_DAYS = 21
 
-# The day after ENTSO-E's last published GB day-ahead price
-# (2020-12-31, confirmed live). See module docstring's "GAP_START
-# backfill" section.
-GAP_START = date(2021, 1, 1)
-
-# Pace requests to stay polite to Nord Pool's public API - matters far
-# more during a GAP_START backfill (up to ~2,000 requests in one run)
-# than for the normal ~32-day trailing window. See "Rate limiting" in
-# the module docstring for why this isn't faster.
-REQUEST_PAUSE_SECONDS = 1.5
-RETRY_BACKOFFS = [30, 60, 120, 240]  # seconds, on 401/429, same day
-COOLDOWN_AFTER_CONSECUTIVE_FAILS = 3
-COOLDOWN_SECONDS = 60
-# If even a cooldown doesn't clear it, stop this run's backfill entirely
-# rather than burning the whole job on a sustained block - the next
-# scheduled run (every 4 hours) picks up where this left off (see
-# day_already_covered), so nothing is lost, just deferred.
-ABORT_AFTER_CONSECUTIVE_FAILS = 7
+REQUEST_PAUSE_SECONDS = 0.5
+# On HTTP 401/429 wait and retry the same day a couple of times (a genuine
+# short block clears quickly) - but not for long: a day Nord Pool simply
+# refuses never becomes available, so don't sit and wait for it.
+RETRY_BACKOFFS = [20, 60]  # seconds
+ABORT_AFTER_CONSECUTIVE_FAILS = 3
 
 
 def fetch_n2ex_day_ahead(delivery_date: str) -> dict | None:
     """Same idea as fetch_nordpool_bridge.py's own fetch_n2ex_day_ahead,
-    plus retry-with-backoff on 401/429 - see module docstring's "Rate
-    limiting" section."""
+    plus a short retry on 401/429. None = "not published (yet)" (HTTP 204
+    or an empty 200 body, e.g. tomorrow's prices before ~13:00 CET)."""
     params = {
         "date": delivery_date,
         "market": N2EX_MARKET,
         "deliveryArea": N2EX_AREA,
         "currency": CURRENCY,
     }
-    attempts = len(RETRY_BACKOFFS) + 1
-    for attempt in range(attempts):
+    for attempt in range(len(RETRY_BACKOFFS) + 1):
         resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=30)
 
         if resp.status_code == 204 or (resp.status_code == 200 and not resp.text.strip()):
@@ -125,8 +99,8 @@ def fetch_n2ex_day_ahead(delivery_date: str) -> dict | None:
         if resp.status_code in (401, 429):
             if attempt < len(RETRY_BACKOFFS):
                 wait = RETRY_BACKOFFS[attempt]
-                print(f"    rate-limited (HTTP {resp.status_code}) on {delivery_date} - "
-                      f"waiting {wait}s before retry {attempt + 1}/{len(RETRY_BACKOFFS)}...")
+                print(f"    HTTP {resp.status_code} on {delivery_date} - waiting {wait}s "
+                      f"before retry {attempt + 1}/{len(RETRY_BACKOFFS)}...")
                 time.sleep(wait)
                 continue
             raise RuntimeError(
@@ -193,46 +167,12 @@ def save_bridge_prices(hourly: pd.Series, conn) -> tuple[int, int]:
     return written, skipped
 
 
-def missing_days_in_range(conn, start: date, end: date) -> int:
-    """How many calendar days in [start, end] have no GB row at all
-    (any source). This is the correct way to detect whether the
-    GAP_START backfill still has work to do - checking only
-    MIN(timestamp) is a trap: 2020 has real ENTSO-E data, so
-    MIN(timestamp) is always 2020-01-01 regardless of whether
-    2021-2025 (the actual gap) has ever been backfilled, which meant
-    an earlier version of this check never ran the backfill at all
-    (confirmed live, run #77, 2026-09-28 - only did the normal 32-day
-    trailing window, 0 historical days attempted)."""
-    total_days = (end - start).days + 1
-    covered = conn.execute(
-        """
-        SELECT COUNT(DISTINCT substr(timestamp, 1, 10))
-        FROM day_ahead_prices
-        WHERE zone = 'GB' AND timestamp >= ? AND timestamp < ?
-        """,
-        (start.isoformat(), (end + timedelta(days=1)).isoformat()),
-    ).fetchone()[0]
-    return max(total_days - covered, 0)
-
-
-def day_already_covered(conn, d: date) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM day_ahead_prices WHERE zone='GB' AND timestamp LIKE ? LIMIT 1",
-        (d.isoformat() + "%",),
-    ).fetchone()
-    return row is not None
-
-
-def fetch_and_save_range(dates: list[str], conn, skip_covered: bool = False) -> tuple[int, int, int, int, int]:
-    """Fetches and saves each date in order. Returns
+def fetch_and_save_range(dates: list[str], conn) -> tuple[int, int, int, int, int]:
+    """Fetches and saves each date in the order given. Returns
     (published, unpublished, total_written, total_skipped, errored)."""
     published = unpublished = total_written = total_skipped = errored = 0
     consecutive_fails = 0
     for d_str in dates:
-        d = date.fromisoformat(d_str)
-        if skip_covered and day_already_covered(conn, d):
-            continue
-
         try:
             data = fetch_n2ex_day_ahead(d_str)
             consecutive_fails = 0
@@ -241,15 +181,9 @@ def fetch_and_save_range(dates: list[str], conn, skip_covered: bool = False) -> 
             errored += 1
             consecutive_fails += 1
             if consecutive_fails >= ABORT_AFTER_CONSECUTIVE_FAILS:
-                print(f"    {consecutive_fails} day(s) in a row failed even after "
-                      "cooldowns - stopping this run's backfill here. The next "
-                      "scheduled run picks up from here (already-covered days are "
-                      "skipped).")
+                print(f"    {consecutive_fails} day(s) in a row failed - stopping here. "
+                      "The next scheduled run tries again.")
                 break
-            if consecutive_fails >= COOLDOWN_AFTER_CONSECUTIVE_FAILS:
-                print(f"    {consecutive_fails} day(s) in a row failed - cooling down "
-                      f"{COOLDOWN_SECONDS}s before continuing...")
-                time.sleep(COOLDOWN_SECONDS)
             time.sleep(REQUEST_PAUSE_SECONDS)
             continue
 
@@ -269,71 +203,23 @@ def fetch_and_save_range(dates: list[str], conn, skip_covered: bool = False) -> 
 
 
 def main() -> None:
-    import sqlite3
-
     conn = sqlite3.connect(DB_PATH)
     ensure_tables(conn)
 
-    backfill_published = backfill_unpublished = backfill_errored = 0
-    backfill_written = backfill_skipped = 0
-
-    backfill_end = date.today() - timedelta(days=TRAILING_DAYS + 1)
-    if backfill_end >= GAP_START:
-        missing = missing_days_in_range(conn, GAP_START, backfill_end)
-        if missing > 0:
-            # See module docstring's "GAP_START backfill" section.
-            # missing_days_in_range only counts actually-empty days, so
-            # this correctly stays 0 (and this branch is skipped) once
-            # the gap is fully filled, however early 2020's real
-            # ENTSO-E data makes MIN(timestamp) look.
-            backfill_dates = [
-                (GAP_START + timedelta(days=i)).isoformat()
-                for i in range((backfill_end - GAP_START).days + 1)
-            ]
-            print(
-                f"{missing} day(s) missing between {GAP_START.isoformat()} and "
-                f"{backfill_end.isoformat()} - backfilling (already-covered days "
-                "are skipped). This may take a while."
-            )
-            (
-                backfill_published,
-                backfill_unpublished,
-                backfill_written,
-                backfill_skipped,
-                backfill_errored,
-            ) = fetch_and_save_range(backfill_dates, conn, skip_covered=True)
-            print(
-                f"Historical backfill this run: {backfill_published} day(s) published, "
-                f"{backfill_unpublished} had no data, {backfill_errored} errored, "
-                f"{backfill_written} hour(s) written. Any errored days are picked up "
-                "on a future run."
-            )
-
-    # TRAILING_DAYS back through tomorrow - the normal, fast, every-run window.
-    trailing_dates = [
+    # Tomorrow first, then today, yesterday ... back to TRAILING_DAYS ago.
+    dates = [
         (date.today() - timedelta(days=i)).isoformat()
-        for i in range(TRAILING_DAYS, -2, -1)
+        for i in range(-1, TRAILING_DAYS + 1)
     ]
-    (
-        trailing_published,
-        trailing_unpublished,
-        trailing_written,
-        trailing_skipped,
-        trailing_errored,
-    ) = fetch_and_save_range(trailing_dates, conn, skip_covered=False)
+    published, unpublished, written, skipped, errored = fetch_and_save_range(dates, conn)
 
     rebuild_aggregate_tables(conn)
     conn.close()
 
-    total_published = backfill_published + trailing_published
-    total_unpublished = backfill_unpublished + trailing_unpublished
-    total_written = backfill_written + trailing_written
-    total_skipped = backfill_skipped + trailing_skipped
-    total_errored = backfill_errored + trailing_errored
     print(
-        f"N2EX: {total_published} day(s) published and saved, "
-        f"{total_unpublished} not published/no data, {total_errored} errored. "
-        f"{total_written} hour(s) written, {total_skipped} left untouched "
+        f"N2EX: {published} day(s) published and saved, "
+        f"{unpublished} not published/no data, {errored} errored. "
+        f"{written} hour(s) written, {skipped} left untouched "
         "(already had an official ENTSO-E price)."
     )
 

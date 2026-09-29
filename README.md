@@ -23,8 +23,16 @@ phone), no VPN or Tailscale needed.
   project's `fetch_data.py`) - only the very first run does the full
   backfill.
 - `fetch_gb_bridge.py` - bridges GB's price from Nord Pool's N2EX auction
-  for the period ENTSO-E doesn't cover (after 15 June 2021) - a trailing
-  30-day window, refreshed every run.
+  for the period ENTSO-E doesn't cover (ENTSO-E has published no GB price
+  since 31 Dec 2020). Recent days only - a trailing 21-day window,
+  refreshed every run. Nord Pool's free API refuses anything older than
+  roughly a month or two (HTTP 401), so it can't do the history.
+- `fetch_gb_apx.py` - fills GB's history from 1 Jan 2021 up to the start of
+  the Nord Pool window, from Elexon's free public API (APX market index,
+  converted GBP -> EUR with ECB daily rates). Stored as `source='elexon_apx'`
+  - a close proxy for N2EX, not the N2EX auction itself; every run prints
+  how far APX is from the real N2EX price over the last 28 days. Only
+  fetches days that have no GB price yet, so most runs do nothing.
 - `fetch_jao_corridors.py` - JAO corridor auction prices for the 8
   corridors the interconnector tables need (DE-FR/FR-DE plus the 3
   GB-interconnector corridor pairs), Monthly horizon only.
@@ -44,6 +52,7 @@ comfortably under GitHub's 100MB per-file limit.
     python fetch_recent.py
     python fetch_recent_years.py
     python fetch_gb_bridge.py
+    python fetch_gb_apx.py
     python fetch_jao_corridors.py
 
 ## GitHub Actions secrets this workflow needs
