@@ -35,13 +35,27 @@ IMPORTANT - it is a PROXY, not the N2EX auction itself:
     auction clearing price.
 Rows are tagged source='elexon_apx' so they can always be told apart. Two
 honesty checks print how far APX is from a real reference: fill_gaps()
-compares APX with each N2EX price it replaces, and compare_with_entsoe()
-(local backfill_gb_apx.py runs it) compares APX with ENTSO-E's official
-2020 GB prices hour by hour - and shows whether those ENTSO-E numbers are
-in GBP or EUR.
+compares APX with each N2EX price it replaces, and fix_entsoe_gb_pounds()
+compares APX with ENTSO-E's official 2020 GB prices hour by hour.
+
+THE 2020 ROWS WERE POUNDS
+-------------------------
+Confirmed 2026-09-29 by asking ENTSO-E directly: its GB day-ahead prices are
+quoted in GBP (NL, as a control, in EUR). Nothing converted them on the way
+in, so the ENTSO-E GB rows (2020) sat in the price_eur_mwh column as pounds -
+roughly 11% too low in euros. fix_entsoe_gb_pounds() repairs that ONCE:
+  * every hour APX has for those days becomes an APX price in euros (the same
+    source as 2021 onward - one consistent GB series);
+  * any hour APX has no price for keeps its ENTSO-E price, converted GBP ->
+    EUR with the same ECB daily rate, tagged source='entsoe_converted';
+  * the original pound values are first copied to the table
+    gb_entsoe_gbp_original, so nothing is lost;
+  * it writes all-or-nothing (a failed download changes nothing) and is a
+    no-op once no raw 'entsoe' GB rows are left.
 
 What it does
 ------------
+0. (Once) converts the 2020 ENTSO-E GB rows from pounds, as described above.
 1. Finds every CET day between GAP_START and yesterday that still needs APX:
    no/incomplete GB price, or N2EX stand-in rows (see days_needing_apx).
 2. Fetches those days from Elexon in chunks (the API rejects requests that
@@ -86,6 +100,10 @@ ECB_SDMX_URL = "https://data-api.ecb.europa.eu/service/data/EXR/D.GBP.EUR.SP00.A
 FX_WINDOW_DAYS = 120
 
 SOURCE_TAG = "elexon_apx"
+# ENTSO-E's own GB price (originally in pounds) after conversion to euros - only
+# for hours APX has no price for. See fix_entsoe_gb_pounds().
+ENTSOE_CONVERTED_TAG = "entsoe_converted"
+BACKUP_TABLE = "gb_entsoe_gbp_original"
 
 # The day after ENTSO-E's last published GB day-ahead price.
 GAP_START = date(2021, 1, 1)
@@ -478,60 +496,94 @@ def fill_gaps(conn: sqlite3.Connection, first: date = GAP_START, last: date | No
     return rows_written
 
 
-def compare_with_entsoe(conn: sqlite3.Connection, year: int = 2020) -> None:
-    """Compare APX with ENTSO-E's official GB prices for `year`, hour by hour,
-    in BOTH currencies. Two questions at once: how close is APX to an
-    official GB day-ahead price, and are the GB numbers ENTSO-E gave us
-    (stored in a column called price_eur_mwh) really in EUR? ENTSO-E quotes
-    GB in pounds, and nothing converts them on the way in, so they may be
-    GBP. Informational only - writes nothing. Takes ~1 minute (about 75
-    Elexon requests for a year)."""
+def fix_entsoe_gb_pounds(conn: sqlite3.Connection) -> int:
+    """One-off (then a no-op) repair of the ENTSO-E GB rows, which are in
+    POUNDS although they sit in the price_eur_mwh column - see the module
+    docstring. Returns how many rows were rewritten: 0 means nothing to do,
+    or that a download failed and NOTHING was changed."""
     rows = conn.execute(
         "SELECT timestamp, price_eur_mwh FROM day_ahead_prices "
-        "WHERE zone = 'GB' AND source = 'entsoe' AND timestamp >= ? AND timestamp < ?",
-        (f"{year}-01-01", f"{year + 1}-01-01"),
+        "WHERE zone = 'GB' AND source = 'entsoe' ORDER BY timestamp"
     ).fetchall()
-    if len(rows) < 24 * 30:
-        print(f"APX vs ENTSO-E {year}: only {len(rows)} ENTSO-E GB hour(s) stored - too few to compare.")
-        return
-    entsoe = pd.Series({ts: price for ts, price in rows}, dtype=float)
+    if not rows:
+        print("GB pounds fix: no raw ENTSO-E GB rows left - nothing to do.")
+        return 0
 
-    first, last = date(year, 1, 1), date(year, 12, 31)
-    fx = fetch_gbp_per_eur(first, last)
-    records: list[dict] = []
-    for c_first, c_last in chunk_days([first + timedelta(days=i) for i in range((last - first).days + 1)]):
-        records.extend(fetch_chunk_with_fallback(c_first, c_last))
-        time.sleep(REQUEST_PAUSE_SECONDS)
-    gbp = records_to_hourly_gbp(records)
-    if gbp.empty:
-        print(f"APX vs ENTSO-E {year}: Elexon returned no APX data for {year}.")
-        return
-    eur = hourly_gbp_to_eur_cet(gbp, fx)
-    apx = pd.DataFrame(
-        {"apx_eur": eur.to_numpy(), "apx_gbp": np.round(gbp.to_numpy(), 2)},
-        index=[ts.isoformat() for ts in eur.index],
+    days = sorted({date.fromisoformat(ts[:10]) for ts, _ in rows})
+    chunks = chunk_days(days)
+    wanted = set(days)
+    print(f"GB pounds fix: {len(rows)} ENTSO-E GB hour(s), {days[0]} to {days[-1]}, are in pounds - "
+          f"fetching APX for those days ({len(chunks)} chunk(s) from Elexon)...")
+
+    # Everything is downloaded first; the database is only touched afterwards,
+    # so a failure part-way leaves it exactly as it was.
+    try:
+        fx = fetch_gbp_per_eur(days[0], days[-1])
+        parts = []
+        for i, (c_first, c_last) in enumerate(chunks, start=1):
+            records = fetch_chunk_with_fallback(c_first, c_last)
+            hourly = hourly_gbp_to_eur_cet(records_to_hourly_gbp(records), fx)
+            keep = np.array(
+                [c_first <= ts.date() <= c_last and ts.date() in wanted for ts in hourly.index],
+                dtype=bool,
+            )
+            parts.append(hourly[keep])
+            if i % 20 == 0 or i == len(chunks):
+                print(f"  [{i}/{len(chunks)}] up to {c_last}")
+            time.sleep(REQUEST_PAUSE_SECONDS)
+    except FetchError as e:
+        print(f"  ERROR - {e}")
+        print("GB pounds fix: NOTHING was changed. Run it again later.")
+        return 0
+
+    apx = pd.concat(parts) if parts else pd.Series(dtype=float)
+    apx = apx[~apx.index.duplicated(keep="last")]
+    apx_by_ts = {ts.isoformat(): float(p) for ts, p in apx.items() if pd.notna(p)}
+
+    # ENTSO-E pounds -> euros, day by day, with the same ECB rate the APX
+    # conversion uses.
+    day_index = pd.DatetimeIndex([pd.Timestamp(ts[:10]) for ts, _ in rows])
+    rate = fx.reindex(day_index, method="ffill").to_numpy()
+    if not np.isfinite(rate).all():
+        print("  ERROR - a GBP/EUR rate is missing for some day")
+        print("GB pounds fix: NOTHING was changed. Run it again later.")
+        return 0
+    converted = np.round(np.array([p for _, p in rows], dtype=float) / rate, 2)
+
+    updates = []  # (price in EUR, new source tag, timestamp)
+    n_apx = n_converted = 0
+    for (ts, _), eur in zip(rows, converted):
+        if ts in apx_by_ts:
+            updates.append((apx_by_ts[ts], SOURCE_TAG, ts))
+            n_apx += 1
+        else:
+            updates.append((float(eur), ENTSOE_CONVERTED_TAG, ts))
+            n_converted += 1
+
+    both = pd.DataFrame({
+        "ref": pd.Series(converted, index=[ts for ts, _ in rows]),
+        "apx": pd.Series(apx_by_ts, dtype=float),
+    }).dropna()
+    if len(both) >= 24:
+        _print_comparison("APX vs ENTSO-E (pounds converted to euros)", "ENTSO-E", both)
+
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {BACKUP_TABLE} "
+        "(timestamp TEXT PRIMARY KEY, price_gbp_mwh REAL NOT NULL)"
     )
-    both = pd.DataFrame({"ref": entsoe}).join(apx, how="inner").dropna()
-    if len(both) < 24 * 30:
-        print(f"APX vs ENTSO-E {year}: only {len(both)} overlapping hours - too few to compare.")
-        return
-
-    print(f"APX vs ENTSO-E {year}, {len(both)} overlapping hours:")
-    mean_ref = both["ref"].mean()
-    print(f"  mean ENTSO-E GB (as stored) {mean_ref:.2f}; mean APX in EUR {both['apx_eur'].mean():.2f}; "
-          f"mean APX in GBP {both['apx_gbp'].mean():.2f}")
-    results = {}
-    for label, column in (("EUR", "apx_eur"), ("GBP", "apx_gbp")):
-        gap = (both[column] - both["ref"]).abs()
-        results[label] = gap.mean()
-        print(f"  APX in {label} vs stored ENTSO-E: typical hourly gap {gap.mean():.2f}, "
-              f"worst {gap.max():.2f}, correlation {both[column].corr(both['ref']):.3f}")
-    if results["GBP"] < 0.7 * results["EUR"]:
-        print("  -> the stored ENTSO-E GB numbers match APX in GBP: they look like POUNDS, not euros.")
-    elif results["EUR"] < 0.7 * results["GBP"]:
-        print("  -> the stored ENTSO-E GB numbers match APX in EUR: they look like euros.")
-    else:
-        print("  -> can't tell from this whether the stored ENTSO-E GB numbers are GBP or EUR.")
+    with conn:  # one transaction: backup + rewrite together, or neither
+        conn.executemany(
+            f"INSERT OR IGNORE INTO {BACKUP_TABLE} (timestamp, price_gbp_mwh) VALUES (?, ?)", rows
+        )
+        conn.executemany(
+            "UPDATE day_ahead_prices SET price_eur_mwh = ?, source = ? "
+            "WHERE zone = 'GB' AND timestamp = ? AND source = 'entsoe'",
+            updates,
+        )
+    print(f"GB pounds fix done: {n_apx} hour(s) replaced by APX (euros); {n_converted} hour(s) APX has "
+          f"no price for kept from ENTSO-E, converted pounds -> euros (source '{ENTSOE_CONVERTED_TAG}'). "
+          f"The original pound values are saved in the table {BACKUP_TABLE}.")
+    return len(updates)
 
 
 def main() -> None:
@@ -542,8 +594,9 @@ def main() -> None:
 
     conn = sqlite3.connect(Path(__file__).parent / "entsoe_data.db", timeout=30)
     ensure_tables(conn)
+    changed = fix_entsoe_gb_pounds(conn)
     written = fill_gaps(conn)
-    if written:
+    if changed or written:
         rebuild_aggregate_tables(conn)
     conn.close()
 

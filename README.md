@@ -28,7 +28,12 @@ phone), no VPN or Tailscale needed.
   complete day - one consistent source, so years are like-for-like on the
   year-comparison page. Stored as `source='elexon_apx'`: a close proxy for
   the N2EX auction, not the N2EX auction itself. Finished days are not
-  fetched again, so most runs do almost nothing.
+  fetched again, so most runs do almost nothing. Also fixes 2020: ENTSO-E
+  quotes GB in POUNDS, and those rows had been stored as if they were euros.
+  Once (then it does nothing), every 2020 hour APX has a price for becomes
+  the APX price in euros, and any other hour is converted pounds -> euros
+  (`source='entsoe_converted'`). The original pound values are kept in the
+  table `gb_entsoe_gbp_original`.
 - `fetch_gb_bridge.py` - Nord Pool's N2EX auction for the last ~3 weeks plus
   tomorrow. Only a provisional price (what the price table shows for
   today/tomorrow, and a fallback for an hour APX has no trades in): once a
