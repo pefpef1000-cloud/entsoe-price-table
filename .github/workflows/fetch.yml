@@ -11,6 +11,12 @@ on:
 permissions:
   contents: write   # needed to commit the refreshed databases back to the repo
 
+# Never two runs at once (a manual run and a scheduled one would each try to
+# commit the databases). A run that is already going finishes; the next waits.
+concurrency:
+  group: refresh-prices
+  cancel-in-progress: false
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
@@ -66,4 +72,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add entsoe_data.db jao_data.db
           git diff --cached --quiet && echo "No changes to commit." || git commit -m "Refresh prices"
-          git push
+          # If someone pushed code while this run was going, a plain "git push"
+          # is refused and the whole run's data is thrown away (run #82 on
+          # 2026-09-29 was lost that way) - so catch up first.
+          git pull --rebase
+          git push || { git pull --rebase && git push; }
