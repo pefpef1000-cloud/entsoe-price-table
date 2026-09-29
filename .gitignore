@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 .streamlit/secrets.toml
+
+# SQLite side-files (created whenever a tool merely opens the database) - never commit
+*.db-wal
+*.db-shm
+*.db-journal

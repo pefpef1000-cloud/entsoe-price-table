@@ -22,6 +22,14 @@ phone), no VPN or Tailscale needed.
   and GB, for `pages/Year_comparison.py`. Incremental (like the real
   project's `fetch_data.py`) - only the very first run does the full
   backfill.
+- `fetch_nordpool_zones.py` - Nord Pool's own day-ahead prices for tomorrow,
+  today and the last 4 days, for every zone except GB (cloud twin of the
+  local `fetch_nordpool_bridge.py`). Two reasons: SYS (Nordic system price)
+  and TEL exist only at Nord Pool, so the price table can only show those
+  columns (and its "minus SYS" view) with this step; and Nord Pool publishes
+  tomorrow's prices a little before ENTSO-E, so they show up here first.
+  Saved as `source='nordpool'`, never over an official ENTSO-E price - the
+  next ENTSO-E snapshot replaces the stand-ins (SYS and TEL stay).
 - `fetch_gb_apx.py` - GB's price from 1 Jan 2021 onwards (ENTSO-E has
   published no GB price since 31 Dec 2020). Uses Elexon's free public API
   (APX market index), converted GBP -> EUR with ECB daily rates, for EVERY
