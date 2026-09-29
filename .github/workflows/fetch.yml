@@ -41,14 +41,15 @@ jobs:
         run: python fetch_recent_years.py
         continue-on-error: true
 
-      - name: Bridge GB's recent price from Nord Pool N2EX (last ~3 weeks)
+      - name: Bridge GB's provisional price from Nord Pool N2EX (recent days + tomorrow)
         run: python fetch_gb_bridge.py
         continue-on-error: true
 
-      # Fills every GB day that has no price yet (2021 up to the start of
-      # the Nord Pool window) from Elexon's public API. Must run AFTER the
-      # Nord Pool step, so days Nord Pool covers keep their real N2EX price.
-      - name: Fill GB's history from Elexon APX (2021 up to the Nord Pool window)
+      # GB's price series proper: Elexon's APX index for every complete day
+      # from 2021 (one consistent source, so years are like-for-like). Runs
+      # AFTER the Nord Pool step because it replaces that step's provisional
+      # N2EX rows once a day is complete.
+      - name: GB price from Elexon APX (2021 to yesterday, replaces provisional N2EX)
         run: python fetch_gb_apx.py
         continue-on-error: true
 

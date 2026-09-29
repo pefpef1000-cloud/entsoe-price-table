@@ -1,6 +1,6 @@
 """
-fetch_gb_apx.py - fills GB's day-ahead price history (2021 -> now) from
-Elexon's public API, for every day Nord Pool's own free API won't serve.
+fetch_gb_apx.py - GB's day-ahead price, one consistent source from 2021 on:
+Elexon's public APX market index, converted to EUR.
 
 Why this exists
 ---------------
@@ -10,29 +10,40 @@ N2EX auction, but Nord Pool's free Data Portal API only serves roughly the
 LAST MONTH OR TWO of dates - anything older is refused with HTTP 401 from
 any IP, however slowly it's asked (tested 2026-09-29: yesterday and 30 days
 ago HTTP 200; 90 days, 180 days, 1 year and 2021-01-01 all HTTP 401). So
-that script can never fill 2021 -> a few weeks ago.
+N2EX can never provide the history.
 
 Elexon (the GB balancing/settlement body) publishes "Market Index Data"
-(MID) on a free public API with no key and no date restriction, back to at
-least 2021. Two providers report into it: N2EXMIDP (Nord Pool's N2EX) and
-APXMIDP (EPEX Spot's UK market, formerly APX). Elexon's N2EXMIDP series is
-all zeros (price 0, volume 0 - no data), but APXMIDP is fully populated.
+(MID) on a free public API with no key and no date restriction (checked
+back to 2020). Two providers report into it: N2EXMIDP (Nord Pool's N2EX)
+and APXMIDP (EPEX Spot's UK market, formerly APX). Elexon's N2EXMIDP series
+is all zeros (price 0, volume 0 - no data), but APXMIDP is fully populated.
 That is what this script uses.
+
+ONE SOURCE, NOT A MIX. The year-comparison dashboard compares the same GB
+prices year against year, so they must be like-for-like. APX is therefore
+used for EVERY complete day from GAP_START (2021-01-01) to yesterday -
+including the recent weeks where N2EX is also available: the N2EX rows
+fetch_gb_bridge.py saved for those days are replaced. N2EX stays only as
+the provisional price for today and tomorrow (APX has nothing for those
+yet), and as a fallback for any single hour APX has no trades in; once a day
+is complete APX replaces it. Only 'entsoe' rows are never overwritten.
 
 IMPORTANT - it is a PROXY, not the N2EX auction itself:
   * APX and N2EX are two different GB exchanges. Their prices are normally
     close but not identical.
   * MID is a volume-weighted market index per half-hour, not exactly an
     auction clearing price.
-Rows are therefore tagged source='elexon_apx' (never 'nordpool' or
-'entsoe'), so they can always be told apart. After every fill the script
-prints a comparison of APX against the real N2EX prices over the last 28
-days, so the size of the difference is visible instead of assumed.
+Rows are tagged source='elexon_apx' so they can always be told apart. Two
+honesty checks print how far APX is from a real reference: fill_gaps()
+compares APX with each N2EX price it replaces, and compare_with_entsoe()
+(local backfill_gb_apx.py runs it) compares APX with ENTSO-E's official
+2020 GB prices hour by hour - and shows whether those ENTSO-E numbers are
+in GBP or EUR.
 
 What it does
 ------------
-1. Finds every CET day between GAP_START and yesterday that has no
-   (or an incomplete) GB price in day_ahead_prices, from ANY source.
+1. Finds every CET day between GAP_START and yesterday that still needs APX:
+   no/incomplete GB price, or N2EX stand-in rows (see days_needing_apx).
 2. Fetches those days from Elexon in chunks (the API rejects requests that
    span more than 7 days).
 3. Keeps only APXMIDP, drops half-hours with price 0 AND volume 0 (no
@@ -44,13 +55,11 @@ What it does
    republishes the ECB's reference rates), with the ECB's own data API as a
    backup. NOT the ECB's old eurofxref-hist.csv file: on 2026-09-29 that URL
    served a stale snapshot ending in Feb 2010 with dummy-looking values, so
-   every source is now checked to actually cover the dates being converted.
-5. Saves with source='elexon_apx' - but NEVER over an existing 'entsoe' or
-   'nordpool' row (those always win).
+   every source is checked to actually cover the dates being converted.
+5. Saves with source='elexon_apx' - over 'nordpool' or older 'elexon_apx'
+   rows, but NEVER over an 'entsoe' row.
 
-Because step 1 only looks for days with no price, a day that Nord Pool's
-N2EX bridge later covers keeps its real N2EX price, and this script leaves
-every already-covered day alone. Safe to run as often as you like.
+Safe to run as often as you like: a finished day is not fetched again.
 
 Run it with:
     python fetch_gb_apx.py
@@ -88,8 +97,14 @@ GAP_START = date(2021, 1, 1)
 CHUNK_DAYS = 5
 
 # A CET calendar day has 23, 24 or 25 hours (clock changes). A day with at
-# least this many GB rows already counts as fully covered.
+# least this many GB rows counts as complete.
 FULL_DAY_MIN_HOURS = 23
+
+# A day this recent that is still incomplete (or still has N2EX rows) is
+# fetched again on every run - the last half-hours of the index can arrive
+# late. An OLDER day that already has APX rows is final: whatever APX lacks
+# for it (an hour with no trades) it never had, so it is not asked again.
+RECENT_REFRESH_DAYS = 10
 
 REQUEST_PAUSE_SECONDS = 0.3
 RETRY_BACKOFFS = [5, 20, 60]  # seconds, for network errors / HTTP 429 / 5xx
@@ -254,7 +269,7 @@ def fetch_chunk_with_fallback(first: date, last: date) -> list[dict]:
 
 def records_to_hourly_gbp(records: list[dict]) -> pd.Series:
     """APXMIDP half-hour records -> hourly GBP/MWh, indexed by UTC hour start.
-    See module docstring, steps 3 (what is kept/dropped)."""
+    See module docstring, step 3 (what is kept/dropped)."""
     rows = [r for r in records if r.get("dataProvider") == APX_PROVIDER]
     if not rows:
         return pd.Series(dtype=float)
@@ -301,25 +316,42 @@ def hourly_gbp_to_eur_cet(hourly_gbp: pd.Series, gbp_per_eur: pd.Series) -> pd.S
 # Database
 # ---------------------------------------------------------------------------
 
-def missing_days(conn: sqlite3.Connection, first: date, last: date) -> list[date]:
-    """CET days in first..last without a full day of GB prices (any source)."""
+def days_needing_apx(conn: sqlite3.Connection, first: date, last: date,
+                     today: date | None = None) -> list[date]:
+    """CET days in first..last that should be (re)fetched from APX:
+      * a RECENT day (within RECENT_REFRESH_DAYS) that is incomplete or still
+        has N2EX rows - the last half-hours can arrive late;
+      * an OLDER day that is incomplete or has N2EX rows AND has never had
+        an APX row (an older day that already has APX rows is final).
+    A day with a full set of ENTSO-E / APX rows is never fetched."""
+    today = today or date.today()
     rows = conn.execute(
         """
-        SELECT substr(timestamp, 1, 10), COUNT(*)
+        SELECT substr(timestamp, 1, 10), COUNT(*),
+               SUM(source = 'nordpool'), SUM(source = ?)
         FROM day_ahead_prices
         WHERE zone = 'GB' AND timestamp >= ? AND timestamp < ?
         GROUP BY 1
         """,
-        (first.isoformat(), (last + timedelta(days=1)).isoformat()),
+        (SOURCE_TAG, first.isoformat(), (last + timedelta(days=1)).isoformat()),
     ).fetchall()
-    full = {day for day, n in rows if n >= FULL_DAY_MIN_HOURS}
-    all_days = (first + timedelta(days=i) for i in range((last - first).days + 1))
-    return [d for d in all_days if d.isoformat() not in full]
+    info = {day: (n, n_nordpool or 0, n_apx or 0) for day, n, n_nordpool, n_apx in rows}
+
+    needed = []
+    for i in range((last - first).days + 1):
+        d = first + timedelta(days=i)
+        n, n_nordpool, n_apx = info.get(d.isoformat(), (0, 0, 0))
+        incomplete = n < FULL_DAY_MIN_HOURS or n_nordpool > 0
+        if not incomplete:
+            continue
+        if (today - d).days <= RECENT_REFRESH_DAYS or n_apx == 0:
+            needed.append(d)
+    return needed
 
 
 def save_apx_prices(conn: sqlite3.Connection, hourly_eur: pd.Series) -> int:
-    """Upsert as source='elexon_apx', never over an 'entsoe' or 'nordpool'
-    row. Returns how many rows were actually written."""
+    """Upsert as source='elexon_apx' - over 'nordpool' or older 'elexon_apx'
+    rows, never over an 'entsoe' row. Returns how many rows were written."""
     rows = [(ts.isoformat(), float(p)) for ts, p in hourly_eur.items() if pd.notna(p)]
     if not rows:
         return 0
@@ -331,7 +363,7 @@ def save_apx_prices(conn: sqlite3.Connection, hourly_eur: pd.Series) -> int:
         ON CONFLICT(zone, timestamp) DO UPDATE SET
             price_eur_mwh = excluded.price_eur_mwh,
             source = '{SOURCE_TAG}'
-        WHERE day_ahead_prices.source NOT IN ('entsoe', 'nordpool')
+        WHERE day_ahead_prices.source != 'entsoe'
         """,
         rows,
     )
@@ -357,25 +389,48 @@ def chunk_days(days: list[date]) -> list[tuple[date, date]]:
 
 
 # ---------------------------------------------------------------------------
-# The fill + the honesty check
+# The fill + the honesty checks
 # ---------------------------------------------------------------------------
 
+def _print_comparison(title: str, reference_name: str, both: pd.DataFrame) -> None:
+    """both has columns 'ref' (the reference price) and 'apx', EUR/MWh."""
+    diff = both["apx"] - both["ref"]
+    within_10pct = ((diff.abs() / both["ref"].abs().clip(lower=1)) <= 0.10).mean() * 100
+    print(f"{title} - {len(both)} overlapping hours:")
+    print(f"  mean {reference_name} {both['ref'].mean():.2f} EUR/MWh, mean APX {both['apx'].mean():.2f} "
+          f"EUR/MWh (APX minus {reference_name}: {diff.mean():+.2f} on average)")
+    print(f"  typical hourly gap {diff.abs().mean():.2f} EUR/MWh, worst hour {diff.abs().max():.2f}, "
+          f"correlation {both['apx'].corr(both['ref']):.3f}, {within_10pct:.0f}% of hours within 10%")
+
+
+def _existing_nordpool(conn: sqlite3.Connection, first: date, last: date) -> pd.Series:
+    rows = conn.execute(
+        "SELECT timestamp, price_eur_mwh FROM day_ahead_prices "
+        "WHERE zone = 'GB' AND source = 'nordpool' AND timestamp >= ? AND timestamp < ?",
+        (first.isoformat(), (last + timedelta(days=1)).isoformat()),
+    ).fetchall()
+    return pd.Series({ts: price for ts, price in rows}, dtype=float)
+
+
 def fill_gaps(conn: sqlite3.Connection, first: date = GAP_START, last: date | None = None) -> int:
-    """Fill every missing GB day in first..last (default: GAP_START through
-    yesterday) from Elexon APX. Returns how many hourly rows were written."""
+    """Bring every GB day in first..last (default: GAP_START through
+    yesterday) up to date from Elexon APX - see days_needing_apx for which
+    days that means. Returns how many hourly rows were written."""
     last = last or (date.today() - timedelta(days=1))
-    days = missing_days(conn, first, last)
+    days = days_needing_apx(conn, first, last)
     if not days:
-        print(f"GB APX fill: no gaps between {first} and {last} - nothing to do.")
+        print(f"GB APX fill: every day between {first} and {last} is already on APX "
+              "(or ENTSO-E) - nothing to do.")
         return 0
 
     chunks = chunk_days(days)
-    print(f"GB APX fill: {len(days)} day(s) without a full GB price between "
-          f"{first} and {last} - fetching {len(chunks)} chunk(s) from Elexon.")
+    print(f"GB APX fill: {len(days)} day(s) between {first} and {last} still need APX "
+          f"(no price yet, or only N2EX stand-ins) - fetching {len(chunks)} chunk(s) from Elexon.")
     fx = fetch_gbp_per_eur(days[0], days[-1])
     wanted = set(days)
 
     rows_written = days_filled = failed_chunks = consecutive_failures = 0
+    replaced_pairs = []  # (N2EX price, APX price) for every N2EX row APX replaces
     for i, (c_first, c_last) in enumerate(chunks, start=1):
         try:
             records = fetch_chunk_with_fallback(c_first, c_last)
@@ -386,7 +441,7 @@ def fill_gaps(conn: sqlite3.Connection, first: date = GAP_START, last: date | No
             consecutive_failures += 1
             if consecutive_failures >= ABORT_AFTER_CONSECUTIVE_FAILED_CHUNKS:
                 print(f"  {consecutive_failures} chunks in a row failed - stopping here for "
-                      "now. Run again later; already-filled days are skipped.")
+                      "now. Run again later; finished days are not fetched again.")
                 break
             continue
         consecutive_failures = 0
@@ -399,57 +454,84 @@ def fill_gaps(conn: sqlite3.Connection, first: date = GAP_START, last: date | No
             dtype=bool,
         )
         hourly = hourly[keep]
+
+        n2ex = _existing_nordpool(conn, c_first, c_last)
+        if not n2ex.empty and not hourly.empty:
+            apx_by_ts = pd.Series(hourly.to_numpy(), index=[ts.isoformat() for ts in hourly.index])
+            common = n2ex.index.intersection(apx_by_ts.index)
+            if len(common):
+                replaced_pairs.append(pd.DataFrame({"ref": n2ex[common], "apx": apx_by_ts[common]}))
+
         rows_written += save_apx_prices(conn, hourly)
         days_filled += len({ts.date() for ts in hourly.index})
         if i % 20 == 0 or i == len(chunks):
-            print(f"  [{i}/{len(chunks)}] up to {c_last}: {days_filled} day(s) filled, "
+            print(f"  [{i}/{len(chunks)}] up to {c_last}: {days_filled} day(s) done, "
                   f"{rows_written} hour(s) written, {failed_chunks} failed chunk(s)")
         time.sleep(REQUEST_PAUSE_SECONDS)
 
-    print(f"GB APX fill done: {days_filled} of {len(days)} missing day(s) filled "
+    print(f"GB APX fill done: {days_filled} of {len(days)} day(s) updated "
           f"({rows_written} hourly rows, tagged '{SOURCE_TAG}'), {failed_chunks} failed chunk(s).")
+
+    both = pd.concat(replaced_pairs) if replaced_pairs else pd.DataFrame()
+    if len(both) >= 24:
+        _print_comparison("APX vs the real N2EX prices it just replaced", "N2EX", both)
     return rows_written
 
 
-def validate_against_nordpool(conn: sqlite3.Connection, days: int = 28) -> None:
-    """Print how far APX is from the real N2EX price over the last `days`
-    days (only hours where the database holds a genuine Nord Pool N2EX
-    price). Purely informational - writes nothing."""
-    last = date.today() - timedelta(days=1)
-    first = last - timedelta(days=days - 1)
+def compare_with_entsoe(conn: sqlite3.Connection, year: int = 2020) -> None:
+    """Compare APX with ENTSO-E's official GB prices for `year`, hour by hour,
+    in BOTH currencies. Two questions at once: how close is APX to an
+    official GB day-ahead price, and are the GB numbers ENTSO-E gave us
+    (stored in a column called price_eur_mwh) really in EUR? ENTSO-E quotes
+    GB in pounds, and nothing converts them on the way in, so they may be
+    GBP. Informational only - writes nothing. Takes ~1 minute (about 75
+    Elexon requests for a year)."""
     rows = conn.execute(
-        """
-        SELECT timestamp, price_eur_mwh FROM day_ahead_prices
-        WHERE zone = 'GB' AND source = 'nordpool' AND timestamp >= ? AND timestamp < ?
-        """,
-        (first.isoformat(), (last + timedelta(days=1)).isoformat()),
+        "SELECT timestamp, price_eur_mwh FROM day_ahead_prices "
+        "WHERE zone = 'GB' AND source = 'entsoe' AND timestamp >= ? AND timestamp < ?",
+        (f"{year}-01-01", f"{year + 1}-01-01"),
     ).fetchall()
-    if len(rows) < 48:
-        print(f"APX vs N2EX check: only {len(rows)} genuine N2EX hour(s) in the last "
-              f"{days} days - too few to compare.")
+    if len(rows) < 24 * 30:
+        print(f"APX vs ENTSO-E {year}: only {len(rows)} ENTSO-E GB hour(s) stored - too few to compare.")
         return
-    n2ex = pd.Series({ts: price for ts, price in rows})
+    entsoe = pd.Series({ts: price for ts, price in rows}, dtype=float)
 
-    period = [first + timedelta(days=i) for i in range(days)]
+    first, last = date(year, 1, 1), date(year, 12, 31)
+    fx = fetch_gbp_per_eur(first, last)
     records: list[dict] = []
-    for c_first, c_last in chunk_days(period):
+    for c_first, c_last in chunk_days([first + timedelta(days=i) for i in range((last - first).days + 1)]):
         records.extend(fetch_chunk_with_fallback(c_first, c_last))
         time.sleep(REQUEST_PAUSE_SECONDS)
-    apx = hourly_gbp_to_eur_cet(records_to_hourly_gbp(records), fetch_gbp_per_eur(first, last))
-    apx.index = [ts.isoformat() for ts in apx.index]
-
-    both = pd.concat([n2ex.rename("n2ex"), apx.rename("apx")], axis=1, join="inner").dropna()
-    if len(both) < 24:
-        print(f"APX vs N2EX check: only {len(both)} overlapping hour(s) - too few to compare.")
+    gbp = records_to_hourly_gbp(records)
+    if gbp.empty:
+        print(f"APX vs ENTSO-E {year}: Elexon returned no APX data for {year}.")
         return
-    diff = both["apx"] - both["n2ex"]
-    within_10pct = ((diff.abs() / both["n2ex"].abs().clip(lower=1)) <= 0.10).mean() * 100
-    print(f"APX vs N2EX check, {len(both)} overlapping hours over the last {days} days:")
-    print(f"  mean N2EX {both['n2ex'].mean():.2f} EUR/MWh, mean APX {both['apx'].mean():.2f} EUR/MWh "
-          f"(APX minus N2EX: {diff.mean():+.2f} on average)")
-    print(f"  typical hourly gap {diff.abs().mean():.2f} EUR/MWh, worst hour {diff.abs().max():.2f}, "
-          f"correlation {both['apx'].corr(both['n2ex']):.3f}, "
-          f"{within_10pct:.0f}% of hours within 10%")
+    eur = hourly_gbp_to_eur_cet(gbp, fx)
+    apx = pd.DataFrame(
+        {"apx_eur": eur.to_numpy(), "apx_gbp": np.round(gbp.to_numpy(), 2)},
+        index=[ts.isoformat() for ts in eur.index],
+    )
+    both = pd.DataFrame({"ref": entsoe}).join(apx, how="inner").dropna()
+    if len(both) < 24 * 30:
+        print(f"APX vs ENTSO-E {year}: only {len(both)} overlapping hours - too few to compare.")
+        return
+
+    print(f"APX vs ENTSO-E {year}, {len(both)} overlapping hours:")
+    mean_ref = both["ref"].mean()
+    print(f"  mean ENTSO-E GB (as stored) {mean_ref:.2f}; mean APX in EUR {both['apx_eur'].mean():.2f}; "
+          f"mean APX in GBP {both['apx_gbp'].mean():.2f}")
+    results = {}
+    for label, column in (("EUR", "apx_eur"), ("GBP", "apx_gbp")):
+        gap = (both[column] - both["ref"]).abs()
+        results[label] = gap.mean()
+        print(f"  APX in {label} vs stored ENTSO-E: typical hourly gap {gap.mean():.2f}, "
+              f"worst {gap.max():.2f}, correlation {both[column].corr(both['ref']):.3f}")
+    if results["GBP"] < 0.7 * results["EUR"]:
+        print("  -> the stored ENTSO-E GB numbers match APX in GBP: they look like POUNDS, not euros.")
+    elif results["EUR"] < 0.7 * results["GBP"]:
+        print("  -> the stored ENTSO-E GB numbers match APX in EUR: they look like euros.")
+    else:
+        print("  -> can't tell from this whether the stored ENTSO-E GB numbers are GBP or EUR.")
 
 
 def main() -> None:
@@ -461,10 +543,6 @@ def main() -> None:
     conn = sqlite3.connect(Path(__file__).parent / "entsoe_data.db", timeout=30)
     ensure_tables(conn)
     written = fill_gaps(conn)
-    try:
-        validate_against_nordpool(conn)
-    except Exception as e:  # informational only - never fail the step over it
-        print(f"APX vs N2EX check skipped: {e}")
     if written:
         rebuild_aggregate_tables(conn)
     conn.close()

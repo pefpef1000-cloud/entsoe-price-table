@@ -13,12 +13,13 @@ GB-interconnector "countries" (IFA/IFA2/ElecLink, see year_comparison.py's
 INTERCONNECTOR_ENTSOE_ZONE) fed with the REAL N2EX price for recent days.
 
 Saves into the SAME day_ahead_prices table fetch_recent_years.py uses,
-tagged source='nordpool' - but only for an hour that doesn't already have
-an official 'entsoe' value (never happens for GB post-cutoff in practice,
-but this is the exact same safe ON CONFLICT precedence
-fetch_nordpool_bridge.py itself uses: an 'entsoe' row always wins if one
-ever exists for the same hour). A real N2EX price also replaces an
-'elexon_apx' stand-in for the same hour (see fetch_gb_apx.py).
+tagged source='nordpool'. Here that means PROVISIONAL: GB's price series is
+built from Elexon's APX index (fetch_gb_apx.py) so that every year is
+like-for-like, and APX replaces the N2EX price of a day once the day is
+complete. So this script's rows matter for today and tomorrow (APX has
+nothing for those yet - this is what the price table shows) and as a
+fallback for any hour APX has no trades in. It therefore NEVER overwrites
+an 'entsoe' or an 'elexon_apx' row.
 
 THIS SCRIPT ONLY COVERS RECENT DAYS - by design. Nord Pool's free Data
 Portal API refuses dates older than roughly a month or two with HTTP 401
@@ -141,9 +142,9 @@ def parse_hourly(data: dict) -> pd.Series:
 
 
 def save_bridge_prices(hourly: pd.Series, conn) -> tuple[int, int]:
-    """Same ON CONFLICT ... WHERE source != 'entsoe' precedence as
-    fetch_nordpool_bridge.py's own save_bridge_prices. Returns (written,
-    skipped_because_entsoe_already_had_it)."""
+    """Like fetch_nordpool_bridge.py's own save_bridge_prices, but also
+    protects 'elexon_apx' rows (see module docstring). Returns (written,
+    skipped_because_an_official_or_APX_price_was_already_there)."""
     written = skipped = 0
     for ts, price in hourly.items():
         if pd.isna(price):
@@ -155,7 +156,7 @@ def save_bridge_prices(hourly: pd.Series, conn) -> tuple[int, int]:
             ON CONFLICT(zone, timestamp) DO UPDATE SET
                 price_eur_mwh = excluded.price_eur_mwh,
                 source = 'nordpool'
-            WHERE day_ahead_prices.source != 'entsoe'
+            WHERE day_ahead_prices.source NOT IN ('entsoe', 'elexon_apx')
             """,
             (ts.isoformat(), float(price)),
         )
@@ -220,7 +221,7 @@ def main() -> None:
         f"N2EX: {published} day(s) published and saved, "
         f"{unpublished} not published/no data, {errored} errored. "
         f"{written} hour(s) written, {skipped} left untouched "
-        "(already had an official ENTSO-E price)."
+        "(already had an official ENTSO-E or APX price)."
     )
 
 
