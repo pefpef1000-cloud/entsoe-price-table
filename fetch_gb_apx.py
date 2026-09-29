@@ -141,10 +141,17 @@ def fetch_gbp_per_eur(first: date, last: date) -> pd.Series:
         index=pd.to_datetime(df["Date"]),
     ).dropna().sort_index()
     rates = rates[~rates.index.duplicated(keep="last")]
+    parsed = rates  # keep what was actually read, for the error message below
     calendar = pd.date_range(first - timedelta(days=10), last + timedelta(days=3), freq="D")
     rates = rates.reindex(rates.index.union(calendar)).ffill().bfill().reindex(calendar)
     if rates.isna().any() or not rates.between(0.5, 1.5).all():
-        raise FetchError("ECB GBP/EUR rates look implausible - refusing to convert with them")
+        newest = {d.date().isoformat(): float(v) for d, v in parsed.tail(3).items()}
+        raise FetchError(
+            "ECB GBP/EUR rates look implausible - refusing to convert with them. "
+            f"File had {len(df)} rows / {len(df.columns)} columns; {len(parsed)} usable GBP rates "
+            f"(newest {newest}). For {calendar[0].date()}..{calendar[-1].date()}: "
+            f"{int(rates.isna().sum())} missing, min {rates.min()}, max {rates.max()}."
+        )
     return rates
 
 
