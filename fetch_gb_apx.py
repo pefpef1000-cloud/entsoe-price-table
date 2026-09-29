@@ -40,7 +40,11 @@ What it does
    each hour (volume-weighted) into one hourly GBP/MWh price.
 4. Converts GBP -> EUR with the ECB's daily reference rate for that day
    (forward-filled over weekends/holidays), since the rest of the database
-   is EUR/MWh.
+   is EUR/MWh. Rates come from Frankfurter (api.frankfurter.dev, which
+   republishes the ECB's reference rates), with the ECB's own data API as a
+   backup. NOT the ECB's old eurofxref-hist.csv file: on 2026-09-29 that URL
+   served a stale snapshot ending in Feb 2010 with dummy-looking values, so
+   every source is now checked to actually cover the dates being converted.
 5. Saves with source='elexon_apx' - but NEVER over an existing 'entsoe' or
    'nordpool' row (those always win).
 
@@ -66,7 +70,11 @@ import requests
 
 ELEXON_URL = "https://data.elexon.co.uk/bmrs/api/v1/balancing/pricing/market-index"
 APX_PROVIDER = "APXMIDP"
-ECB_HIST_CSV = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.csv"
+FRANKFURTER_URL = "https://api.frankfurter.dev/v1/{start}..{end}"  # ECB reference rates, JSON
+ECB_SDMX_URL = "https://data-api.ecb.europa.eu/service/data/EXR/D.GBP.EUR.SP00.A"  # backup
+# Frankfurter serves daily rates for ranges of at least ~5 months (checked
+# 2026-09-29); longer ranges are thinned out, so ask in windows of this size.
+FX_WINDOW_DAYS = 120
 
 SOURCE_TAG = "elexon_apx"
 
@@ -101,11 +109,15 @@ class BadRequest(FetchError):
     """HTTP 400 - e.g. Elexon refusing a too-long date span. Not retried."""
 
 
-def _get_with_retry(url: str, params: dict, what: str) -> requests.Response:
+class NotFound(FetchError):
+    """HTTP 404 - e.g. an FX date range with no business day in it."""
+
+
+def _get_with_retry(url: str, params: dict, what: str, headers: dict | None = None) -> requests.Response:
     last_problem = "unknown error"
     for attempt in range(len(RETRY_BACKOFFS) + 1):
         try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=60)
+            resp = requests.get(url, params=params, headers=headers or HEADERS, timeout=60)
         except requests.RequestException as e:
             last_problem = f"{what}: network error: {e}"
         else:
@@ -114,6 +126,8 @@ def _get_with_retry(url: str, params: dict, what: str) -> requests.Response:
             last_problem = f"{what}: HTTP {resp.status_code} ({resp.text[:200]!r})"
             if resp.status_code == 400:
                 raise BadRequest(last_problem)
+            if resp.status_code == 404:
+                raise NotFound(last_problem)
             if resp.status_code not in (429, 500, 502, 503, 504):
                 raise FetchError(last_problem)
         if attempt < len(RETRY_BACKOFFS):
@@ -125,34 +139,77 @@ def _get_with_retry(url: str, params: dict, what: str) -> requests.Response:
 # GBP -> EUR
 # ---------------------------------------------------------------------------
 
-def fetch_gbp_per_eur(first: date, last: date) -> pd.Series:
-    """Daily GBP-per-1-EUR from the ECB's reference-rate history, one value
-    for every calendar day from 10 days before `first` to 3 days after
-    `last` (weekends and holidays carry the previous business day's rate).
-    EUR/MWh = GBP/MWh divided by this."""
-    resp = _get_with_retry(ECB_HIST_CSV, {}, "ECB reference rates")
-    # index_col=False: the ECB file has a trailing comma on every line, which
-    # would otherwise make pandas treat the Date column as the index.
-    df = pd.read_csv(io.StringIO(resp.text), index_col=False)
-    if "Date" not in df.columns or "GBP" not in df.columns:
-        raise FetchError(f"ECB file has no Date/GBP column (got {list(df.columns)[:6]}...)")
-    rates = pd.Series(
-        pd.to_numeric(df["GBP"], errors="coerce").to_numpy(),
-        index=pd.to_datetime(df["Date"]),
+def _fx_from_frankfurter(start: date, end: date) -> pd.Series:
+    """{date: GBP per 1 EUR} for business days in start..end, in windows."""
+    rates: dict[pd.Timestamp, float] = {}
+    window_start = start
+    while window_start <= end:
+        window_end = min(window_start + timedelta(days=FX_WINDOW_DAYS - 1), end)
+        url = FRANKFURTER_URL.format(start=window_start.isoformat(), end=window_end.isoformat())
+        try:
+            resp = _get_with_retry(url, {"base": "EUR", "symbols": "GBP"}, "Frankfurter FX rates")
+            payload = resp.json().get("rates", {})
+        except NotFound:
+            payload = {}  # a window with no business day in it - fine, the others cover it
+        except ValueError as e:
+            raise FetchError("Frankfurter FX rates: response wasn't valid JSON") from e
+        for day, values in payload.items():
+            if "GBP" in values:
+                rates[pd.Timestamp(day)] = float(values["GBP"])
+        window_start = window_end + timedelta(days=1)
+    return pd.Series(rates, dtype=float).sort_index()
+
+
+def _fx_from_ecb_api(start: date, end: date) -> pd.Series:
+    """Backup: the ECB's own SDMX data API (CSV)."""
+    resp = _get_with_retry(
+        ECB_SDMX_URL,
+        {"startPeriod": start.isoformat(), "endPeriod": end.isoformat(), "format": "csvdata"},
+        "ECB data API",
+        headers={"User-Agent": HEADERS["User-Agent"], "Accept": "text/csv"},
+    )
+    df = pd.read_csv(io.StringIO(resp.text))
+    if not {"TIME_PERIOD", "OBS_VALUE"} <= set(df.columns):
+        raise FetchError(f"ECB data API: unexpected columns {list(df.columns)[:8]}")
+    return pd.Series(
+        pd.to_numeric(df["OBS_VALUE"], errors="coerce").to_numpy(),
+        index=pd.to_datetime(df["TIME_PERIOD"]),
     ).dropna().sort_index()
-    rates = rates[~rates.index.duplicated(keep="last")]
-    parsed = rates  # keep what was actually read, for the error message below
-    calendar = pd.date_range(first - timedelta(days=10), last + timedelta(days=3), freq="D")
-    rates = rates.reindex(rates.index.union(calendar)).ffill().bfill().reindex(calendar)
-    if rates.isna().any() or not rates.between(0.5, 1.5).all():
-        newest = {d.date().isoformat(): float(v) for d, v in parsed.tail(3).items()}
-        raise FetchError(
-            "ECB GBP/EUR rates look implausible - refusing to convert with them. "
-            f"File had {len(df)} rows / {len(df.columns)} columns; {len(parsed)} usable GBP rates "
-            f"(newest {newest}). For {calendar[0].date()}..{calendar[-1].date()}: "
-            f"{int(rates.isna().sum())} missing, min {rates.min()}, max {rates.max()}."
-        )
-    return rates
+
+
+def _check_fx_covers(parsed: pd.Series, first: date, last: date) -> None:
+    """Refuse rates that don't actually cover first..last with plausible
+    values (a stale or garbled source must never be used to convert)."""
+    if parsed.empty:
+        raise FetchError("no rates returned")
+    if not parsed.between(0.5, 1.5).all():
+        raise FetchError(f"implausible GBP/EUR values (min {parsed.min()}, max {parsed.max()})")
+    if parsed.index.min() > pd.Timestamp(first):
+        raise FetchError(f"rates only start {parsed.index.min().date()}, need {first} or earlier")
+    if parsed.index.max() < pd.Timestamp(last) - timedelta(days=10):
+        raise FetchError(f"rates only run to {parsed.index.max().date()}, need up to about {last}")
+
+
+def fetch_gbp_per_eur(first: date, last: date) -> pd.Series:
+    """Daily GBP-per-1-EUR, one value for every calendar day from 10 days
+    before `first` to 3 days after `last` (weekends and holidays carry the
+    previous business day's rate). EUR/MWh = GBP/MWh divided by this.
+    Tries Frankfurter, then the ECB data API; each is checked to really
+    cover the period, and if neither does this raises."""
+    start = first - timedelta(days=15)
+    end = min(last + timedelta(days=3), date.today())
+    problems = []
+    for name, fetch in (("Frankfurter", _fx_from_frankfurter), ("ECB data API", _fx_from_ecb_api)):
+        try:
+            parsed = fetch(start, end)
+            _check_fx_covers(parsed, first, last)
+        except FetchError as e:
+            problems.append(f"{name}: {e}")
+            continue
+        parsed = parsed[~parsed.index.duplicated(keep="last")]
+        calendar = pd.date_range(first - timedelta(days=10), last + timedelta(days=3), freq="D")
+        return parsed.reindex(parsed.index.union(calendar)).ffill().bfill().reindex(calendar)
+    raise FetchError("no usable GBP/EUR rates - refusing to convert. " + " | ".join(problems))
 
 
 # ---------------------------------------------------------------------------
