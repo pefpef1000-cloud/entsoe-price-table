@@ -11,6 +11,10 @@ on:
     # has them within minutes. In UTC, so some of these hit the right time in
     # summer and the others in winter. Odd minutes on purpose: GitHub delays
     # runs queued exactly on the hour.
+    # Morning runs (08:37, 09:37, 10:37 UTC): some zones (RS, ME and other
+    # south-east / Nordic ones) get tomorrow's prices on ENTSO-E hours before
+    # the big EPEX zones do - this picks them up soon after Peter's local run.
+    - cron: "37 8,9,10 * * *"
     - cron: "47 10 * * *"
     - cron: "17 11 * * *"
     - cron: "47 11 * * *"
