@@ -206,10 +206,50 @@ else:
     )
 
     highlight_range = None
+    ref_zone = "DE_LU"
     if not show_nordic_spread:
-        highlight_range = st.number_input(
-            "Highlight prices within DE_LU +/- (EUR/MWh)", min_value=0.0, value=0.0, step=0.05, format="%.2f",
+        # Reference zone for the highlight: every price within this zone's
+        # price +/- the range (same hour) gets a black frame. Dropdown sits
+        # above the text; the number field sits right of the text. Both are
+        # sized to their content via the CSS below, not stretched full width.
+        zone_choices = list(full_table.columns)
+        ref_zone = st.selectbox(
+            "Reference zone",
+            zone_choices,
+            index=zone_choices.index("DE_LU") if "DE_LU" in zone_choices else 0,
+            key="hl_ref_zone",
+            label_visibility="collapsed",
         )
+        with st.container(key="hl_row"):
+            txt_col, num_col = st.columns(2, gap="small", vertical_alignment="center")
+            txt_col.markdown(f"Highlight prices within **{ref_zone}** +/- (EUR/MWh)")
+            highlight_range = num_col.number_input(
+                "Range (EUR/MWh)",
+                min_value=0.0, value=0.0, step=0.05, format="%.2f",
+                key="hl_range",
+                label_visibility="collapsed",
+            )
+        st.markdown(
+            """
+            <style>
+            .st-key-hl_ref_zone { width: 9rem !important; }
+            /* dropdown width set above */
+            .st-key-hl_row div[data-testid="stHorizontalBlock"] {
+                width: max-content !important; flex-wrap: nowrap !important;
+                align-items: center !important; gap: 0.75rem !important;
+            }
+            .st-key-hl_row div[data-testid="stColumn"],
+            .st-key-hl_row div[data-testid="column"] {
+                width: auto !important; flex: 0 0 auto !important; min-width: 0 !important;
+            }
+            .st-key-hl_row div[data-testid="stMarkdownContainer"] p { margin: 0 !important; white-space: nowrap; }
+            .st-key-hl_range { width: 8.5rem !important; }
+            /* number field width set above */
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
 
     if show_nordic_spread:
         available_nb = [z for z in NORDIC_BALTIC_ORDER if z in full_table.columns]
@@ -278,12 +318,12 @@ else:
                 cmap="RdYlGn", axis=None, low=0.15, high=0.15, vmin=vmin, vmax=vmax
             )
 
-            if highlight_range is not None and "DE_LU" in full_table.columns:
+            if highlight_range is not None and ref_zone in full_table.columns:
                 def _border_matches(row: pd.Series) -> list[str]:
-                    ref = row["DE_LU"]
+                    ref = row[ref_zone]
                     out = []
                     for col, val in row.items():
-                        if col == "DE_LU":
+                        if col == ref_zone:
                             out.append("")  # never frame the reference column itself
                         elif pd.notna(val) and pd.notna(ref) and abs(round(val, 2) - round(ref, 2)) <= highlight_range + 1e-9:
                             out.append("border: 3px solid black")
