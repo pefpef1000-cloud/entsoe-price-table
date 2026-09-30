@@ -205,10 +205,10 @@ else:
         "price minus the system price (SYS)"
     )
 
-    highlight_de_lu_matches = False
+    highlight_range = None
     if not show_nordic_spread:
-        highlight_de_lu_matches = st.checkbox(
-            "Highlight prices that match DE_LU for that hour", value=True
+        highlight_range = st.number_input(
+            "Highlight prices within DE_LU +/- (EUR/MWh)", min_value=0.0, value=0.0, step=0.05, format="%.2f",
         )
 
     if show_nordic_spread:
@@ -278,14 +278,14 @@ else:
                 cmap="RdYlGn", axis=None, low=0.15, high=0.15, vmin=vmin, vmax=vmax
             )
 
-            if highlight_de_lu_matches and "DE_LU" in full_table.columns:
+            if highlight_range is not None and "DE_LU" in full_table.columns:
                 def _border_matches(row: pd.Series) -> list[str]:
                     ref = row["DE_LU"]
                     out = []
                     for col, val in row.items():
                         if col == "DE_LU":
                             out.append("")  # never frame the reference column itself
-                        elif pd.notna(val) and pd.notna(ref) and round(val, 2) == round(ref, 2):
+                        elif pd.notna(val) and pd.notna(ref) and abs(round(val, 2) - round(ref, 2)) <= highlight_range + 1e-9:
                             out.append("border: 3px solid black")
                         else:
                             out.append("")
