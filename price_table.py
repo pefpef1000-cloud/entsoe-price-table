@@ -29,6 +29,13 @@ A switch "Show Nordic prices" hides the Nordic columns (SYS, DK, NO, SE, FI,
 EE, LV, LT, TEL) from the full table. It does nothing in the Nordic-only view
 or the short list, so it is greyed out there.
 
+A switch "More colours" (on by default) colours each price by its RANK among
+all prices on screen instead of by its distance from the cheapest/dearest
+price. Most days the prices bunch up around 150-250 with a few very low or
+very high ones; on a straight min-max scale that bunch all looks the same
+green. By rank, the whole red - yellow - green range is used evenly. Higher
+price is still always greener, equal prices always get the same colour.
+
 Above the table a warning lists the zones that have NO prices for the picked
 day yet (compared with the zones that had prices in the 7 days before), plus
 any zone that has only some of the day's hours. It follows the view you have
@@ -194,6 +201,22 @@ def load_expected_zones(day: date) -> list:
     return [r[0] for r in rows]
 
 
+def _rank_map(values_table: pd.DataFrame) -> pd.DataFrame:
+    """Each cell's place in the price ranking, 0 (cheapest) .. 1 (dearest),
+    over every cell in the table. Equal prices get the same number (the
+    middle of their tied places), empty cells stay empty. Used as the
+    colour map when "More colours" is on."""
+    vals = values_table.to_numpy(dtype=float)
+    flat = np.sort(vals[~np.isnan(vals)])
+    if flat.size == 0:
+        return values_table.copy()
+    left = np.searchsorted(flat, vals, side="left")
+    right = np.searchsorted(flat, vals, side="right")
+    rank = (left + right) / 2 / flat.size
+    rank = np.where(np.isnan(vals), np.nan, rank)
+    return pd.DataFrame(rank, index=values_table.index, columns=values_table.columns)
+
+
 df = load_day(picked_date)
 
 if df.empty:
@@ -290,6 +313,15 @@ else:
     )
     hide_nordic = (
         not show_nordic_columns and not show_nordic_spread and not show_core_zones
+    )
+
+    more_colours = st.toggle(
+        "More colours",
+        value=True,
+        help="On: colours are spread evenly over all prices on screen (by "
+             "rank), so the typical 150-250 range shows red, yellow and "
+             "green instead of one green. Off: the old straight min-max "
+             "colour scale.",
     )
 
     highlight_range = None
@@ -432,11 +464,18 @@ else:
         # scale excludes outlier columns rather than using the raw
         # min/max.
         if show_nordic_spread:
-            vmin, vmax = _robust_vmin_vmax(price_block)
-            styled = display_table.style.background_gradient(
-                cmap="RdYlGn", axis=None, low=0.15, high=0.15,
-                vmin=vmin, vmax=vmax, subset=price_block.columns,
-            )
+            if more_colours:
+                styled = display_table.style.background_gradient(
+                    cmap="RdYlGn", axis=None, low=0.1, high=0.1,
+                    gmap=_rank_map(price_block), vmin=0.0, vmax=1.0,
+                    subset=price_block.columns,
+                )
+            else:
+                vmin, vmax = _robust_vmin_vmax(price_block)
+                styled = display_table.style.background_gradient(
+                    cmap="RdYlGn", axis=None, low=0.15, high=0.15,
+                    vmin=vmin, vmax=vmax, subset=price_block.columns,
+                )
 
             # "vs SYS" block: a diverging scale centered on zero, so 0
             # (== the system price itself) sits in the middle color,
@@ -453,10 +492,16 @@ else:
                     subset=spread_block.columns,
                 )
         else:
-            vmin, vmax = _robust_vmin_vmax(display_table)
-            styled = display_table.style.background_gradient(
-                cmap="RdYlGn", axis=None, low=0.15, high=0.15, vmin=vmin, vmax=vmax
-            )
+            if more_colours:
+                styled = display_table.style.background_gradient(
+                    cmap="RdYlGn", axis=None, low=0.1, high=0.1,
+                    gmap=_rank_map(display_table), vmin=0.0, vmax=1.0,
+                )
+            else:
+                vmin, vmax = _robust_vmin_vmax(display_table)
+                styled = display_table.style.background_gradient(
+                    cmap="RdYlGn", axis=None, low=0.15, high=0.15, vmin=vmin, vmax=vmax
+                )
 
             if highlight_range is not None and ref_zone in full_table.columns:
                 def _border_matches(row: pd.Series) -> list[str]:
@@ -553,6 +598,11 @@ else:
     st.caption(
         f"Peak = average price {PEAK_START_HOUR:02d}:00-{PEAK_END_HOUR:02d}:00. "
         "Off-peak = 2 x Base - Peak. Prices in EUR/MWh."
+        + (
+            " Colours: by rank - red = cheapest prices on screen, green = dearest."
+            if more_colours
+            else ""
+        )
         + (
             " 'vs SYS' = that zone's price minus the system price (SYS) "
             "for the same hour/row."
