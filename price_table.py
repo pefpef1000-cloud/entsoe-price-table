@@ -29,15 +29,16 @@ A switch "Show Nordic prices" hides the Nordic columns (SYS, DK, NO, SE, FI,
 EE, LV, LT, TEL) from the full table. It does nothing in the Nordic-only view
 or the short list, so it is greyed out there.
 
-A switch "More colours" (on by default) mixes two things for each cell's
-colour: half its RANK among all prices on screen, half the price itself
+The colours mix two things for each cell: half its RANK among all prices on
+screen, half the price itself
 (between the cheapest and the dearest price on screen). Most days the prices
 bunch up around 150-250 with a few very low or very high ones; on a straight
 min-max scale that bunch all looks the same green. The rank half spreads the
 bunch over the whole red - yellow - green range; the price half keeps the
 extremes apart (a 700 stays clearly darker than a 300, which a pure rank
 colouring could not do). Higher price is still always greener, equal prices
-always get the same colour.
+always get the same colour. (There used to be a switch for this; Peter
+asked for it to be always on.)
 
 Above the table a warning lists the zones that have NO prices for the picked
 day yet (compared with the zones that had prices in the 7 days before), plus
@@ -132,43 +133,6 @@ def load_day(day: date) -> pd.DataFrame:
     return df
 
 
-def _robust_vmin_vmax(values_table: pd.DataFrame):
-    """vmin/vmax for a heatmap color scale, excluding whole OUTLIER
-    COLUMNS (e.g. a zone whose prices are simply on a different scale
-    from everyone else - 10-50x higher). A simple percentile trim on all
-    the flattened numbers doesn't work here: if the outlier column is,
-    say, 1/20th of all the columns, its 24 hourly values are comfortably
-    more than 2% of the total cells, so a 2nd/98th percentile cut doesn't
-    actually exclude it and the scale still gets stretched (confirmed
-    with synthetic data - the trim made no visible difference). Instead,
-    find outlier COLUMNS first (by comparing each column's median against
-    the spread of all columns' medians, using the standard IQR fence),
-    then set vmin/vmax from only the remaining normal columns. An outlier
-    column's own cells are still shown and still colored - they just clip
-    to the strongest color instead of dragging every other column's color
-    down with them.
-    """
-    col_medians = values_table.median()
-    if col_medians.empty:
-        return None, None
-    q1, q3 = col_medians.quantile([0.25, 0.75])
-    iqr = q3 - q1
-    if iqr > 0:
-        lower_fence = q1 - 3 * iqr
-        upper_fence = q3 + 3 * iqr
-        normal_cols = col_medians[
-            (col_medians >= lower_fence) & (col_medians <= upper_fence)
-        ].index
-    else:
-        normal_cols = col_medians.index
-
-    normal_values = values_table[normal_cols].to_numpy(dtype=float).flatten()
-    normal_values = normal_values[~pd.isna(normal_values)]
-    if normal_values.size:
-        return float(np.nanmin(normal_values)), float(np.nanmax(normal_values))
-    return None, None
-
-
 @st.cache_data(ttl=60)
 def load_expected_zones(day: date) -> list:
     """Zones that had at least one price in the 7 days BEFORE this day. A
@@ -204,7 +168,7 @@ def load_expected_zones(day: date) -> list:
     return [r[0] for r in rows]
 
 
-# "More colours": how much of each cell's colour comes from its RANK (0 = all
+# How much of each cell's colour comes from its RANK (0 = all
 # from the price itself, 1 = all from the rank). 0.5: the rank spreads the
 # bunch of ordinary prices over many colours, the price keeps 700 and 300
 # apart. (Pure rank, 1.0, made every very high price the same dark green.)
@@ -216,8 +180,8 @@ def _colour_map(values_table: pd.DataFrame) -> pd.DataFrame:
     COLOUR_RANK_SHARE x its place in the price ranking over every cell in
     the table + the rest x its price between the cheapest and the dearest
     cell. Equal prices get the same number, empty cells stay empty, a
-    higher price never gets a lower number. Used as the colour map when
-    "More colours" is on."""
+    higher price never gets a lower number. Used as the colour map of the
+    price heatmap."""
     vals = values_table.to_numpy(dtype=float)
     flat = np.sort(vals[~np.isnan(vals)])
     if flat.size == 0:
@@ -328,16 +292,6 @@ else:
     )
     hide_nordic = (
         not show_nordic_columns and not show_nordic_spread and not show_core_zones
-    )
-
-    more_colours = st.toggle(
-        "More colours",
-        value=True,
-        help="On: each colour mixes the price's rank among all prices on "
-             "screen (spreads the typical 150-250 range over red, yellow "
-             "and green) with the price itself (so a 700 stays clearly "
-             "darker than a 300). Off: the old straight min-max colour "
-             "scale.",
     )
 
     highlight_range = None
@@ -476,22 +430,14 @@ else:
         # Heatmap: green = high price, red = low price. One shared color
         # scale per block (axis=None), not per column - that way a color
         # is directly comparable between zones, not just relative to
-        # each column's own min/max. See _robust_vmin_vmax for why the
-        # scale excludes outlier columns rather than using the raw
-        # min/max.
+        # each column's own min/max. How a cell's color position is worked
+        # out (rank + price) is explained in _colour_map.
         if show_nordic_spread:
-            if more_colours:
-                styled = display_table.style.background_gradient(
-                    cmap="RdYlGn", axis=None, low=0.1, high=0.1,
-                    gmap=_colour_map(price_block), vmin=0.0, vmax=1.0,
-                    subset=price_block.columns,
-                )
-            else:
-                vmin, vmax = _robust_vmin_vmax(price_block)
-                styled = display_table.style.background_gradient(
-                    cmap="RdYlGn", axis=None, low=0.15, high=0.15,
-                    vmin=vmin, vmax=vmax, subset=price_block.columns,
-                )
+            styled = display_table.style.background_gradient(
+                cmap="RdYlGn", axis=None, low=0.1, high=0.1,
+                gmap=_colour_map(price_block), vmin=0.0, vmax=1.0,
+                subset=price_block.columns,
+            )
 
             # "vs SYS" block: a diverging scale centered on zero, so 0
             # (== the system price itself) sits in the middle color,
@@ -508,16 +454,10 @@ else:
                     subset=spread_block.columns,
                 )
         else:
-            if more_colours:
-                styled = display_table.style.background_gradient(
-                    cmap="RdYlGn", axis=None, low=0.1, high=0.1,
-                    gmap=_colour_map(display_table), vmin=0.0, vmax=1.0,
-                )
-            else:
-                vmin, vmax = _robust_vmin_vmax(display_table)
-                styled = display_table.style.background_gradient(
-                    cmap="RdYlGn", axis=None, low=0.15, high=0.15, vmin=vmin, vmax=vmax
-                )
+            styled = display_table.style.background_gradient(
+                cmap="RdYlGn", axis=None, low=0.1, high=0.1,
+                gmap=_colour_map(display_table), vmin=0.0, vmax=1.0,
+            )
 
             if highlight_range is not None and ref_zone in full_table.columns:
                 def _border_matches(row: pd.Series) -> list[str]:
@@ -614,11 +554,7 @@ else:
     st.caption(
         f"Peak = average price {PEAK_START_HOUR:02d}:00-{PEAK_END_HOUR:02d}:00. "
         "Off-peak = 2 x Base - Peak. Prices in EUR/MWh."
-        + (
-            " Colours: half by rank, half by price - red = cheapest on screen, dark green = dearest."
-            if more_colours
-            else ""
-        )
+        + " Colours: half by rank, half by price - red = cheapest on screen, dark green = dearest."
         + (
             " 'vs SYS' = that zone's price minus the system price (SYS) "
             "for the same hour/row."
