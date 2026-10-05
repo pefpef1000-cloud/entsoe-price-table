@@ -26,8 +26,8 @@ There's a second toggle for a short list: DE_LU, FR, CH, AT, SI, HU and all
 the Italian zones (IT_*) - one click instead of scrolling past 40 columns.
 
 A switch "Show Nordic prices" hides the Nordic columns (SYS, DK, NO, SE, FI,
-TEL) from the full table - the Baltics (EE, LV, LT) stay. It does nothing in
-the Nordic-only view or the short list, so it is greyed out there.
+EE, LV, LT, TEL) from the full table. It does nothing in the Nordic-only view
+or the short list, so it is greyed out there.
 
 Above the table a warning lists the zones that have NO prices for the picked
 day yet (compared with the zones that had prices in the 7 days before), plus
@@ -278,13 +278,11 @@ else:
     ) and not show_nordic_spread
 
     # Show/hide the Nordic columns in the FULL table. SYS is Nord Pool's
-    # system price, TEL is Nord Pool's Telemark area. The Baltics (EE, LV,
-    # LT) are not Nordic and stay.
-    NORDIC_ZONES = [
-        z for z in NORDIC_BALTIC_ORDER if z not in ("EE", "LV", "LT")
-    ] + ["TEL"]
+    # system price, TEL is Nord Pool's Telemark area. Peter counts the
+    # Baltics (EE, LV, LT) as Nordic here, same as the Nordic/Baltic view.
+    NORDIC_ZONES = list(NORDIC_BALTIC_ORDER) + ["TEL"]
     show_nordic_columns = st.toggle(
-        "Show Nordic prices (SYS, DK, NO, SE, FI, TEL)",
+        "Show Nordic prices (SYS, DK, NO, SE, FI, EE, LV, LT, TEL)",
         value=True,
         disabled=show_nordic_spread or show_core_zones,
         help="Switch off to hide the Nordic columns in the full table. Not "
