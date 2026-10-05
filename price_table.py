@@ -17,13 +17,17 @@ Shows a table for a single day:
              against synthetic data before delivery.)
 
 There's also a toggle for a Nordic/Baltic-only view: SYS, DK_1, DK_2,
-NO_1-4, SE_1-4, FI, EE, LV, LT - shown twice side by side, first as raw
+NO_1-5, SE_1-4, FI, EE, LV, LT - shown twice side by side, first as raw
 prices, then again as each zone's price minus the SYS (system) price for
 that same hour, so you can see each zone's spread to the system price at
 a glance.
 
 There's a second toggle for a short list: DE_LU, FR, CH, AT, SI, HU and all
 the Italian zones (IT_*) - one click instead of scrolling past 40 columns.
+
+A switch "Show Nordic prices" hides the Nordic columns (SYS, DK, NO, SE, FI,
+TEL) from the full table - the Baltics (EE, LV, LT) stay. It does nothing in
+the Nordic-only view or the short list, so it is greyed out there.
 
 Above the table a warning lists the zones that have NO prices for the picked
 day yet (compared with the zones that had prices in the 7 days before), plus
@@ -240,7 +244,7 @@ else:
     # same hour (i.e. its spread to the system price).
     # ---------------------------------------------------------------
     NORDIC_BALTIC_ORDER = [
-        "SYS", "DK_1", "DK_2", "NO_1", "NO_2", "NO_3", "NO_4",
+        "SYS", "DK_1", "DK_2", "NO_1", "NO_2", "NO_3", "NO_4", "NO_5",
         "SE_1", "SE_2", "SE_3", "SE_4", "FI", "EE", "LV", "LT",
     ]
 
@@ -272,6 +276,23 @@ else:
         disabled=show_nordic_spread,
         help="Not available together with the Nordic/Baltic view.",
     ) and not show_nordic_spread
+
+    # Show/hide the Nordic columns in the FULL table. SYS is Nord Pool's
+    # system price, TEL is Nord Pool's Telemark area. The Baltics (EE, LV,
+    # LT) are not Nordic and stay.
+    NORDIC_ZONES = [
+        z for z in NORDIC_BALTIC_ORDER if z not in ("EE", "LV", "LT")
+    ] + ["TEL"]
+    show_nordic_columns = st.toggle(
+        "Show Nordic prices (SYS, DK, NO, SE, FI, TEL)",
+        value=True,
+        disabled=show_nordic_spread or show_core_zones,
+        help="Switch off to hide the Nordic columns in the full table. Not "
+             "used in the Nordic/Baltic-only view or the short list.",
+    )
+    hide_nordic = (
+        not show_nordic_columns and not show_nordic_spread and not show_core_zones
+    )
 
     highlight_range = None
     ref_zone = "DE_LU"
@@ -359,6 +380,10 @@ else:
             display_table = None
         else:
             display_table = full_table[core_cols]
+    elif hide_nordic:
+        display_table = full_table[
+            [c for c in full_table.columns if c not in NORDIC_ZONES]
+        ]
     else:
         display_table = full_table
 
@@ -373,6 +398,8 @@ else:
         _relevant = lambda z: z in NORDIC_BALTIC_ORDER  # noqa: E731
     elif show_core_zones:
         _relevant = _is_core_zone
+    elif hide_nordic:
+        _relevant = lambda z: z not in NORDIC_ZONES  # noqa: E731
     else:
         _relevant = lambda z: True  # noqa: E731
 
