@@ -29,12 +29,15 @@ A switch "Show Nordic prices" hides the Nordic columns (SYS, DK, NO, SE, FI,
 EE, LV, LT, TEL) from the full table. It does nothing in the Nordic-only view
 or the short list, so it is greyed out there.
 
-A switch "More colours" (on by default) colours each price by its RANK among
-all prices on screen instead of by its distance from the cheapest/dearest
-price. Most days the prices bunch up around 150-250 with a few very low or
-very high ones; on a straight min-max scale that bunch all looks the same
-green. By rank, the whole red - yellow - green range is used evenly. Higher
-price is still always greener, equal prices always get the same colour.
+A switch "More colours" (on by default) mixes two things for each cell's
+colour: half its RANK among all prices on screen, half the price itself
+(between the cheapest and the dearest price on screen). Most days the prices
+bunch up around 150-250 with a few very low or very high ones; on a straight
+min-max scale that bunch all looks the same green. The rank half spreads the
+bunch over the whole red - yellow - green range; the price half keeps the
+extremes apart (a 700 stays clearly darker than a 300, which a pure rank
+colouring could not do). Higher price is still always greener, equal prices
+always get the same colour.
 
 Above the table a warning lists the zones that have NO prices for the picked
 day yet (compared with the zones that had prices in the 7 days before), plus
@@ -201,20 +204,32 @@ def load_expected_zones(day: date) -> list:
     return [r[0] for r in rows]
 
 
-def _rank_map(values_table: pd.DataFrame) -> pd.DataFrame:
-    """Each cell's place in the price ranking, 0 (cheapest) .. 1 (dearest),
-    over every cell in the table. Equal prices get the same number (the
-    middle of their tied places), empty cells stay empty. Used as the
-    colour map when "More colours" is on."""
+# "More colours": how much of each cell's colour comes from its RANK (0 = all
+# from the price itself, 1 = all from the rank). 0.5: the rank spreads the
+# bunch of ordinary prices over many colours, the price keeps 700 and 300
+# apart. (Pure rank, 1.0, made every very high price the same dark green.)
+COLOUR_RANK_SHARE = 0.5
+
+
+def _colour_map(values_table: pd.DataFrame) -> pd.DataFrame:
+    """Where each cell sits on the colour scale, 0 (red) .. 1 (dark green):
+    COLOUR_RANK_SHARE x its place in the price ranking over every cell in
+    the table + the rest x its price between the cheapest and the dearest
+    cell. Equal prices get the same number, empty cells stay empty, a
+    higher price never gets a lower number. Used as the colour map when
+    "More colours" is on."""
     vals = values_table.to_numpy(dtype=float)
     flat = np.sort(vals[~np.isnan(vals)])
     if flat.size == 0:
         return values_table.copy()
     left = np.searchsorted(flat, vals, side="left")
     right = np.searchsorted(flat, vals, side="right")
-    rank = (left + right) / 2 / flat.size
-    rank = np.where(np.isnan(vals), np.nan, rank)
-    return pd.DataFrame(rank, index=values_table.index, columns=values_table.columns)
+    rank = (left + right) / 2 / flat.size  # ties share the middle of their places
+    lo, hi = flat[0], flat[-1]
+    price = (vals - lo) / (hi - lo) if hi > lo else np.zeros_like(vals)
+    mix = COLOUR_RANK_SHARE * rank + (1 - COLOUR_RANK_SHARE) * price
+    mix = np.where(np.isnan(vals), np.nan, mix)
+    return pd.DataFrame(mix, index=values_table.index, columns=values_table.columns)
 
 
 df = load_day(picked_date)
@@ -318,10 +333,11 @@ else:
     more_colours = st.toggle(
         "More colours",
         value=True,
-        help="On: colours are spread evenly over all prices on screen (by "
-             "rank), so the typical 150-250 range shows red, yellow and "
-             "green instead of one green. Off: the old straight min-max "
-             "colour scale.",
+        help="On: each colour mixes the price's rank among all prices on "
+             "screen (spreads the typical 150-250 range over red, yellow "
+             "and green) with the price itself (so a 700 stays clearly "
+             "darker than a 300). Off: the old straight min-max colour "
+             "scale.",
     )
 
     highlight_range = None
@@ -467,7 +483,7 @@ else:
             if more_colours:
                 styled = display_table.style.background_gradient(
                     cmap="RdYlGn", axis=None, low=0.1, high=0.1,
-                    gmap=_rank_map(price_block), vmin=0.0, vmax=1.0,
+                    gmap=_colour_map(price_block), vmin=0.0, vmax=1.0,
                     subset=price_block.columns,
                 )
             else:
@@ -495,7 +511,7 @@ else:
             if more_colours:
                 styled = display_table.style.background_gradient(
                     cmap="RdYlGn", axis=None, low=0.1, high=0.1,
-                    gmap=_rank_map(display_table), vmin=0.0, vmax=1.0,
+                    gmap=_colour_map(display_table), vmin=0.0, vmax=1.0,
                 )
             else:
                 vmin, vmax = _robust_vmin_vmax(display_table)
@@ -599,7 +615,7 @@ else:
         f"Peak = average price {PEAK_START_HOUR:02d}:00-{PEAK_END_HOUR:02d}:00. "
         "Off-peak = 2 x Base - Peak. Prices in EUR/MWh."
         + (
-            " Colours: by rank - red = cheapest prices on screen, green = dearest."
+            " Colours: half by rank, half by price - red = cheapest on screen, dark green = dearest."
             if more_colours
             else ""
         )
