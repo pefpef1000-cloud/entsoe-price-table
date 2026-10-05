@@ -22,6 +22,15 @@ prices, then again as each zone's price minus the SYS (system) price for
 that same hour, so you can see each zone's spread to the system price at
 a glance.
 
+There's a second toggle for a short list: DE_LU, FR, CH, AT, SI, HU and all
+the Italian zones (IT_*) - one click instead of scrolling past 40 columns.
+
+Above the table a warning lists the zones that have NO prices for the picked
+day yet (compared with the zones that had prices in the 7 days before), plus
+any zone that has only some of the day's hours. It follows the view you have
+on: in the short list it only talks about those zones, in the Nordic view
+only about the Nordic/Baltic ones.
+
 Date picker defaults to TOMORROW every time the page loads (day-ahead
 prices for tomorrow are usually the ones you actually want to look at,
 since today's/yesterday's are already old news) - pick any other date
@@ -146,6 +155,41 @@ def _robust_vmin_vmax(values_table: pd.DataFrame):
     return None, None
 
 
+@st.cache_data(ttl=60)
+def load_expected_zones(day: date) -> list:
+    """Zones that had at least one price in the 7 days BEFORE this day. A
+    zone on this list that has no rows on the picked day is reported as
+    missing. Looking at the week before (not at the whole database) keeps
+    zones that stopped publishing - or had not started yet on an old date -
+    from being reported as missing."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        # Fast on a big database: walk the zone list through the (zone,
+        # timestamp) index, then ask the index whether each zone has any row
+        # in the week. (The timestamps start with YYYY-MM-DD, so comparing
+        # them as text with the plain dates works.)
+        rows = conn.execute(
+            """
+            WITH RECURSIVE z(zone) AS (
+                SELECT MIN(zone) FROM day_ahead_prices
+                UNION ALL
+                SELECT (SELECT MIN(zone) FROM day_ahead_prices WHERE zone > z.zone)
+                FROM z WHERE z.zone IS NOT NULL
+            )
+            SELECT zone FROM z
+            WHERE zone IS NOT NULL
+              AND EXISTS (SELECT 1 FROM day_ahead_prices d
+                          WHERE d.zone = z.zone
+                            AND d.timestamp >= ? AND d.timestamp < ?)
+            """,
+            ((day - timedelta(days=7)).isoformat(), day.isoformat()),
+        ).fetchall()
+        conn.close()
+    except Exception:  # noqa: BLE001 - the warning is a nice-to-have, never break the table
+        return []
+    return [r[0] for r in rows]
+
+
 df = load_day(picked_date)
 
 if df.empty:
@@ -204,6 +248,30 @@ else:
         "Show Nordic/Baltic zones only, with a second block of each "
         "price minus the system price (SYS)"
     )
+
+    # Short list: one click for the zones Peter looks at most. Not offered
+    # together with the Nordic view (that one has its own zone list).
+    CORE_ZONES = ["DE_LU", "FR", "CH", "AT", "SI", "HU"]
+    ITALY_ORDER = [
+        "IT_NORD", "IT_CNOR", "IT_CSUD", "IT_SUD", "IT_CALA", "IT_SICI", "IT_SARD",
+    ]
+
+    def _is_core_zone(zone: str) -> bool:
+        return zone in CORE_ZONES or zone.startswith("IT")
+
+    def _core_columns(columns) -> list:
+        """CORE_ZONES in the order above, then the Italian zones (the 7
+        market zones first, then any other IT_* that has data, A-Z)."""
+        columns = list(columns)
+        italy = [z for z in ITALY_ORDER if z in columns]
+        italy += sorted(z for z in columns if z.startswith("IT") and z not in ITALY_ORDER)
+        return [z for z in CORE_ZONES if z in columns] + italy
+
+    show_core_zones = st.checkbox(
+        "Show only DE_LU, FR, CH, AT, SI, HU and all Italian zones",
+        disabled=show_nordic_spread,
+        help="Not available together with the Nordic/Baltic view.",
+    ) and not show_nordic_spread
 
     highlight_range = None
     ref_zone = "DE_LU"
@@ -281,8 +349,55 @@ else:
                 [["vs SYS"], spread_block.columns]
             )
             display_table = pd.concat([price_block, spread_block], axis=1)
+    elif show_core_zones:
+        core_cols = _core_columns(full_table.columns)
+        if not core_cols:
+            st.warning(
+                "None of DE_LU, FR, CH, AT, SI, HU or the Italian zones are "
+                "in the data for this date."
+            )
+            display_table = None
+        else:
+            display_table = full_table[core_cols]
     else:
         display_table = full_table
+
+    # ---------------------------------------------------------------
+    # Which zones are missing for this day? Shown above the table, for
+    # the zones of the view that is switched on.
+    # ---------------------------------------------------------------
+    def _label(zone: str) -> str:
+        return "SYS" if zone == "NORDIC_SYSTEM" else zone
+
+    if show_nordic_spread:
+        _relevant = lambda z: z in NORDIC_BALTIC_ORDER  # noqa: E731
+    elif show_core_zones:
+        _relevant = _is_core_zone
+    else:
+        _relevant = lambda z: True  # noqa: E731
+
+    n_hours = len(table.index)
+    no_prices = sorted(
+        {_label(z) for z in load_expected_zones(picked_date)} - set(table.columns)
+    )
+    no_prices += [z for z in table.columns if table[z].isna().all()]
+    only_some = [
+        f"{z} ({int(table[z].notna().sum())} of {n_hours} hours)"
+        for z in table.columns
+        if 0 < table[z].notna().sum() < n_hours
+    ]
+    no_prices = [z for z in no_prices if _relevant(z)]
+    only_some = [t for t in only_some if _relevant(t.split(" ")[0])]
+    if no_prices or only_some:
+        lines = []
+        if no_prices:
+            lines.append(
+                f"**Missing for {picked_date.isoformat()} - no prices for "
+                f"{len(no_prices)} zone(s):** {', '.join(no_prices)}"
+            )
+        if only_some:
+            lines.append(f"**Only some hours:** {', '.join(only_some)}")
+        st.warning("\n\n".join(lines))
 
     if display_table is not None:
         # Heatmap: green = high price, red = low price. One shared color
@@ -313,14 +428,14 @@ else:
                     subset=spread_block.columns,
                 )
         else:
-            vmin, vmax = _robust_vmin_vmax(full_table)
+            vmin, vmax = _robust_vmin_vmax(display_table)
             styled = display_table.style.background_gradient(
                 cmap="RdYlGn", axis=None, low=0.15, high=0.15, vmin=vmin, vmax=vmax
             )
 
             if highlight_range is not None and ref_zone in full_table.columns:
                 def _border_matches(row: pd.Series) -> list[str]:
-                    ref = row[ref_zone]
+                    ref = full_table.loc[row.name, ref_zone]  # also works if that column is hidden
                     out = []
                     for col, val in row.items():
                         if col == ref_zone:
@@ -409,13 +524,6 @@ else:
         # naturally displays every row with no inner scrollbar - no
         # separate height calculation needed for that anymore either.
         st.table(styled)
-
-        if show_nordic_spread:
-            missing = [z for z in available_nb if table[z].isna().all()]
-        else:
-            missing = [z for z in table.columns if table[z].isna().all()]
-        if missing:
-            st.caption(f"No data at all for: {', '.join(missing)}")
 
     st.caption(
         f"Peak = average price {PEAK_START_HOUR:02d}:00-{PEAK_END_HOUR:02d}:00. "
