@@ -1,0 +1,13 @@
+# Packages for the online Dash app on Render (online_app.py).
+# Same versions as on Peter's PC (tested together 2026-10-11).
+# requirements.txt next to this file is for the Streamlit Cloud app and
+# the GitHub Actions fetchers -- leave that one as it is.
+dash==4.4.1
+plotly==7.1.0
+pandas==3.0.5
+numpy==2.5.4
+matplotlib==3.11.2
+openpyxl==3.1.5
+requests==2.34.2
+gunicorn==26.2.0
+tzdata

@@ -80,3 +80,25 @@ comfortably under GitHub's 100MB per-file limit.
 ## Deployed at
 
 https://entsoe-price-table.streamlit.app
+
+## Online Dash version (Render)
+
+The same two dashboards as Dash apps, on Render instead of Streamlit Cloud
+(Streamlit Cloud can only run Streamlit apps). One web address:
+`/` = hourly price table, `/years/` = Year comparison with all 5 tabs.
+
+- `online_app.py` - downloads the data and serves both apps. Runs
+  `price_table_dash.py` and `year_comparison_dash.py` unchanged (exact
+  copies of the files in `entsoe_scraper`).
+- Data: `entsoe_data.db` from this repo (GitHub Actions, as above) for the
+  price table; the full history (`entsoe_history.db.gz`, `jao_history.db.gz`)
+  from the release `online-data`, uploaded by `upload_online_data.py` on
+  Peter's PC. The app checks for new files every 10 minutes.
+- `render.yaml` - Render's setup (create the service as a Blueprint).
+  Data commits do not redeploy the app; code changes do.
+- `requirements-online.txt` - packages for Render only (`requirements.txt`
+  stays for Streamlit Cloud and the fetchers).
+- The Daily tenor (Corridor margins) is hidden online: it needs ~1.1 GB
+  memory, the free plan has 512 MB. Delete `HIDE_TENORS` in Render's
+  settings on a 2 GB plan.
+- Try it on a PC: `python online_app.py` -> http://127.0.0.1:8060/

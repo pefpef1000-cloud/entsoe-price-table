@@ -1,0 +1,33 @@
+# Render setup for the online Dash dashboards (online_app.py).
+# Render reads this file when the service is created as a "Blueprint"
+# (Render dashboard -> New -> Blueprint -> pick this repo).
+#
+# Data commits from GitHub Actions (entsoe_data.db, jao_data.db) do NOT
+# redeploy the app (buildFilter below): the app downloads new data itself
+# every 10 minutes. Only code changes redeploy.
+services:
+  - type: web
+    name: entsoe-dashboards
+    runtime: python
+    plan: free            # 512 MB, 0.1 CPU. "starter" ($7/month) = 0.5 CPU, about 5x faster
+    region: frankfurt
+    buildCommand: pip install -r requirements-online.txt
+    startCommand: gunicorn online_app:server --workers 1 --threads 4 --timeout 600 --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    buildFilter:
+      paths:
+        - online_app.py
+        - price_table_dash.py
+        - year_comparison_dash.py
+        - requirements-online.txt
+        - render.yaml
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.14.3"
+      - key: TZ                 # dates and times in Danish time (e.g. "tomorrow")
+        value: Europe/Copenhagen
+      - key: HIDE_TENORS        # Daily needs ~1.1 GB memory; delete this on a 2 GB plan
+        value: Daily
+      - key: MALLOC_ARENA_MAX   # keeps Python's memory use down on a small server
+        value: "2"
