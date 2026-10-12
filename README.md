@@ -90,10 +90,14 @@ The same two dashboards as Dash apps, on Render instead of Streamlit Cloud
 - `online_app.py` - downloads the data and serves both apps. Runs
   `price_table_dash.py` and `year_comparison_dash.py` unchanged (exact
   copies of the files in `entsoe_scraper`).
-- Data: `entsoe_data.db` from this repo (GitHub Actions, as above) for the
-  price table; the full history (`entsoe_history.db.gz`, `jao_history.db.gz`)
-  from the release `online-data`, uploaded by `upload_online_data.py` on
-  Peter's PC. The app checks for new files every 10 minutes.
+- Data for the price table: `entsoe_data.db` from this repo (GitHub
+  Actions, as above) MERGED with `recent_prices.db.gz` (last 14 days from
+  Peter's PC, uploaded right after each local fetch). A price missing on
+  one side comes from the other; an official ENTSO-E price beats a Nord Pool
+  stand-in. Checked every 2 minutes.
+- Data for the Year comparison: the full history (`entsoe_history.db.gz`,
+  `jao_history.db.gz`) from the release `online-data`, uploaded by
+  `upload_online_data.py` on Peter's PC. Checked every 10 minutes.
 - `render.yaml` - Render's setup (create the service as a Blueprint).
   Data commits do not redeploy the app; code changes do.
 - `requirements-online.txt` - packages for Render only (`requirements.txt`

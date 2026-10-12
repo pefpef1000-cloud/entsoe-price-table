@@ -8,13 +8,19 @@ Both dashboard files are the same files as on the PC, unchanged. This file
 only does three things around them:
 
   1. Gets the data:
-       entsoe_data.db        from this GitHub repo. GitHub Actions refreshes
-                             it ~13 times a day.            -> price table
-       entsoe_history.db.gz  from the GitHub release "online-data".
-       jao_history.db.gz     upload_online_data.py on Peter's PC sends
-                             them after its runs.           -> year comparison
-  2. Looks for newer files every 10 minutes (and at every start -- Render's
-     free plan stops the app after 15 idle minutes).
+       price table -- two sources, merged (whichever has a price wins; an
+       official ENTSO-E price beats a Nord Pool stand-in):
+         entsoe_data.db        from this GitHub repo (GitHub Actions,
+                               ~13 runs a day)
+         recent_prices.db.gz   from the GitHub release "online-data": the
+                               last 14 days from Peter's PC, sent right after
+                               each local run fetched the prices
+       year comparison:
+         entsoe_history.db.gz  from the same release, uploaded by
+         jao_history.db.gz     upload_online_data.py on Peter's PC
+  2. Looks for newer files: prices every 2 minutes, history every 10 minutes
+     (and at every start -- Render's free plan stops the app after 15 idle
+     minutes).
   3. Serves both dashboards from one web address, with a link bar on top.
 
 Render starts it with (see render.yaml):
@@ -52,18 +58,40 @@ RELEASE_URL = os.environ.get(
 DATA_DIR = Path(os.environ.get("DATA_DIR", Path(tempfile.gettempdir()) / "online_data")).resolve()
 LOCAL_TZ = ZoneInfo("Europe/Copenhagen")
 REFRESH_SECONDS = max(60, int(float(os.environ.get("REFRESH_MINUTES", "10")) * 60))
+PRICE_REFRESH_SECONDS = max(30, int(float(os.environ.get("PRICE_REFRESH_MINUTES", "2")) * 60))
 
-RECENT_DB = DATA_DIR / "entsoe_data.db"
+ACTIONS_DB = DATA_DIR / "actions_prices.db"     # GitHub Actions' entsoe_data.db
+PC_RECENT_DB = DATA_DIR / "pc_recent_prices.db"  # last 14 days from Peter's PC
+PRICE_DB = DATA_DIR / "entsoe_data.db"          # both merged = what the table reads
 HISTORY_DB = DATA_DIR / "entsoe_history.db"
 JAO_DB = DATA_DIR / "jao_history.db"
 HISTORY_FILES = [("entsoe_history.db.gz", HISTORY_DB), ("jao_history.db.gz", JAO_DB)]
 STAMP_NAME = "stamp.json"          # written last by upload_online_data.py
+PC_RECENT_NAME = "recent_prices.db.gz"
+PC_RECENT_STAMP_NAME = "recent_stamp.json"
 STATE_FILE = DATA_DIR / "downloaded.json"
+
+# Fill the GitHub Actions prices with the PC's: a row the GitHub file lacks
+# is added; a row it has is only replaced when the PC has an official price
+# and GitHub only a Nord Pool stand-in ('nordpool').
+MERGE_SQL = """
+INSERT OR REPLACE INTO main.day_ahead_prices (zone, timestamp, price_eur_mwh, source)
+SELECT p.zone, p.timestamp, p.price_eur_mwh, p.source
+FROM pc.day_ahead_prices p
+LEFT JOIN main.day_ahead_prices m ON m.zone = p.zone AND m.timestamp = p.timestamp
+WHERE p.price_eur_mwh IS NOT NULL AND (
+      m.zone IS NULL
+   OR (CASE WHEN COALESCE(p.source, 'entsoe') = 'nordpool' THEN 1 ELSE 2 END)
+    > (CASE WHEN COALESCE(m.source, 'entsoe') = 'nordpool' THEN 1 ELSE 2 END))
+"""
+MERGE_COLUMNS = ("zone", "timestamp", "price_eur_mwh", "source")
 
 _http = requests.Session()
 _http.headers["User-Agent"] = "entsoe-price-table-online"
 _state_lock = threading.Lock()
-_status = {"history": "not downloaded yet", "history_uploaded_at": None}
+_merge_lock = threading.Lock()
+_status = {"history": "not downloaded yet", "history_uploaded_at": None,
+           "pc_prices_uploaded_at": None}
 
 
 def log(text):
@@ -120,25 +148,84 @@ def _download(url: str, dest: Path, gunzip: bool = False, headers: dict | None =
             tmp.unlink()
 
 
-def refresh_recent() -> None:
-    """The price table's database, from the repo (asks "changed since?")."""
+def refresh_actions() -> bool:
+    """GitHub Actions' prices, from the repo (asks "changed since?").
+    True if a new file came in."""
     with _state_lock:
         state = _load_state()
-    seen = state.get("recent", {})
+    seen = state.get("actions", {})
     headers = {}
-    if RECENT_DB.is_file():
+    if ACTIONS_DB.is_file():
         if seen.get("etag"):
             headers["If-None-Match"] = seen["etag"]
         if seen.get("last_modified"):
             headers["If-Modified-Since"] = seen["last_modified"]
-    got = _download(RECENT_URL, RECENT_DB, headers=headers)
+    got = _download(RECENT_URL, ACTIONS_DB, headers=headers)
     if got is None:
-        return
+        return False
     with _state_lock:
         state = _load_state()
-        state["recent"] = {"etag": got.get("ETag"), "last_modified": got.get("Last-Modified")}
+        state["actions"] = {"etag": got.get("ETag"), "last_modified": got.get("Last-Modified")}
         _save_state(state)
-    log(f"price table data updated ({RECENT_DB.stat().st_size / 1e6:.0f} MB)")
+    log(f"GitHub prices updated ({ACTIONS_DB.stat().st_size / 1e6:.0f} MB)")
+    return True
+
+
+def refresh_pc_recent() -> bool:
+    """The PC's last 14 days of prices, from the release -- only when the
+    small recent_stamp.json there changed. True if a new file came in."""
+    r = _http.get(f"{RELEASE_URL}/{PC_RECENT_STAMP_NAME}", timeout=(20, 60))
+    if r.status_code == 404:
+        return False          # the PC has not sent any yet
+    r.raise_for_status()
+    stamp_text = r.text
+    with _state_lock:
+        state = _load_state()
+    if PC_RECENT_DB.is_file() and state.get("pc_recent_stamp") == stamp_text:
+        _status["pc_prices_uploaded_at"] = _uploaded_at(stamp_text)
+        return False
+    _download(f"{RELEASE_URL}/{PC_RECENT_NAME}", PC_RECENT_DB, gunzip=True)
+    with _state_lock:
+        state = _load_state()
+        state["pc_recent_stamp"] = stamp_text
+        _save_state(state)
+    _status["pc_prices_uploaded_at"] = _uploaded_at(stamp_text)
+    log(f"PC prices updated (uploaded {_status['pc_prices_uploaded_at'] or '?'})")
+    return True
+
+
+def rebuild_price_db() -> None:
+    """PRICE_DB = GitHub Actions' file, filled up with the PC's prices.
+    Built in a temporary file and swapped in, so the table never sees a
+    half-built file."""
+    with _merge_lock:
+        base = ACTIONS_DB if ACTIONS_DB.is_file() else PC_RECENT_DB
+        if not base.is_file():
+            return
+        tmp = PRICE_DB.with_name(PRICE_DB.name + ".merge")
+        shutil.copyfile(base, tmp)
+        added = 0
+        try:
+            if base is ACTIONS_DB and PC_RECENT_DB.is_file():
+                conn = sqlite3.connect(str(tmp))
+                try:
+                    conn.execute("ATTACH DATABASE ? AS pc", (str(PC_RECENT_DB),))
+                    cols = {r[1] for r in conn.execute("PRAGMA main.table_info(day_ahead_prices)")}
+                    pc_cols = {r[1] for r in conn.execute("PRAGMA pc.table_info(day_ahead_prices)")}
+                    if set(MERGE_COLUMNS) <= cols and set(MERGE_COLUMNS) <= pc_cols:
+                        added = conn.execute(MERGE_SQL).rowcount
+                        conn.commit()
+                    else:
+                        log("PC prices not used: the two price tables have different columns")
+                    conn.execute("DETACH DATABASE pc")
+                finally:
+                    conn.close()
+            _make_readable(tmp)
+            os.replace(tmp, PRICE_DB)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+    log(f"price table data rebuilt ({added} rows from the PC added or improved)")
 
 
 def refresh_history() -> None:
@@ -171,44 +258,70 @@ def refresh_history() -> None:
         f"(uploaded {_status['history_uploaded_at'] or '?'})")
 
 
-def _set_uploaded_at(stamp_text: str) -> None:
+def _uploaded_at(stamp_text: str):
     try:
         when = datetime.fromisoformat(json.loads(stamp_text)["uploaded_at"])
-        _status["history_uploaded_at"] = when.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+        return when.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
     except (ValueError, KeyError, TypeError):
-        _status["history_uploaded_at"] = None
+        return None
+
+
+def _set_uploaded_at(stamp_text: str) -> None:
+    _status["history_uploaded_at"] = _uploaded_at(stamp_text)
+
+
+def refresh_prices() -> None:
+    """Both price sources; rebuild the merged file if either changed."""
+    changed = False
+    for name, job in (("GitHub prices", refresh_actions), ("PC prices", refresh_pc_recent)):
+        try:
+            changed = job() or changed
+        except Exception as exc:  # noqa: BLE001 - keep the old files, try again later
+            log(f"could not refresh {name}: {exc}")
+    if changed or not PRICE_DB.is_file():
+        rebuild_price_db()
 
 
 def _refresh_loop() -> None:
-    first = True
+    next_history = 0.0
     while True:
-        for name, job in (("history", refresh_history), ("price table data", refresh_recent)):
-            if first and job is refresh_recent:
-                continue   # already done at start
+        if time.monotonic() >= next_history:
             try:
-                job()
-            except Exception as exc:  # noqa: BLE001 - keep the old files, try again later
-                log(f"could not refresh {name}: {exc}")
-                if job is refresh_history and _status["history"] == "downloading":
+                refresh_history()
+            except Exception as exc:  # noqa: BLE001
+                log(f"could not refresh history: {exc}")
+                if _status["history"] == "downloading":
                     _status["history"] = "download failed - retrying in a few minutes"
-        first = False
-        time.sleep(REFRESH_SECONDS)
+            next_history = time.monotonic() + REFRESH_SECONDS
+        time.sleep(PRICE_REFRESH_SECONDS)
+        try:
+            refresh_prices()
+        except Exception as exc:  # noqa: BLE001
+            log(f"could not rebuild the price table data: {exc}")
 
 
 def prepare_data() -> None:
-    """Runs once at start: price table data right away (falls back to the
-    copy in the repo), history in the background."""
+    """Runs once at start: price table data right away (GitHub's file falls
+    back to the copy in the repo), history in the background."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     log(f"starting - local time {time.strftime('%Y-%m-%d %H:%M %Z')}, data folder {DATA_DIR}")
     try:
-        refresh_recent()
+        refresh_actions()
     except Exception as exc:  # noqa: BLE001
-        log(f"could not download the price table data: {exc}")
+        log(f"could not download GitHub's prices: {exc}")
         repo_copy = HERE / "entsoe_data.db"
-        if not RECENT_DB.is_file() and repo_copy.is_file():
-            shutil.copyfile(repo_copy, RECENT_DB)
-            _make_readable(RECENT_DB)
+        if not ACTIONS_DB.is_file() and repo_copy.is_file():
+            shutil.copyfile(repo_copy, ACTIONS_DB)
+            _make_readable(ACTIONS_DB)
             log("using the copy of entsoe_data.db that came with the code")
+    try:
+        refresh_pc_recent()
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not download the PC's prices: {exc}")
+    try:
+        rebuild_price_db()
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not build the price table data: {exc}")
     threading.Thread(target=_refresh_loop, name="data-refresh", daemon=True).start()
 
 
@@ -229,7 +342,7 @@ try:
 finally:
     os.environ.pop("DASH_REQUESTS_PATHNAME_PREFIX", None)
 
-pt.DB_PATH = RECENT_DB
+pt.DB_PATH = PRICE_DB
 yc.DB_PATH = HISTORY_DB
 yc.JAO_DB_FILE = JAO_DB
 
@@ -283,8 +396,13 @@ def history_note() -> str:
     return f"History updated {when}" if when else ""
 
 
+def prices_note() -> str:
+    when = _status.get("pc_prices_uploaded_at")
+    return f"Prices from the PC uploaded {when}, from GitHub checked every 2 min" if when else ""
+
+
 def price_table_page():
-    return html.Div([nav("pt"), pt.serve_layout()])
+    return html.Div([nav("pt", prices_note()), pt.serve_layout()])
 
 
 def wait_page():
@@ -313,7 +431,7 @@ for _module in (pt, yc):
         "{%css%}", "{%css%}<style>" + NAV_CSS + "</style>")
 
 pt.app.layout = price_table_page
-pt.app.validation_layout = html.Div([nav("pt"), pt.serve_layout()])
+pt.app.validation_layout = html.Div([nav("pt", "x"), pt.serve_layout()])
 yc.app.layout = year_comparison_page
 yc.app.validation_layout = html.Div([nav("yc", "x"), wait_page(), yc.serve_layout()])
 yc.app.clientside_callback(
