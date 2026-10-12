@@ -15,11 +15,11 @@ Controls (top to bottom), same as the Streamlit version:
   - "Nordic/Baltic zones only": SYS, DK, NO, SE, FI, EE, LV, LT twice - first
     the prices, then each price minus the system price (SYS).
   - "Short list": DE_LU, FR, CH, AT, SI, HU and all Italian zones.
-  - Switch "Show Nordic prices": hides the Nordic columns in the full table.
+  - Tick box "Show Nordic prices": hides the Nordic columns in the full table.
   - Reference zone + range: every price within the reference zone's price
     +/- the range (same hour) gets a black frame.
 
-Above the table a warning lists the zones that have no prices for the day
+Below the table a warning lists the zones that have no prices for the day
 yet (compared with the 7 days before) and the zones with only some hours.
 
 Colours: each cell is half its RANK among all prices on screen, half the
@@ -47,7 +47,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from dash import Dash, Input, Output, State, dcc, html
+from dash import Dash, Input, Output, State, ctx, dcc, html
 
 DB_NAME = "entsoe_data.db"
 DEFAULT_PORT = 8051
@@ -72,7 +72,7 @@ NORDIC_BALTIC_ORDER = [
     "SYS", "DK_1", "DK_2", "NO_1", "NO_2", "NO_3", "NO_4", "NO_5",
     "SE_1", "SE_2", "SE_3", "SE_4", "FI", "EE", "LV", "LT",
 ]
-# Columns the "Show Nordic prices" switch hides. TEL = Nord Pool's Telemark
+# Columns the "Show Nordic prices" tick box hides. TEL = Nord Pool's Telemark
 # area. Peter counts the Baltics (EE, LV, LT) as Nordic here.
 NORDIC_ZONES = NORDIC_BALTIC_ORDER + ["TEL"]
 CORE_ZONES = ["DE_LU", "FR", "CH", "AT", "SI", "HU"]
@@ -567,28 +567,32 @@ def serve_layout():
     choices = zone_choices(tomorrow)
     ref = "DE_LU" if "DE_LU" in choices or not choices else choices[0]
     return html.Div(className="pt-page", children=[
-        html.H1("Hourly day-ahead prices - all countries"),
-        html.Div(className="pt-field", children=[
-            html.Label("Date", htmlFor="pt-date"),
+        # Everything except the table sits in two compact rows at the top.
+        html.Div(className="pt-top", children=[
+            html.H1("Hourly prices"),
             html.Div(className="pt-date-box", children=dcc.DatePickerSingle(
                 id="pt-date", date=tomorrow.isoformat(), display_format="YYYY-MM-DD",
                 first_day_of_week=1, clearable=False)),
-        ]),
-        dcc.Checklist(id="pt-nordic", options=_check(LABEL_NORDIC), value=[],
-                      className="pt-check"),
-        dcc.Checklist(id="pt-core", options=_check(LABEL_CORE), value=[],
-                      className="pt-check"),
-        dcc.Checklist(id="pt-switch", options=_check(LABEL_SWITCH), value=["on"],
-                      className="pt-check pt-switch"),
-        html.Div(id="pt-highlight", children=[
-            dcc.Dropdown(id="pt-ref", options=choices or ["DE_LU"], value=ref,
-                         clearable=False, searchable=True, className="pt-ref"),
-            html.Div(className="pt-hl-row", children=[
-                html.Span(["Highlight prices within ", html.B(ref, id="pt-ref-name"),
-                           " +/- (EUR/MWh)"]),
-                dcc.Input(id="pt-range", type="number", min=0, step=0.05, value=0,
-                          debounce=False, className="pt-range"),
+            html.Div(id="pt-highlight", className="pt-hl-row", children=[
+                html.Span("Highlight prices within"),
+                dcc.Dropdown(id="pt-ref", options=choices or ["DE_LU"], value=ref,
+                             clearable=False, searchable=True, className="pt-ref"),
+                html.Span("+/- (EUR/MWh)"),
+                html.Div(className="pt-stepper", children=[
+                    html.Button("\u2212", id="pt-minus", title="10 cent less", className="pt-step"),
+                    dcc.Input(id="pt-range", type="number", min=0, step=0.01, value=0,
+                              debounce=False, className="pt-range"),
+                    html.Button("+", id="pt-plus", title="10 cent more", className="pt-step"),
+                ]),
             ]),
+        ]),
+        html.Div(className="pt-checks", children=[
+            dcc.Checklist(id="pt-nordic", options=_check(LABEL_NORDIC), value=[],
+                          className="pt-check"),
+            dcc.Checklist(id="pt-core", options=_check(LABEL_CORE), value=[],
+                          className="pt-check"),
+            dcc.Checklist(id="pt-switch", options=_check(LABEL_SWITCH), value=["on"],
+                          className="pt-check"),
         ]),
         dcc.Loading(type="dot", delay_show=400, children=[
             dcc.Store(id="pt-html"),   # the warnings + table as HTML text
@@ -603,28 +607,26 @@ body { margin: 0; background: #ffffff; color: #1f2430;
        font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
        font-size: 15px; }
 .pt-page { padding: 18px 24px 40px; }
-.pt-page h1 { font-size: 28px; margin: 0 0 14px; font-weight: 700; }
-.pt-field { margin-bottom: 12px; }
-.pt-field label { display: block; font-size: 13px; color: #555b6a; margin-bottom: 4px; }
+.pt-top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; }
+.pt-page h1 { font-size: 24px; margin: 0; font-weight: 700; }
 .pt-date-box { width: 11rem; }
-.pt-check { margin: 6px 0; }
+.pt-checks { display: flex; flex-wrap: wrap; gap: 2px 26px; margin: 8px 0 2px; }
 .pt-check label { display: flex !important; align-items: center; gap: 8px; cursor: pointer; }
 .pt-check input { width: 16px; height: 16px; margin: 0; flex: 0 0 auto; }
 .pt-check input:disabled, .pt-check input:disabled + * { opacity: .45; cursor: not-allowed; }
-.pt-switch input { appearance: none; -webkit-appearance: none; width: 34px; height: 18px;
-       border-radius: 9px; background: #b8bdc9; position: relative; cursor: pointer;
-       transition: background .15s; border: none; }
-.pt-switch input::after { content: ""; position: absolute; top: 2px; left: 2px;
-       width: 14px; height: 14px; border-radius: 50%; background: #fff;
-       transition: left .15s; }
-.pt-switch input:checked { background: #2a78d6; }
-.pt-switch input:checked::after { left: 18px; }
-#pt-highlight { margin: 12px 0 6px; }
 .pt-ref { width: 9rem; }
-.pt-hl-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
-       margin-top: 8px; }
-.pt-range { width: 7rem; flex: 0 0 auto; box-sizing: border-box; padding: 6px 8px; border: 1px solid #c6cad3; border-radius: 6px;
-       font: inherit; }
+.pt-hl-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+.pt-stepper { display: flex; align-items: stretch; }
+.pt-range { width: 5.5rem; flex: 0 0 auto; box-sizing: border-box; padding: 6px 8px;
+       border: 1px solid #c6cad3; border-radius: 0; border-left: 0; border-right: 0;
+       font: inherit; text-align: center; -moz-appearance: textfield; }
+.pt-range::-webkit-inner-spin-button, .pt-range::-webkit-outer-spin-button {
+       -webkit-appearance: none; margin: 0; }
+.pt-step { width: 34px; border: 1px solid #c6cad3; background: #f4f5f8; font: inherit;
+       font-size: 18px; line-height: 1; cursor: pointer; color: #1f2430; }
+.pt-step:first-child { border-radius: 6px 0 0 6px; }
+.pt-step:last-child { border-radius: 0 6px 6px 0; }
+.pt-step:hover { background: #e6e9f0; }
 .pt-warning { background: #fff8db; border: 1px solid #f0dd8a; color: #6b5300;
        border-radius: 8px; padding: 10px 14px; margin: 12px 0; }
 .pt-warning p { margin: 0 0 6px; }
@@ -645,7 +647,7 @@ body { margin: 0; background: #ffffff; color: #1f2430;
 
 DB_PATH = find_db()  # main() replaces it when --db is given
 
-app = Dash(__name__, title="Hourly price table", update_title=None)
+app = Dash(__name__, title="Hourly prices", update_title=None)
 app.index_string = app.index_string.replace("{%css%}", "{%css%}<style>" + CSS + "</style>")
 app.layout = serve_layout
 
@@ -658,7 +660,7 @@ app.layout = serve_layout
     Input("pt-core", "value"),
 )
 def lock_controls(nordic, core):
-    """Short list is not offered together with the Nordic view; the switch
+    """Short list is not offered together with the Nordic view; the third box
     does nothing in either of those two views, so it is greyed out there."""
     nordic_on = bool(nordic)
     core_on = bool(core) and not nordic_on
@@ -690,7 +692,6 @@ def fill_reference_zones(day_text, current):
 @app.callback(
     Output("pt-html", "data"),
     Output("pt-caption", "children"),
-    Output("pt-ref-name", "children"),
     Input("pt-date", "date"),
     Input("pt-nordic", "value"),
     Input("pt-core", "value"),
@@ -702,10 +703,27 @@ def update_table(day_text, nordic, core, switch, ref_zone, range_value):
     day = _parse_day(day_text)
     ref_zone = ref_zone or "DE_LU"
     if day is None:
-        return to_html(_warning("Pick a date.")), "", ref_zone
+        return to_html(_warning("Pick a date.")), ""
     notes, table_div, caption = render(
         day, bool(nordic), bool(core), bool(switch), ref_zone, _parse_range(range_value))
-    return to_html([notes, table_div]), caption, ref_zone
+    # The table first; the warnings (missing zones etc.) go below it.
+    return to_html([table_div, notes]), caption
+
+
+RANGE_BUTTON_STEP = 0.10  # EUR/MWh per click on the - / + buttons
+
+
+@app.callback(
+    Output("pt-range", "value"),
+    Input("pt-minus", "n_clicks"),
+    Input("pt-plus", "n_clicks"),
+    State("pt-range", "value"),
+    prevent_initial_call=True,
+)
+def step_range(_minus, _plus, current):
+    """The - and + buttons change the range by 10 cent. Never below 0."""
+    step = -RANGE_BUTTON_STEP if ctx.triggered_id == "pt-minus" else RANGE_BUTTON_STEP
+    return max(round(_parse_range(current) + step, 2), 0)
 
 
 # Runs in the browser: writes the HTML text from the Store into the page.
