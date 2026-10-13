@@ -83,13 +83,20 @@ https://entsoe-price-table.streamlit.app
 
 ## Online Dash version (Render)
 
-The same two dashboards as Dash apps, on Render instead of Streamlit Cloud
-(Streamlit Cloud can only run Streamlit apps). One web address:
-`/` = hourly price table, `/years/` = Year comparison with all 5 tabs.
+The Dash dashboards, on Render instead of Streamlit Cloud (Streamlit Cloud
+can only run Streamlit apps). One web address:
+`/` = hourly price table, `/years/` = Year comparison with all 5 tabs,
+`/dayahead/` = day-ahead prices + load forecast (`entsoe_dash.py`),
+`/auctions/` = JAO capacity auctions (`jao_dash.py`),
+`/futures/` = EEX power futures (`eex_dash.py`), behind the password in
+Render's `FUTURES_PASSWORD` setting (EEX data may not be republished).
+The gas dashboards (ENTSOG, GIE) stay on the PC: their data (2.8 GB and
+0.85 GB) is too big for the free plan.
 
-- `online_app.py` - downloads the data and serves both apps. Runs
-  `price_table_dash.py` and `year_comparison_dash.py` unchanged (exact
-  copies of the files in `entsoe_scraper`).
+- `online_app.py` - downloads the data and serves all apps. Runs the
+  dashboard files unchanged (exact copies of the files in `entsoe_scraper`,
+  `jao_scraper` and `eex_scraper`). A memory guard empties the apps' caches
+  when the app passes 350 MB (free plan: 512 MB).
 - Data for the price table: `entsoe_data.db` from this repo (GitHub
   Actions, as above) MERGED with `recent_prices.db.gz` (last 14 days from
   Peter's PC, uploaded right after each local fetch). A price missing on

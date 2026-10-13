@@ -1,10 +1,14 @@
 """
-online_app.py -- the ONLINE version (on Render) of the two Dash dashboards:
+online_app.py -- the ONLINE version (on Render) of the Dash dashboards:
 
-    /          Hourly price table   (price_table_dash.py)
-    /years/    Year comparison      (year_comparison_dash.py, all 5 tabs)
+    /            Hourly price table   (price_table_dash.py)
+    /years/      Year comparison      (year_comparison_dash.py, all 5 tabs)
+    /dayahead/   Day-ahead prices     (entsoe_dash.py)
+    /auctions/   Capacity auctions    (jao_dash.py)
+    /futures/    Power futures        (eex_dash.py) -- behind a password
+                 (FUTURES_PASSWORD): EEX data may not be republished
 
-Both dashboard files are the same files as on the PC, unchanged. This file
+The dashboard files are the same files as on the PC, unchanged. This file
 only does three things around them:
 
   1. Gets the data:
@@ -15,9 +19,12 @@ only does three things around them:
          recent_prices.db.gz   from the GitHub release "online-data": the
                                last 14 days from Peter's PC, sent right after
                                each local run fetched the prices
-       year comparison:
-         entsoe_history.db.gz  from the same release, uploaded by
-         jao_history.db.gz     upload_online_data.py on Peter's PC
+       the other pages: from the same release, uploaded by
+       upload_online_data.py on Peter's PC:
+         entsoe_history.db.gz   year comparison, day-ahead prices
+         load_forecast.db.gz    day-ahead prices (load forecast)
+         jao_history.db.gz      year comparison, capacity auctions
+         eex_market_data.db.gz  power futures
   2. Looks for newer files: prices every 2 minutes, history every 10 minutes
      (and at every start -- Render's free plan stops the app after 15 idle
      minutes).
@@ -30,7 +37,12 @@ Try it on the PC:
 """
 
 import argparse
+import base64
+import ctypes
+import gc
 import gzip
+import hmac
+import importlib
 import json
 import os
 import shutil
@@ -65,7 +77,17 @@ PC_RECENT_DB = DATA_DIR / "pc_recent_prices.db"  # last 14 days from Peter's PC
 PRICE_DB = DATA_DIR / "entsoe_data.db"          # both merged = what the table reads
 HISTORY_DB = DATA_DIR / "entsoe_history.db"
 JAO_DB = DATA_DIR / "jao_history.db"
-HISTORY_FILES = [("entsoe_history.db.gz", HISTORY_DB), ("jao_history.db.gz", JAO_DB)]
+LOAD_DB = DATA_DIR / "load_forecast.db"
+EEX_DB = DATA_DIR / "eex_market_data.db"
+# (file in the release, local copy, required). The optional ones are left
+# out until the PC uploads them; their pages wait. Load forecast first, so
+# it is new before the history file (whose change refreshes the caches).
+HISTORY_FILES = [
+    ("load_forecast.db.gz", LOAD_DB, False),
+    ("eex_market_data.db.gz", EEX_DB, False),
+    ("entsoe_history.db.gz", HISTORY_DB, True),
+    ("jao_history.db.gz", JAO_DB, True),
+]
 STAMP_NAME = "stamp.json"          # written last by upload_online_data.py
 PC_RECENT_NAME = "recent_prices.db.gz"
 PC_RECENT_STAMP_NAME = "recent_stamp.json"
@@ -239,15 +261,20 @@ def refresh_history() -> None:
     stamp_text = r.text
     with _state_lock:
         state = _load_state()
-    have_files = all(path.is_file() for _, path in HISTORY_FILES)
+    have_files = all(path.is_file() for _, path, _ in HISTORY_FILES)
     if have_files and state.get("history_stamp") == stamp_text:
         _set_uploaded_at(stamp_text)
         _status["history"] = "ok"
         return
     _status["history"] = "downloading"
     started = time.time()
-    for name, path in HISTORY_FILES:
-        _download(f"{RELEASE_URL}/{name}", path, gunzip=True)
+    for name, path, required in HISTORY_FILES:
+        try:
+            _download(f"{RELEASE_URL}/{name}", path, gunzip=True)
+        except requests.HTTPError as exc:
+            if required or exc.response is None or exc.response.status_code != 404:
+                raise
+            log(f"{name} is not in the release yet - its page waits")
     with _state_lock:
         state = _load_state()
         state["history_stamp"] = stamp_text
@@ -326,25 +353,50 @@ def prepare_data() -> None:
 
 
 # ---------------------------------------------------------------------
-# 3: the two dashboards behind one address
+# 3: the dashboards behind one address
 # ---------------------------------------------------------------------
 prepare_data()
 
 from dash import Input, Output, dcc, html  # noqa: E402
 from werkzeug.middleware.dispatcher import DispatcherMiddleware  # noqa: E402
-from werkzeug.utils import redirect  # noqa: E402
 
-import price_table_dash as pt  # noqa: E402
 
-os.environ["DASH_REQUESTS_PATHNAME_PREFIX"] = "/years/"
-try:
-    import year_comparison_dash as yc  # noqa: E402
-finally:
-    os.environ.pop("DASH_REQUESTS_PATHNAME_PREFIX", None)
+def _import_under(module_name: str, prefix: str):
+    """Import a Dash app module so that its pages and requests live under
+    `prefix` (Dash reads this setting when the app is created)."""
+    if prefix == "/":
+        return importlib.import_module(module_name)
+    os.environ["DASH_REQUESTS_PATHNAME_PREFIX"] = prefix
+    try:
+        return importlib.import_module(module_name)
+    finally:
+        os.environ.pop("DASH_REQUESTS_PATHNAME_PREFIX", None)
+
+
+pt = _import_under("price_table_dash", "/")
+yc = _import_under("year_comparison_dash", "/years/")
+ed = _import_under("entsoe_dash", "/dayahead/")
+jd = _import_under("jao_dash", "/auctions/")
+eex = _import_under("eex_dash", "/futures/")
 
 pt.DB_PATH = PRICE_DB
 yc.DB_PATH = HISTORY_DB
 yc.JAO_DB_FILE = JAO_DB
+ed.DB_PATH = HISTORY_DB
+jd.DB_PATH = JAO_DB
+eex.DB_PATH = EEX_DB
+
+
+def _dayahead_connect():
+    """entsoe_dash reads prices from the history file and the load forecast
+    from its own file: attached, so its SQL finds both tables unchanged."""
+    conn = sqlite3.connect(HISTORY_DB.resolve().as_uri() + "?mode=ro", uri=True)
+    if LOAD_DB.is_file():
+        conn.execute("ATTACH DATABASE ? AS lf", (LOAD_DB.resolve().as_uri() + "?mode=ro",))
+    return conn
+
+
+ed._connect = _dayahead_connect
 
 # Tenors left out of the Corridor margins / Market value pickers online.
 # Daily needs ~1.1 GB of memory (1.5 million hourly auction rows), more than
@@ -374,7 +426,13 @@ NAV_CSS = """
            background: #eaf2fc; border: 1px solid #c5dbf5; color: #1d4f8c;
            font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif; }
 """
-PAGES = [("pt", "Hourly price table", "/"), ("yc", "Year comparison", "/years/")]
+PAGES = [
+    ("pt", "Hourly price table", "/"),
+    ("yc", "Year comparison", "/years/"),
+    ("ed", "Day-ahead prices", "/dayahead/"),
+    ("jd", "Capacity auctions", "/auctions/"),
+    ("eex", "Power futures", "/futures/"),
+]
 
 
 def nav(here: str, note: str = ""):
@@ -387,13 +445,9 @@ def nav(here: str, note: str = ""):
     return html.Nav(links, className="ol-nav")
 
 
-def history_ready() -> bool:
-    return HISTORY_DB.is_file() and JAO_DB.is_file()
-
-
 def history_note() -> str:
     when = _status.get("history_uploaded_at")
-    return f"History updated {when}" if when else ""
+    return f"Data from the PC uploaded {when}" if when else ""
 
 
 def prices_note() -> str:
@@ -401,18 +455,18 @@ def prices_note() -> str:
     return f"Prices from the PC uploaded {when}, from GitHub checked every 2 min" if when else ""
 
 
-def price_table_page():
-    return html.Div([nav("pt", prices_note()), pt.serve_layout()])
-
-
 def wait_page():
     state = _status["history"]
     if state.startswith("no history"):
-        text = [html.B("No history uploaded yet. "),
+        text = [html.B("No data uploaded yet. "),
                 "Run upload_online_data.py once on the PC. "
                 "This page checks again every 20 seconds."]
+    elif state == "ok":
+        text = [html.B("The data for this page is not uploaded yet. "),
+                "It comes with the next upload from the PC (after its 04:00 and "
+                "13:00 runs). This page checks again every 20 seconds."]
     else:
-        text = [html.B("The history is being downloaded (about 70 MB). "),
+        text = [html.B("The data is being downloaded (about 100 MB). "),
                 f"Status: {state}. This page reloads by itself every 20 seconds."]
     return html.Div([
         html.Div(text, className="ol-wait"),
@@ -420,28 +474,76 @@ def wait_page():
     ])
 
 
-def year_comparison_page():
-    if not history_ready():
-        return html.Div([nav("yc"), wait_page()])
-    return html.Div([nav("yc", history_note()), yc.serve_layout()])
+# key -> (module, page builder, files the page needs, note)
+APPS = {
+    "pt": (pt, pt.serve_layout, [PRICE_DB], prices_note),
+    "yc": (yc, yc.serve_layout, [HISTORY_DB, JAO_DB], history_note),
+    "ed": (ed, ed.make_layout, [HISTORY_DB, LOAD_DB], history_note),
+    "jd": (jd, jd.make_layout, [JAO_DB], history_note),
+    "eex": (eex, eex.make_layout, [EEX_DB], history_note),
+}
 
 
-for _module in (pt, yc):
+def _page_for(key):
+    module, build, needs, note = APPS[key]
+
+    def page():
+        if not all(path.is_file() for path in needs):
+            return html.Div([nav(key), wait_page()])
+        return html.Div([nav(key, note()), build()])
+    return page
+
+
+VALIDATION = {"pt": pt.serve_layout, "yc": yc.serve_layout, "ed": ed.full_layout,
+              "jd": jd.full_layout, "eex": eex.full_layout}
+for _key, (_module, _build, _needs, _note) in APPS.items():
     _module.app.index_string = _module.app.index_string.replace(
         "{%css%}", "{%css%}<style>" + NAV_CSS + "</style>")
+    _module.app.layout = _page_for(_key)
+    _module.app.validation_layout = html.Div([nav(_key, "x"), wait_page(), VALIDATION[_key]()])
+    _module.app.clientside_callback(
+        "function (n) { if (n) { window.location.reload(); } "
+        "return window.dash_clientside.no_update; }",
+        Output("ol-wait-tick", "disabled"),
+        Input("ol-wait-tick", "n_intervals"),
+    )
 
-pt.app.layout = price_table_page
-pt.app.validation_layout = html.Div([nav("pt", "x"), pt.serve_layout()])
-yc.app.layout = year_comparison_page
-yc.app.validation_layout = html.Div([nav("yc", "x"), wait_page(), yc.serve_layout()])
-yc.app.clientside_callback(
-    "function (n) { if (n) { window.location.reload(); } return window.dash_clientside.no_update; }",
-    Output("ol-wait-tick", "disabled"),
-    Input("ol-wait-tick", "n_intervals"),
-)
+
+class PasswordGate:
+    """HTTP password (the browser asks once, any user name) in front of one
+    app. EEX data may not be republished, and this site is public."""
+
+    def __init__(self, app, password: str, realm: str):
+        self.app, self.password, self.realm = app, password, realm
+
+    def __call__(self, environ, start_response):
+        if not self.password:
+            start_response("403 Forbidden", [("Content-Type", "text/html; charset=utf-8")])
+            return [b"<p style='font-family:sans-serif;margin:24px'>Power futures is switched "
+                    b"off online until a password is set: in Render, open the service, "
+                    b"Environment, add <b>FUTURES_PASSWORD</b>.</p>"]
+        header = environ.get("HTTP_AUTHORIZATION", "")
+        if header.startswith("Basic "):
+            try:
+                _user, _, given = base64.b64decode(header[6:]).decode("utf-8").partition(":")
+            except (ValueError, UnicodeDecodeError):
+                given = ""
+            if hmac.compare_digest(given.encode(), self.password.encode()):
+                return self.app(environ, start_response)
+        start_response("401 Unauthorized", [
+            ("WWW-Authenticate", f'Basic realm="{self.realm}", charset="UTF-8"'),
+            ("Content-Type", "text/plain; charset=utf-8")])
+        return [b"Password needed."]
+
 
 server = pt.app.server
-server.wsgi_app = DispatcherMiddleware(server.wsgi_app, {"/years": yc.app.server})
+server.wsgi_app = DispatcherMiddleware(server.wsgi_app, {
+    "/years": yc.app.server,
+    "/dayahead": ed.app.server,
+    "/auctions": jd.app.server,
+    "/futures": PasswordGate(eex.app.server, os.environ.get("FUTURES_PASSWORD", ""),
+                             "Power futures"),
+})
 
 
 @server.route("/healthz")
@@ -449,13 +551,56 @@ def healthz():
     return "ok"
 
 
-@server.route("/years")
-def years_without_slash():
-    return redirect("/years/")
+# Memory guard. Render's free plan has 512 MB and restarts the app when it
+# needs more. Each dashboard keeps its results in a cache; when the whole
+# app passes MEMORY_LIMIT_MB, all caches are emptied and the memory is given
+# back. Pages are then simply worked out again on the next click.
+MEMORY_LIMIT_MB = int(os.environ.get("MEMORY_LIMIT_MB", "350"))
+
+
+def _rss_mb() -> int:
+    try:
+        with open("/proc/self/status") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0          # not Linux (e.g. on the PC): the guard does nothing
+
+
+def free_memory() -> None:
+    for module in (pt, yc, ed, jd, eex):
+        cache = getattr(module, "_cache", None)
+        lock = getattr(module, "_cache_lock", None) or getattr(module, "_lock", None)
+        if cache is None:
+            continue
+        if lock is None:
+            cache.clear()
+        else:
+            with lock:
+                cache.clear()
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _memory_guard() -> None:
+    while True:
+        time.sleep(15)
+        used = _rss_mb()
+        if MEMORY_LIMIT_MB and used > MEMORY_LIMIT_MB:
+            free_memory()
+            log(f"memory {used} MB > {MEMORY_LIMIT_MB} MB: caches emptied, now {_rss_mb()} MB")
+
+
+threading.Thread(target=_memory_guard, name="memory-guard", daemon=True).start()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Both dashboards behind one address.")
+    parser = argparse.ArgumentParser(description="All online dashboards behind one address.")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8060)))
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()

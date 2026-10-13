@@ -1,4 +1,6 @@
 # Render setup for the online Dash dashboards (online_app.py).
+# Power futures (EEX) needs FUTURES_PASSWORD: set it by hand in Render ->
+# the service -> Environment (it is a secret, so it is not in this file).
 # Render reads this file when the service is created as a "Blueprint"
 # (Render dashboard -> New -> Blueprint -> pick this repo).
 #
@@ -20,6 +22,9 @@ services:
         - online_app.py
         - price_table_dash.py
         - year_comparison_dash.py
+        - entsoe_dash.py
+        - jao_dash.py
+        - eex_dash.py
         - requirements-online.txt
         - render.yaml
     envVars:
