@@ -376,7 +376,10 @@ def _import_under(module_name: str, prefix: str):
 pt = _import_under("price_table_dash", "/")
 yc = _import_under("year_comparison_dash", "/years/")
 ed = _import_under("entsoe_dash", "/dayahead/")
-jd = _import_under("jao_dash", "/auctions/")
+# jao_dash (capacity auctions) is merged into the LTCAP tool since 2026-10-13:
+# year_comparison_dash imports it and shows its tabs, so it is loaded already.
+# No page of its own any more - /auctions/ now forwards to /years/.
+jd = sys.modules.get("jao_dash") or importlib.import_module("jao_dash")
 eex = _import_under("eex_dash", "/futures/")
 
 pt.DB_PATH = PRICE_DB
@@ -428,9 +431,8 @@ NAV_CSS = """
 """
 PAGES = [
     ("pt", "Hourly price table", "/"),
-    ("yc", "Year comparison", "/years/"),
+    ("yc", "LTCAP tool", "/years/"),
     ("ed", "Day-ahead prices", "/dayahead/"),
-    ("jd", "Capacity auctions", "/auctions/"),
     ("eex", "Power futures", "/futures/"),
 ]
 
@@ -479,7 +481,6 @@ APPS = {
     "pt": (pt, pt.serve_layout, [PRICE_DB], prices_note),
     "yc": (yc, yc.serve_layout, [HISTORY_DB, JAO_DB], history_note),
     "ed": (ed, ed.make_layout, [HISTORY_DB, LOAD_DB], history_note),
-    "jd": (jd, jd.make_layout, [JAO_DB], history_note),
     "eex": (eex, eex.make_layout, [EEX_DB], history_note),
 }
 
@@ -495,7 +496,7 @@ def _page_for(key):
 
 
 VALIDATION = {"pt": pt.serve_layout, "yc": yc.serve_layout, "ed": ed.full_layout,
-              "jd": jd.full_layout, "eex": eex.full_layout}
+              "eex": eex.full_layout}
 for _key, (_module, _build, _needs, _note) in APPS.items():
     _module.app.index_string = _module.app.index_string.replace(
         "{%css%}", "{%css%}<style>" + NAV_CSS + "</style>")
@@ -536,11 +537,20 @@ class PasswordGate:
         return [b"Password needed."]
 
 
+def _moved_to(location: str):
+    """Old address -> new one (e.g. bookmarks of the old Capacity auctions page)."""
+    def app(environ, start_response):
+        start_response("301 Moved Permanently", [("Location", location),
+                                                 ("Content-Type", "text/plain")])
+        return [b"Moved"]
+    return app
+
+
 server = pt.app.server
 server.wsgi_app = DispatcherMiddleware(server.wsgi_app, {
     "/years": yc.app.server,
     "/dayahead": ed.app.server,
-    "/auctions": jd.app.server,
+    "/auctions": _moved_to("/years/"),
     "/futures": PasswordGate(eex.app.server, os.environ.get("FUTURES_PASSWORD", ""),
                              "Power futures"),
 })

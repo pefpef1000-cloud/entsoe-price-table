@@ -2,15 +2,19 @@
 JAO auction data - Dash version
 ===============================
 
-Dash version of `jao_dashboard.py` (Streamlit) over `jao_data.db`, built by
-`jao_scraper.py`. Same queries, same calculations (copied unchanged), same
-four tabs. The Streamlit file is left as it was.
+Dash version of `jao_dashboard.py` (Streamlit, since deleted - see
+`dashboards/00-standard.md`) over `jao_data.db`, built by `jao_scraper.py`.
+The first four tabs are the original queries/calculations copied unchanged;
+"Buyer lookup map" (added 2026-10-13) is new, Dash-only.
 
 - Corridor explorer: one corridor + horizon + product - every auction's
   volume and price, with the opposite direction alongside. For the
   Monthly horizon also year-by-month tables of price and volume.
 - Buyers by month: one horizon + month - who won each corridor.
 - Buyer lookup: one buyer - everything they have won.
+- Buyer lookup map: one buyer + a time scope (all time/year/month) - a map
+  of Europe with a line for each corridor direction they won, sized and
+  coloured by how many times.
 - Top buyers: leaderboard by auctions won - all time, one year or one month.
 
 Run it (Windows, in the folder this file sits in):
@@ -39,13 +43,21 @@ file changes, then re-read - refresh the page or touch a picker.
 from __future__ import annotations
 
 import argparse
+import json
+import math
+from html import escape as html_escape
 import os
+import re
 import sqlite3
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
-from dash import Dash, Input, Output, ctx, dash_table, dcc, html, no_update
+import plotly.graph_objects as go
+from dash import Dash, Input, Output, State, ctx, dash_table, dcc, html, no_update
 from dash.dash_table.Format import Format, Group, Scheme
 
 DEFAULT_PORT = 8055
@@ -69,6 +81,99 @@ EXCLUDED_DASHBOARD_HORIZONS = {"daily", "intraday"}
 FONT = "'Segoe UI', Inter, Arial, sans-serif"
 INK = {"text": "#1f2328", "muted": "#6b6a64", "grid": "#e8e7e1", "axis": "#c3c2b7",
        "bg": "#f6f5f1", "card": "#ffffff", "accent": "#2a78d6"}
+
+# ---------------------------------------------------------------------
+# Buyer lookup map - geography for JAO's corridor codes. One point per
+# country/zone token that actually appears in Peter's 103 real corridor
+# codes (checked against jao_data.db, 2026-10-13) - approximate, for a
+# schematic line map, not survey-accurate. D1/D2/N2 are JAO's own tokens
+# for DK1/DK2/NO2 (confirmed in dashboards/year-comparison-streamlit.md's
+# ZONE_TO_JAO_TOKEN and scrapers/jao-ceexd-bundle.md's sibling notes on
+# JAO's Danish/Norwegian corridors - JAO never uses "DK1"/"DK2"/"NO2").
+# lat, lon, display name.
+GEO = {
+    # Real country centroids (or, for DK1/DK2/NO2, the real centre of that
+    # bidding zone's own sub-region) - as close to the actual geography as
+    # a single point per zone can get, not a schematic spread.
+    "AT": (47.60, 14.55, "Austria"), "BE": (50.50, 4.47, "Belgium"),
+    "BG": (42.73, 25.49, "Bulgaria"), "CH": (46.82, 8.23, "Switzerland"),
+    "CZ": (49.82, 15.47, "Czechia"), "D1": (56.05, 9.30, "Denmark (DK1)"),
+    "D2": (55.50, 11.90, "Denmark (DK2)"), "DE": (51.17, 10.45, "Germany"),
+    "EE": (58.60, 25.01, "Estonia"),
+    "ES": (40.46, -3.75, "Spain"), "FI": (61.92, 25.75, "Finland"),
+    "FR": (46.23, 2.21, "France"), "GB": (54.00, -2.50, "Great Britain"),
+    "GR": (39.07, 21.82, "Greece"), "HR": (45.10, 15.20, "Croatia"),
+    "HU": (47.16, 19.50, "Hungary"), "IT": (42.80, 12.80, "Italy"),
+    "LV": (56.88, 24.60, "Latvia"), "ME": (42.71, 19.37, "Montenegro"),
+    "MK": (41.61, 21.75, "North Macedonia"), "N2": (58.70, 7.50, "Norway (NO2)"),
+    "NL": (52.13, 5.29, "Netherlands"), "PL": (51.92, 19.15, "Poland"),
+    "PT": (39.40, -8.22, "Portugal"), "RO": (45.94, 24.97, "Romania"),
+    "RS": (44.02, 21.01, "Serbia"), "SI": (46.15, 15.00, "Slovenia"),
+    "SK": (48.67, 19.70, "Slovakia"), "UA": (48.38, 31.17, "Ukraine"),
+}
+
+# Named-cable prefixes (3-part corridor codes, e.g. "IF1-FR-GB") - just for
+# a nicer hover label, the geography comes from GEO regardless.
+CABLE_NAMES = {"EL1": "ElecLink", "IF1": "IFA", "IF2": "IFA2",
+               "NLL": "Nemo Link", "NSL": "North Sea Link", "VKL": "Viking Link"}
+
+# Where each country pair's line crosses the REAL border - the direction
+# arrows sit here (Peter, 2026-10-13, drawing on the map: two arrows side by
+# side on each border, one per direction, e.g. BE-FR up by Chimay, not
+# halfway between Paris and Brussels). Land pairs: where the straight
+# centroid-to-centroid line crosses the two countries' shared border in
+# Natural Earth 1:50m - or, where that line misses the shared border (e.g.
+# HU-UA, whose straight line runs through Romania), the nearest point on it;
+# the line is then drawn bent through this point. Sea / same-country pairs
+# (cables, DK1-DK2): halfway between the real link's two landfalls.
+# Key = the two GEO tokens in alphabetical order. Any pair missing here
+# falls back to the midpoint of the two centroids (_border_point).
+BORDER_POINTS = {
+    "AT-CH": (47.02, 9.82), "AT-CZ": (48.98, 15.12), "AT-DE": (48.55, 13.46),
+    "AT-HU": (47.42, 16.56), "AT-IT": (46.52, 13.72), "AT-SI": (46.59, 14.86),
+    "BE-DE": (50.68, 6.11), "BE-FR": (49.96, 4.18), "BE-NL": (51.41, 4.93),
+    "BG-GR": (41.53, 24.28),
+    "BG-MK": (41.94, 22.86), "BG-RO": (43.68, 25.34), "BG-RS": (43.60, 22.48),
+    "CH-DE": (47.72, 8.69), "CH-FR": (46.62, 6.17), "CH-IT": (46.09, 9.06),
+    "CZ-DE": (50.48, 13.01), "CZ-SK": (49.11, 18.10), "D1-DE": (54.85, 9.58),
+    "DE-FR": (49.12, 7.03), "EE-LV": (57.99, 24.87),
+    # DE-NL: on the real border but further north (near Emmen) than where the
+    # straight line crosses (51.88, 6.63), so its arrows are clear of the
+    # BE-NL / NL-BE ones (Peter, 2026-10-13: "move the de nl arrows up").
+    "DE-NL": (52.77, 7.06),
+    "ES-FR": (43.01, -1.12), "ES-PT": (39.58, -7.47), "FR-IT": (44.68, 6.99),
+    "HR-HU": (46.08, 17.24), "HR-RS": (44.87, 18.99), "HR-SI": (45.45, 15.13),
+    "HU-RO": (46.72, 21.49), "HU-RS": (46.16, 19.98), "HU-SI": (46.49, 16.54),
+    "HU-SK": (48.22, 19.64), "HU-UA": (47.93, 22.86), "IT-SI": (45.61, 13.87),
+    "ME-RS": (43.10, 19.85), "MK-RS": (42.25, 21.55), "PL-UA": (50.48, 24.03),
+    "RO-RS": (44.68, 22.37), "RO-UA": (47.99, 26.16), "SK-UA": (48.61, 22.19),
+    # Sea cables / same country - halfway between the two landfalls.
+    "BE-GB": (51.33, 2.30),    # Nemo Link, Zeebrugge - Richborough
+    "D1-D2": (56.00, 10.90),   # Great Belt link - placed north of the real
+                               # crossing (55.35, 10.95) on purpose, so it
+                               # doesn't crowd D1-DE / D2-DE (Peter, 2026-10-13)
+    "D1-GB": (54.40, 4.20),    # Viking Link, Jutland coast - Lincolnshire
+    "D2-DE": (54.75, 13.00),   # Kriegers Flak link, east of Kontek - further
+                               # right so it's clear of D1-DE (Peter, 2026-10-13)
+    "D1-NL": (54.45, 7.50),    # COBRAcable, Jutland coast - Eemshaven (JAO: "DK-NL")
+    "EE-FI": (59.80, 25.00),   # Estlink 1+2, Gulf of Finland
+    "FR-GB": (50.00, -1.90),   # IFA / IFA2 / ElecLink - moved west from the
+                               # Strait of Dover (51.00, 1.45) to the western
+                               # Channel, clear of Nemo (Peter, 2026-10-13:
+                               # "move ifa ifa2 more to the left", "a bit more")
+    "GB-N2": (57.20, 1.95),    # North Sea Link, Blyth - Norwegian coast
+    "GR-IT": (39.83, 19.37),   # GRITA, Otranto - Epirus
+    "IT-ME": (42.38, 16.48),   # MONITA, Pescara - Kotor
+}
+
+# Arrow colours (Peter, 2026-10-13: "if all is selected one colour if more
+# are selected separate colours for the tenors picked"). Tenor colours are
+# the dashboard standard's fixed colour-blind-safe palette, one per tenor in
+# TENOR_ORDER, so a tenor keeps its colour whatever else is picked. "All"
+# is a neutral dark, so it never reads as one particular tenor.
+ALL_TENORS_COLOR = "#1f2328"
+TENOR_COLORS = {"Yearly": "#2a78d6", "Seasonal": "#eb6834", "Quarterly": "#1baf7a",
+                "Monthly": "#eda100", "Weekly": "#e87ba4"}
 
 
 # ---------------------------------------------------------------------
@@ -140,6 +245,121 @@ def opposite_corridor(corridor_code: str) -> str | None:
         prefix, a, b = parts
         return f"{prefix}-{b}-{a}"
     return None
+
+
+# JAO's corridor "DK-NL" (COBRAcable) lands in DK1, so on the map "DK" is
+# shown as D1 (Peter, 2026-10-13: "Call DK D1"). Display only - the
+# database and the other tabs keep JAO's own "DK-NL".
+TOKEN_ALIAS = {"DK": "D1"}
+
+
+def display_code(corridor_code: str) -> str:
+    """corridor_code with TOKEN_ALIAS applied to each part ("DK-NL" ->
+    "D1-NL"); everything else unchanged."""
+    return "-".join(TOKEN_ALIAS.get(p, p) for p in corridor_code.split("-"))
+
+
+def corridor_endpoints(corridor_code: str) -> tuple[str, str, str] | None:
+    """(origin token, destination token, display label) for a corridor code,
+    using the same two/three-part shapes as opposite_corridor() above - or
+    None if it has no single geographic direction ("CEEXD", a bundled
+    multi-border auction - see scrapers/jao-ceexd-bundle.md) or either end
+    isn't in GEO."""
+    if corridor_code == "CEEXD":
+        return None
+    shown = display_code(corridor_code)
+    parts = shown.split("-")
+    if len(parts) == 2:
+        a, b = parts
+        label = shown
+    elif len(parts) == 3:
+        prefix, a, b = parts
+        label = f"{shown} ({CABLE_NAMES.get(prefix, prefix)})"
+    else:
+        return None
+    a0, b0 = re.sub(r"\(.*\)", "", a), re.sub(r"\(.*\)", "", b)
+    if a0 not in GEO or b0 not in GEO:
+        return None
+    return a0, b0, label
+
+
+def _border_point(a: str, b: str) -> tuple[float, float]:
+    """(lat, lon) where the a-b line crosses the real border (BORDER_POINTS),
+    or the midpoint of the two centroids if the pair isn't listed there."""
+    key = "-".join(sorted((a, b)))
+    if key in BORDER_POINTS:
+        return BORDER_POINTS[key]
+    return (GEO[a][0] + GEO[b][0]) / 2, (GEO[a][1] + GEO[b][1]) / 2
+
+
+# Pairs whose arrows should point straight at one country's dot instead of
+# following the centroid-border-centroid line (Peter, 2026-10-13: "de-d2
+# more to the right and point towards d2").
+ARROW_AIM = {"D2-DE": "D2"}
+
+
+# Direction-arrow size, in "local degrees" (1 = one degree of latitude, and
+# longitude is squeezed by cos(lat) first so the arrow isn't stretched
+# sideways). ~1.4 long on the full-Europe view = roughly a thumb's width.
+ARROW_HALF_LEN = 0.7
+ARROW_HEAD_LEN = 0.35     # length of each of the two arrowhead strokes
+ARROW_SIDE = 0.4      # how far each arrow sits off the line, to its own side
+LABEL_GAP = 0.4       # corridor-name label: this much further out than the arrow
+ARROW_WIDTH = 2           # px - thin line arrows (Peter, 2026-10-13: "make
+                          # arrowheads only lines and arrow thinner")
+ARROW_HEAD_ANGLE = 28     # degrees between the shaft and each head stroke
+
+
+def _arrow_label(items: list[tuple[str, int]], o: str, d: str) -> str:
+    """Small corridor name next to an arrow (Peter, 2026-10-13: "write the
+    name of the corridor in small next to the arrows"). A plain corridor
+    shows its own code ("FR-ES", "DE(TenneT)-CZ"); cable corridors sharing
+    one arrow show the direction plus the cable names ("FR-GB IFA, IFA2")."""
+    cables = [lab.split("(", 1)[1].rstrip(")") for lab, _ in items
+              if " (" in lab and lab.count("-") == 2]
+    if cables:
+        return f"{o}-{d} " + ", ".join(cables)
+    return ", ".join(lab for lab, _ in items)
+
+
+def _flow_arrow(lat_c, lon_c, ux, uy, half_len, head_len, side, n_parts=1):
+    """One direction's arrow at a border, drawn with thin lines only: a
+    shaft plus an open arrowhead (two short strokes from the tip - no
+    filled triangle; Peter, 2026-10-13: "make arrowheads only lines and
+    arrow thinner"). Centred on (lat_c, lon_c) but moved `side` to the
+    RIGHT of travel, pointing along (ux, uy) (a unit vector in the local
+    frame, x = lon * cos(lat), y = lat), so A->B and B->A land side by
+    side on opposite sides of the border.
+
+    With several tenors the shaft is cut lengthwise into `n_parts` equal
+    pieces, tail to tip, one per tenor colour - still one arrow with more
+    colours. Returns (parts, head): parts = list of (lats, lons) shaft
+    pieces from tail to tip; head = (lats, lons) of the open arrowhead
+    (left stroke end, tip, right stroke end)."""
+    k = math.cos(math.radians(lat_c)) or 1.0
+    nx, ny = uy, -ux                       # right-hand side of travel
+    cx, cy = lon_c * k + nx * side, lat_c + ny * side
+    tail = (cx - ux * half_len, cy - uy * half_len)
+    tip = (cx + ux * half_len, cy + uy * half_len)
+
+    def geo(pts):
+        return [p[1] for p in pts], [p[0] / k for p in pts]
+
+    parts = []
+    for i in range(n_parts):
+        a, b = i / n_parts, (i + 1) / n_parts
+        parts.append(geo([(tail[0] + (tip[0] - tail[0]) * a, tail[1] + (tip[1] - tail[1]) * a),
+                          (tail[0] + (tip[0] - tail[0]) * b, tail[1] + (tip[1] - tail[1]) * b)]))
+    t = math.radians(ARROW_HEAD_ANGLE)
+    back = (-ux, -uy)
+
+    def wing(sign):                        # rotate "back" by +/- the head angle
+        c, s = math.cos(sign * t), math.sin(sign * t)
+        return (tip[0] + (back[0] * c - back[1] * s) * head_len,
+                tip[1] + (back[0] * s + back[1] * c) * head_len)
+
+    head = geo([wing(1), tip, wing(-1)])
+    return parts, head
 
 
 @cached
@@ -379,6 +599,137 @@ def load_buyer_monthly_pivot(buyer_label: str) -> pd.DataFrame:
     return pivot.reindex(columns=ordered_cols)
 
 
+def _expand_to_delivery_months(df: pd.DataFrame) -> pd.DataFrame:
+    """Spread each row over every calendar month its delivery window
+    [market_period_start, market_period_stop) touches, in CET/CEST local
+    time (JAO stores local midnight as UTC, e.g. "2025-12-31T23:00Z" =
+    1 Jan 2026 00:00 CET; stop is exclusive, hence -1s) - the exact same
+    date handling as entsoe_scraper/year_comparison_dash.py's
+    _load_jao_tenor_prices()/_load_jao_tenor_winners(), the already-
+    verified JAO delivery-month expansion, reused here rather than
+    re-derived. Needs market_period_start, market_period_stop and
+    horizon_name columns (Weekly/Daily products are shorter than a month
+    and count only for the month they start in, same special case those
+    functions make). Adds year/month (1-12) columns; every other column
+    is repeated as-is, so one input row can become several output rows."""
+    if df.empty:
+        return df.assign(year=pd.Series(dtype="int64"), month=pd.Series(dtype="int64"))
+    start = pd.to_datetime(df["market_period_start"], utc=True).dt.tz_convert("CET")
+    stop = pd.to_datetime(df["market_period_stop"], utc=True).dt.tz_convert("CET") - pd.Timedelta(seconds=1)
+    first_month = (start.dt.year * 12 + start.dt.month - 1).to_numpy()
+    last_month = (stop.dt.year * 12 + stop.dt.month - 1).fillna(-1).astype(int).to_numpy()
+    sub_month = df["horizon_name"].isin(("Weekly", "Daily")).to_numpy()
+    last_month = np.where(sub_month, first_month, last_month)
+    n_months = np.maximum(last_month - first_month + 1, 1)
+
+    out = df.loc[df.index.repeat(n_months)].reset_index(drop=True)
+    month_index = np.repeat(first_month, n_months) + np.concatenate([np.arange(n) for n in n_months])
+    out["year"] = month_index // 12
+    out["month"] = month_index % 12 + 1
+    return out
+
+
+# Same canonical order as _order_horizons() (Daily/Intraday are excluded
+# dashboard-wide already - EXCLUDED_DASHBOARD_HORIZONS - so they are not
+# offered as a tenor to pick here either). Peter: "pick/unpick each
+# tenor" - the Buyer lookup map's only filter besides Buyer and Month
+# (Peter, 2026-10-13: "not scope and tenor. only tenor." - the earlier
+# Year/Quarter/Season/Month Scope control is gone; there is always
+# exactly one picked month, see load_delivery_months() below, and Tenor
+# is the one remaining way to narrow what's shown for it).
+TENOR_ORDER = ["Yearly", "Seasonal", "Quarterly", "Monthly", "Weekly"]
+
+
+@cached
+def load_buyer_map_data(buyer_label: str, year_month: str, tenors: str = "All") -> pd.DataFrame:
+    """One row per corridor + tenor (horizon_name) this buyer HOLDS
+    capacity for during the picked delivery month ("2026-10"), with the
+    win count and win date(s) (the day each auction closed), filtered by
+    `tenors` ("All", or a comma-joined subset of TENOR_ORDER - a plain
+    string rather than a list/set because @cached needs a hashable
+    argument).
+
+    Scoped by DELIVERY period (market_period_start/stop, via
+    _expand_to_delivery_months()), NOT by bid_gate_closure like Top
+    Buyers (load_top_buyers) - a Yearly auction won in November still
+    counts for every month it delivers in. That's deliberately different:
+    this map answers "what does this buyer hold in October", Top Buyers'
+    Month scope answers "which auctions did they win in October" - two
+    different questions that happen to share a month picker's shape.
+    (Peter, 2026-10-13, after the first bid_gate_closure-scoped version
+    showed only 2 corridors for a month where he knew there were more:
+    "they have more than 2 for oct".)
+
+    One win per auction regardless of how many EIC codes resolve to this
+    buyer's name, and regardless of how many delivery months it spans
+    overall (nunique on identification, not a row count - a Yearly
+    auction touches 12 expanded rows across the year but is still 1 win
+    in whichever single one of those months is picked here)."""
+    frag, params = _horizon_exclusion("a.horizon_name")
+    conn = _connect()
+    df = pd.read_sql_query(
+        f"""
+        SELECT a.identification, a.corridor_code, a.horizon_name,
+               a.market_period_start, a.market_period_stop, a.bid_gate_closure,
+               w.eic_code, n.party_name
+        FROM auction_winners w
+        JOIN auctions a ON a.identification = w.identification
+        LEFT JOIN eic_names n ON n.eic_code = w.eic_code
+        WHERE {frag}
+        """,
+        conn,
+        params=params,
+    )
+    conn.close()
+    empty = pd.DataFrame(columns=["corridor_code", "horizon_name", "wins", "win_date"])
+    if df.empty:
+        return empty
+
+    df["buyer_label"] = df["party_name"].fillna(df["eic_code"])
+    df = df[df["buyer_label"] == buyer_label]
+    if df.empty:
+        return empty
+    df = df.drop_duplicates(subset=["identification"])
+
+    if tenors != "All":
+        df = df[df["horizon_name"].isin(tenors.split(","))]
+        if df.empty:
+            return empty
+
+    expanded = _expand_to_delivery_months(df)
+    y, m = year_month.split("-")
+    mask = (expanded["year"] == int(y)) & (expanded["month"] == int(m))
+    expanded = expanded[mask]
+    if expanded.empty:
+        return empty
+
+    # One row per corridor + tenor (an auction has exactly one tenor, so
+    # summing these over tenors gives the per-corridor total again).
+    counts = (expanded.groupby(["corridor_code", "horizon_name"])["identification"]
+              .nunique().reset_index(name="wins"))
+
+    # Win date = the day the auction closed (bid_gate_closure, CET) - when
+    # the capacity was won (Peter, 2026-10-13: "add win date to the
+    # table"). One date per auction; several wins on the same day show as
+    # "2026-09-16 (x2)".
+    won = expanded.drop_duplicates("identification").copy()
+    won["day"] = (pd.to_datetime(won["bid_gate_closure"], utc=True)
+                  .dt.tz_convert("CET").dt.strftime("%Y-%m-%d"))
+
+    def fmt_days(days):
+        tally = days.dropna().value_counts()
+        return ", ".join(d if tally[d] == 1 else f"{d} (x{tally[d]})"
+                         for d in sorted(tally.index))
+
+    dates = (won.groupby(["corridor_code", "horizon_name"])["day"]
+             .apply(fmt_days).reset_index(name="win_date"))
+    counts = counts.merge(dates, on=["corridor_code", "horizon_name"], how="left")
+    rank = {t: i for i, t in enumerate(TENOR_ORDER)}
+    counts["_t"] = counts["horizon_name"].map(rank).fillna(len(rank))
+    counts = counts.sort_values(["corridor_code", "_t"]).drop(columns="_t")
+    return counts.reset_index(drop=True)
+
+
 @cached
 def load_available_years() -> list[int]:
     frag, params = _horizon_exclusion()
@@ -405,6 +756,221 @@ def load_available_year_months() -> list[str]:
         return []
     closed = pd.to_datetime([r[0] for r in rows], utc=True, errors="coerce").dropna()
     return sorted(set(closed.strftime("%Y-%m")))
+
+
+@cached
+def _all_auctions_by_delivery_month() -> pd.DataFrame:
+    """Every non-excluded-horizon auction, one row per calendar month it
+    DELIVERS in (_expand_to_delivery_months()) - the universe the Buyer
+    lookup map's Month picker is built from. Not buyer-filtered and not
+    the same thing as load_available_years()/load_available_year_months()
+    (those stay bid_gate_closure-based, for Top Buyers - see
+    load_buyer_map_data()'s docstring for why the two tabs deliberately
+    use different date columns)."""
+    frag, params = _horizon_exclusion()
+    conn = _connect()
+    df = pd.read_sql_query(
+        f"SELECT identification, corridor_code, horizon_name, market_period_start, "
+        f"market_period_stop FROM auctions WHERE {frag}",
+        conn,
+        params=params,
+    )
+    conn.close()
+    return _expand_to_delivery_months(df)
+
+
+@cached
+def load_delivery_months() -> list[str]:
+    expanded = _all_auctions_by_delivery_month()
+    return sorted({f"{y}-{m:02d}" for y, m in zip(expanded["year"], expanded["month"])})
+
+
+_MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def delivery_label(horizon: str, start: pd.Timestamp, stop: pd.Timestamp) -> str:
+    """Trader-style name of a delivery period (start/stop already in CET,
+    stop exclusive): Cal-27, Q1-27, Sum-27 / Win-26, Nov-26, or the dates
+    for anything shorter ("03-04 Oct")."""
+    if pd.isna(start) or pd.isna(stop):
+        return "-"
+    end = stop - pd.Timedelta(seconds=1)
+    yy = f"{start.year % 100:02d}"
+    if horizon == "Yearly":
+        return f"Cal-{yy}"
+    if horizon == "Quarterly":
+        return f"Q{(start.month - 1) // 3 + 1}-{yy}"
+    if horizon == "Monthly":
+        return f"{_MONTH_ABBR[start.month - 1]}-{yy}"
+    if horizon == "Seasonal" and start.month in (4, 10):
+        return f"{'Sum' if start.month == 4 else 'Win'}-{yy}"
+    if start.date() == end.date():
+        return f"{start.day:02d} {_MONTH_ABBR[start.month - 1]}"
+    if (start.year, start.month) == (end.year, end.month):
+        return f"{start.day:02d}-{end.day:02d} {_MONTH_ABBR[start.month - 1]}"
+    return (f"{start.day:02d} {_MONTH_ABBR[start.month - 1]} - "
+            f"{end.day:02d} {_MONTH_ABBR[end.month - 1]}")
+
+
+@cached
+def load_auction_calendar(first_day: str) -> pd.DataFrame:
+    """Every non-daily auction (dashboard-wide exclusions) whose bid gate
+    CLOSES on or after `first_day` ("2026-10-01", CET), one row per
+    auction slot: same close time, open time, tenor and delivery period ->
+    one row, with all its corridors. Columns: closes, opens (CET
+    Timestamps), horizon_name, delivery, corridors (list), cancelled (list
+    of the corridors JAO marked cancelled). The Auction calendar tab
+    (Peter, 2026-10-13: "make a new tab with the auction calendar")."""
+    frag, params = _horizon_exclusion()
+    since = pd.Timestamp(first_day, tz="CET").tz_convert("UTC")
+    conn = _connect()
+    df = pd.read_sql_query(
+        f"""SELECT corridor_code, horizon_name, cancelled, bid_gate_opening,
+                   bid_gate_closure, market_period_start, market_period_stop
+            FROM auctions
+            WHERE {frag} AND bid_gate_closure >= ?""",
+        conn, params=params + (since.strftime("%Y-%m-%dT%H:%M"),))
+    conn.close()
+    cols = ["closes", "opens", "horizon_name", "delivery", "corridors", "cancelled"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df["closes"] = pd.to_datetime(df["bid_gate_closure"], utc=True).dt.tz_convert("CET")
+    df["opens"] = pd.to_datetime(df["bid_gate_opening"], utc=True).dt.tz_convert("CET")
+    df = df[df["closes"] >= since.tz_convert("CET")]
+    start = pd.to_datetime(df["market_period_start"], utc=True).dt.tz_convert("CET")
+    stop = pd.to_datetime(df["market_period_stop"], utc=True).dt.tz_convert("CET")
+    df["delivery"] = [delivery_label(h, a, b) for h, a, b in zip(df["horizon_name"], start, stop)]
+    df["dstart"] = start
+    df = df.sort_values("corridor_code")
+    df["cancel_code"] = df["corridor_code"].where(df["cancelled"].fillna(0).astype(int) == 1)
+    out = (df.groupby(["closes", "opens", "horizon_name", "delivery", "dstart"], dropna=False)
+             .agg(corridors=("corridor_code", list),
+                  cancelled=("cancel_code", lambda s: [c for c in s if isinstance(c, str)]))
+             .reset_index())
+    rank = {t: i for i, t in enumerate(TENOR_ORDER)}
+    out["_t"] = out["horizon_name"].map(rank).fillna(len(rank))
+    out = out.sort_values(["closes", "_t", "dstart"]).reset_index(drop=True)
+    return out[cols]
+
+
+# "Update database" button (Peter, 2026-10-13: "add a button that if pressed
+# updates the database"). Runs `jao_scraper.py --upcoming` in the background
+# - the quick refresh of upcoming auctions, ~8 min at JAO's pace - and shows
+# its progress from the status file every scraper run writes next to the
+# database (jao_update_status.json, nightly runs included). Only shown where
+# the scraper and its API key sit next to this file, i.e. on Peter's PC -
+# never in the online copy.
+SCRAPER_PATH = Path(__file__).resolve().parent / "jao_scraper.py"
+CAN_UPDATE = SCRAPER_PATH.exists() and (SCRAPER_PATH.parent / "api_key.txt").exists()
+UPDATE_STATUS_FILE = "jao_update_status.json"
+UPDATE_STALE_MINUTES = 10        # "running" but silent this long = it died
+UPDATE_LOGS_KEPT = 20
+_update_lock = threading.Lock()
+_update_proc = None              # the run this dashboard started, if any
+
+
+def _scraper_python() -> str:
+    """The scraper's own venv (what the nightly run uses), else this Python."""
+    for p in (SCRAPER_PATH.parent / ".venv" / "Scripts" / "python.exe",
+              SCRAPER_PATH.parent / ".venv" / "bin" / "python"):
+        if p.exists():
+            return str(p)
+    return sys.executable
+
+
+def read_update_status() -> dict | None:
+    try:
+        return json.loads(DB_PATH.with_name(UPDATE_STATUS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _status_fresh(st: dict | None) -> bool:
+    """A run that says "running" and wrote within UPDATE_STALE_MINUTES."""
+    if not st or st.get("state") != "running":
+        return False
+    try:
+        last = pd.Timestamp(st.get("updated") or st.get("started"))
+    except (TypeError, ValueError):
+        return False
+    return pd.Timestamp.now(tz="UTC") - last < pd.Timedelta(minutes=UPDATE_STALE_MINUTES)
+
+
+def update_is_running() -> bool:
+    with _update_lock:
+        own = _update_proc is not None and _update_proc.poll() is None
+    return own or _status_fresh(read_update_status())
+
+
+def start_update() -> bool:
+    """Start `jao_scraper.py --upcoming` in the background, output to
+    logs/update_button_<time>.log. False if a run is already going (this
+    button's, or the nightly one)."""
+    global _update_proc
+    with _update_lock:
+        if _update_proc is not None and _update_proc.poll() is None:
+            return False
+        if _status_fresh(read_update_status()):
+            return False
+        log_dir = SCRAPER_PATH.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        old = sorted(log_dir.glob("update_button_*.log"))
+        for f in old[:max(0, len(old) - UPDATE_LOGS_KEPT + 1)]:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        log = log_dir / f"update_button_{pd.Timestamp.now(tz='CET'):%Y-%m-%d_%H%M%S}.log"
+        flags = 0
+        if os.name == "nt":       # no console window, not killed with the dashboard's
+            flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        with open(log, "w", encoding="utf-8") as fh:
+            _update_proc = subprocess.Popen(
+                [_scraper_python(), "-u", str(SCRAPER_PATH), "--upcoming", "--db", str(DB_PATH)],
+                cwd=str(SCRAPER_PATH.parent), stdout=fh, stderr=subprocess.STDOUT,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"}, creationflags=flags)
+        return True
+
+
+def _cet_hhmm(iso: str | None) -> str:
+    try:
+        t = pd.Timestamp(iso).tz_convert("CET")
+    except (TypeError, ValueError):
+        return "?"
+    today = pd.Timestamp.now(tz="CET").normalize()
+    return f"{t:%H:%M}" if t.normalize() == today else f"{t.day} {_MONTH_ABBR[t.month - 1]} {t:%H:%M}"
+
+
+def update_status_text() -> str:
+    st = read_update_status()
+    if st is None:
+        return "No update run recorded yet."
+    who = "Nightly update" if st.get("mode") == "full" else "Update"
+    state = st.get("state")
+    if state == "running" and _status_fresh(st):
+        done, total = st.get("done", 0), st.get("total", 0)
+        pct = f" ({100 * done // total}%)" if total else ""
+        return f"{who} running since {_cet_hhmm(st.get('started'))}: {done}/{total}{pct}."
+    if state == "running":
+        return (f"{who} from {_cet_hhmm(st.get('started'))} stopped without finishing "
+                f"({st.get('done', 0)}/{st.get('total', 0)}).")
+    when = _cet_hhmm(st.get("updated"))
+    if state == "done":
+        return f"Last update {when} ({who.lower()}): {st.get('message', '')}."
+    return f"{who} at {when} {state}: {st.get('message', '')}"
+
+
+@cached
+def load_last_fetch() -> str | None:
+    """When the scraper last saved auctions (CET, "13 Oct 04:14"), or None."""
+    conn = _connect()
+    row = conn.execute("SELECT MAX(fetched_at) FROM auctions").fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return None
+    t = pd.Timestamp(row[0]).tz_convert("CET")
+    return f"{t.day} {_MONTH_ABBR[t.month - 1]} {t:%H:%M}"
 
 
 @cached
@@ -586,6 +1152,210 @@ def num(value, decimals):
     return f"{value:.{decimals}f}" if pd.notna(value) else "-"
 
 
+def render_calendar_html(cal: pd.DataFrame, now: pd.Timestamp) -> str:
+    """The Auction calendar as one HTML table (one text, not one Dash
+    component per cell - see the dashboard standard), painted by CAL_PAINT_JS.
+    A header row per day, then that day's auction slots. Days before today
+    and slots that already closed are greyed. The first day from today on
+    carries data-anchor="today" - the painter scrolls there, so the tab opens
+    on today with the rest of the month above it."""
+    esc = html_escape
+    today = now.normalize()
+    out = ['<table class="cal"><thead><tr><th>Closes</th><th>Opens</th><th>Tenor</th>'
+           '<th>Delivery</th><th>Corridors</th><th>Status</th></tr></thead><tbody>']
+    anchored = False
+    for day, rows in cal.groupby(cal["closes"].dt.normalize(), sort=True):
+        cls = ["day"]
+        if day < today:
+            cls.append("past")
+        if day == today:
+            cls.append("today")
+        anchor = ""
+        if not anchored and day >= today:
+            anchor, anchored = ' data-anchor="today"', True
+        label = f"{day:%A} {day.day} {_MONTH_ABBR[day.month - 1]} {day.year}"
+        if day == today:
+            label += " - today"
+        out.append(f'<tr class="{" ".join(cls)}"{anchor}><th colspan="6">{esc(label)}</th></tr>')
+        for r in rows.itertuples():
+            live = [c for c in r.corridors if c not in r.cancelled]
+            if not live:
+                status = '<span class="st st-cancel">Cancelled</span>'
+            elif pd.notna(r.opens) and now < r.opens:
+                status = '<span class="st st-up">Upcoming</span>'
+            elif now < r.closes:
+                status = '<span class="st st-open">Open now</span>'
+            else:
+                status = '<span class="st st-closed">Closed</span>'
+            opens = ("-" if pd.isna(r.opens) else
+                     f"{r.opens.day} {_MONTH_ABBR[r.opens.month - 1]} {r.opens:%H:%M}")
+            color = TENOR_COLORS.get(r.horizon_name, INK["muted"])
+            corr = ", ".join(f'<s class="code">{esc(c)}</s>' if c in r.cancelled
+                             else f'<span class="code">{esc(c)}</span>' for c in r.corridors)
+            row_cls = ' class="past"' if r.closes < now else ""
+            out.append(
+                f"<tr{row_cls}><td>{r.closes:%H:%M}</td><td>{esc(opens)}</td>"
+                f'<td><span class="tdot" style="background:{color}"></span>{esc(r.horizon_name)}</td>'
+                f"<td>{esc(r.delivery)}</td>"
+                f'<td class="corr">{corr} <span class="cnt">({len(r.corridors)})</span></td>'
+                f"<td>{status}</td></tr>")
+    out.append("</tbody></table>")
+    return "".join(out)
+
+
+def render_buyer_map(counts: pd.DataFrame, split_tenors: bool) -> html.Div:
+    """counts: corridor_code, horizon_name, wins (load_buyer_map_data).
+
+    Arrows only, no lines (Peter, 2026-10-13: "loose the lines, they have
+    no relevance"). Every arrow sits on the real border crossing
+    (BORDER_POINTS), moved to the right-hand side of its own direction, so
+    A->B and B->A land side by side on opposite sides (_flow_arrow).
+
+    split_tenors=False ("All" picked): one arrow per direction, all in
+    ALL_TENORS_COLOR. split_tenors=True (one or more tenors picked): still
+    ONE arrow per direction, split lengthwise into one coloured strip per
+    tenor that direction was won in (TENOR_COLORS, in TENOR_ORDER) - a
+    direction won only as Yearly is all blue, Yearly + Monthly is half blue
+    half orange.
+
+    A small corridor-name label sits just outside each arrow. Several cable corridors in the same direction (FR->GB
+    via IFA, IFA2, ElecLink) share one arrow; the hover lists each. CEEXD
+    (a bundled multi-border auction) can't be placed - only counted in the
+    caption/table."""
+    borders, unmapped_wins = {}, 0
+    for _, row in counts.iterrows():
+        ends = corridor_endpoints(row["corridor_code"])
+        if ends is None:
+            unmapped_wins += int(row["wins"])
+            continue
+        a, b, label = ends
+        tenor = row["horizon_name"] if split_tenors else "All"
+        key = "-".join(sorted((a, b)))
+        entry = borders.setdefault(key, {"ends": tuple(sorted((a, b))), "dirs": {}})
+        per_tenor = entry["dirs"].setdefault((a, b), {})
+        per_tenor.setdefault(tenor, []).append((label, int(row["wins"])))
+
+    def unit(dx, dy):
+        m = math.hypot(dx, dy) or 1.0
+        return dx / m, dy / m
+
+    def color_of(tenor):
+        return TENOR_COLORS.get(tenor, ALL_TENORS_COLOR) if split_tenors else ALL_TENORS_COLOR
+
+    fig = go.Figure()
+    tenors_used = set()
+    lab_lats, lab_lons, lab_text, lab_pos, lab_col = [], [], [], [], []
+    for entry in borders.values():
+        t1, t2 = entry["ends"]
+        lat1, lon1 = GEO[t1][0], GEO[t1][1]
+        lat2, lon2 = GEO[t2][0], GEO[t2][1]
+        plat, plon = _border_point(t1, t2)
+
+        # Direction t1 -> t2 AT the border crossing, in the local frame
+        # (x = lon * cos(lat)): average of centroid->border and
+        # border->centroid, so it still lines up where the crossing is off
+        # the straight line (e.g. HU-UA).
+        k = math.cos(math.radians(plat))
+        leg1 = ((plon - lon1) * k, plat - lat1)
+        leg2 = ((lon2 - plon) * k, lat2 - plat)
+        u1, u2 = unit(*leg1), unit(*leg2)
+        ux, uy = unit(u1[0] + u2[0], u1[1] + u2[1])
+        aim = ARROW_AIM.get(f"{t1}-{t2}")
+        if aim in (t1, t2):
+            vx, vy = unit((GEO[aim][1] - plon) * k, GEO[aim][0] - plat)
+            ux, uy = (vx, vy) if aim == t2 else (-vx, -vy)
+        # Short legs (BE-FR's crossing is close to Belgium's centre) get a
+        # shorter arrow so it doesn't run past the country dot.
+        half_len = min(ARROW_HALF_LEN, 0.8 * min(math.hypot(*leg1), math.hypot(*leg2)))
+        head_len = min(ARROW_HEAD_LEN, half_len * 0.9)
+
+        for (o, d), per_tenor in entry["dirs"].items():
+            sx, sy = (ux, uy) if (o, d) == (t1, t2) else (-ux, -uy)
+            order = [t for t in ["All"] + TENOR_ORDER if t in per_tenor] + \
+                    sorted(t for t in per_tenor if t not in TENOR_ORDER and t != "All")
+            parts, (hlats, hlons) = _flow_arrow(
+                plat, plon, sx, sy, half_len, head_len, ARROW_SIDE, n_parts=len(order))
+            all_items, lines_ = [], []
+            for tenor in order:
+                items = per_tenor[tenor]
+                all_items += items
+                wins = sum(w for _, w in items)
+                what = f"{tenor}: " if split_tenors else ""
+                lines_.append(f"{what}{wins} win{'' if wins == 1 else 's'}")
+                if len(items) > 1 or items[0][0] != f"{o}-{d}":
+                    lines_ += [f"  {lab}: {w}" for lab, w in items]
+            hover = f"<b>{o} -> {d}</b><br>" + "<br>".join(lines_)
+            for tenor, (lats, lons) in zip(order, parts):
+                tenors_used.add(tenor)
+                fig.add_trace(go.Scattergeo(
+                    lat=lats, lon=lons, mode="lines",
+                    line=dict(width=ARROW_WIDTH, color=color_of(tenor)),
+                    hoverinfo="text", text=hover, showlegend=False))
+            # open arrowhead, in the colour of the piece it sits on
+            fig.add_trace(go.Scattergeo(
+                lat=hlats, lon=hlons, mode="lines",
+                line=dict(width=ARROW_WIDTH, color=color_of(order[-1])),
+                hoverinfo="text", text=hover, showlegend=False))
+
+            # Name label just outside the arrow, text running away from the
+            # border so the two directions' labels don't sit on each other.
+            nx, ny = sy, -sx
+            off = ARROW_SIDE + LABEL_GAP
+            lab_lats.append(plat + ny * off)
+            lab_lons.append(plon + nx * off / k)
+            if nx > 0.35:
+                lab_pos.append("middle right")
+            elif nx < -0.35:
+                lab_pos.append("middle left")
+            else:
+                lab_pos.append("top center" if ny > 0 else "bottom center")
+            # merge the same corridor across tenors before labelling
+            seen = {}
+            for lab, w in all_items:
+                seen[lab] = seen.get(lab, 0) + w
+            lab_text.append(_arrow_label(list(seen.items()), o, d))
+            lab_col.append(color_of(order[0]) if len(order) == 1 else INK["text"])
+
+    if lab_text:
+        fig.add_trace(go.Scattergeo(
+            lat=lab_lats, lon=lab_lons, mode="text", text=lab_text,
+            textposition=lab_pos, textfont=dict(size=9, color=lab_col),
+            hoverinfo="skip", showlegend=False))
+
+    touched = sorted({t for e in borders.values() for t in e["ends"]})
+    if touched:
+        fig.add_trace(go.Scattergeo(
+            lat=[GEO[t][0] for t in touched], lon=[GEO[t][1] for t in touched],
+            mode="markers+text", text=touched, textposition="top center",
+            marker=dict(size=6, color="#ffffff", line=dict(width=1.5, color=INK["muted"])),
+            textfont=dict(size=10, color=INK["muted"]),
+            hovertext=[GEO[t][2] for t in touched], hoverinfo="text", showlegend=False))
+
+    # Legend only when the colours mean something (tenors split).
+    if split_tenors:
+        for tenor in [t for t in TENOR_ORDER if t in tenors_used]:
+            fig.add_trace(go.Scattergeo(
+                lat=[None], lon=[None], mode="markers",
+                marker=dict(size=11, symbol="triangle-right", color=TENOR_COLORS[tenor]),
+                name=tenor, showlegend=True))
+
+    fig.update_geos(scope="europe", resolution=50, showland=True, landcolor="#eeede7",
+                    showcountries=True, countrycolor=INK["grid"], showcoastlines=True,
+                    coastlinecolor=INK["grid"], showframe=False, bgcolor="rgba(0,0,0,0)",
+                    lataxis_range=[33, 65], lonaxis_range=[-12, 33])
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=10, b=0), height=560, paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(family=FONT, size=12, color=INK["text"]), showlegend=split_tenors,
+        legend=dict(title=dict(text="Tenor"), orientation="h", y=-0.03))
+
+    children = [dcc.Graph(figure=fig, config={"displayModeBar": False})]
+    if unmapped_wins:
+        children.append(note(
+            f"{unmapped_wins} win(s) via CEEXD (a bundled multi-border auction, not a "
+            "single corridor - see the Corridor explorer tab) are not shown on the map, "
+            "only in the table below.", "note"))
+    return html.Div(children)
+
 CSS = f"""
 body {{ margin:0; background:{INK['bg']}; color:{INK['text']}; font-family:{FONT}; }}
 .wrap {{ max-width:1400px; margin:0 auto; padding:16px 20px 40px; }}
@@ -616,11 +1386,64 @@ h3 {{ font-size:16px; margin:18px 0 6px; }}
 .seg input {{ display:none; }}
 .seg label:has(input:checked) {{ background:{INK['accent']}; }}
 .seg label:has(input:checked), .seg label:has(input:checked) * {{ color:#fff !important; }}
+.updbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:2px 0 10px; }}
+.updbtn {{ padding:5px 14px; border:1px solid {INK['accent']}; background:{INK['accent']}; color:#fff;
+          border-radius:6px; cursor:pointer; font-size:13px; font-family:{FONT}; }}
+.updbtn:disabled {{ opacity:.5; cursor:default; }}
+.updstatus {{ font-size:13px; color:{INK['muted']}; }}
+.calbox {{ max-height:70vh; overflow:auto; background:{INK['card']};
+           border:1px solid {INK['grid']}; border-radius:6px; margin-top:8px; }}
+table.cal {{ border-collapse:collapse; width:100%; font-size:13px; }}
+table.cal thead th {{ position:sticky; top:0; z-index:2; background:{INK['bg']}; text-align:left;
+                     font-weight:600; padding:6px 10px; border-bottom:1px solid {INK['axis']}; }}
+table.cal td {{ padding:5px 10px; border-bottom:1px solid {INK['grid']}; vertical-align:top; }}
+table.cal tr.day th {{ text-align:left; padding:12px 10px 4px; font-weight:600;
+                      border-bottom:1px solid {INK['grid']}; }}
+table.cal tr.day.today th {{ color:{INK['accent']}; }}
+table.cal tr.past td, table.cal tr.day.past th {{ color:{INK['muted']}; opacity:.75; }}
+table.cal td {{ white-space:nowrap; }}
+table.cal td.corr {{ white-space:normal; max-width:560px; }}
+table.cal .code {{ white-space:nowrap; }}
+.tdot {{ display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }}
+.st {{ display:inline-block; padding:1px 8px; border-radius:9px; font-size:12px; white-space:nowrap; }}
+.st-open {{ background:#1baf7a; color:#fff; }}
+.st-up {{ border:1px solid {INK['axis']}; color:{INK['text']}; }}
+.st-closed {{ color:{INK['muted']}; }}
+.st-cancel {{ color:#c0392b; }}
+.cnt {{ color:{INK['muted']}; }}
 @media (max-width:700px) {{ .ctl, .ctl.wide {{ min-width:100%; }} }}
 """
 
+# Callbacks are recorded here and registered on an app by register_callbacks(),
+# so the same tabs can run on their own (this file's `app`) AND inside the
+# LTCAP tool (year_comparison_dash.py imports this file and registers them on
+# its app - Peter, 2026-10-13: "merge jao auction data app and LTCAP tool").
+_CALLBACKS: list = []
+
+
+def _callback(*args, **kwargs):
+    def record(func):
+        _CALLBACKS.append(("server", args, kwargs, func))
+        return func
+    return record
+
+
+def _clientside_callback(*args, **kwargs):
+    _CALLBACKS.append(("client", args, kwargs, None))
+
+
+def register_callbacks(target_app) -> None:
+    """Attach every callback of these tabs to `target_app`."""
+    for kind, args, kwargs, func in _CALLBACKS:
+        if kind == "server":
+            target_app.callback(*args, **kwargs)(func)
+        else:
+            target_app.clientside_callback(*args, **kwargs)
+
+
 TABS = [("corridor", "Corridor explorer"), ("bymonth", "Buyers by month"),
-        ("lookup", "Buyer lookup"), ("top", "Top buyers")]
+        ("lookup", "Buyer lookup"), ("bmap", "Buyer lookup map"), ("top", "Top buyers"),
+        ("cal", "Auction calendar")]
 TAB_STYLE = {"padding": "7px 12px", "fontSize": 14, "color": INK["muted"],
              "backgroundColor": INK["bg"], "border": "none",
              "borderBottom": f"1px solid {INK['grid']}"}
@@ -638,17 +1461,33 @@ def dd(id_):
     return dcc.Dropdown(id=id_, clearable=False)
 
 
-def full_layout():
+def header_parts():
+    """Caption + "Update database" bar - above the tabs, here and in the LTCAP tool."""
     caption = (f"Note: {', '.join(sorted(EXCLUDED_DASHBOARD_HORIZONS))}-horizon auctions are "
-               "excluded from this whole dashboard for now.") if EXCLUDED_DASHBOARD_HORIZONS else ""
-    return html.Div([
-        html.H1("JAO auction data"),
+               "excluded from the JAO tabs for now.") if EXCLUDED_DASHBOARD_HORIZONS else ""
+    return [
         html.Div(caption, className="sub"),
-        dcc.Tabs(id="tabs", value="corridor", children=[
-            dcc.Tab(label=label, value=value, style=TAB_STYLE, selected_style=TAB_SELECTED)
-            for value, label in TABS]),
+        html.Div([
+            html.Button("Update database", id="upd-btn", n_clicks=0, className="updbtn",
+                        title="Re-fetch upcoming auctions from JAO now (~8 min). "
+                              "The full update still runs every night at 04:00."),
+            html.Span(id="upd-status", className="updstatus"),
+            dcc.Interval(id="upd-tick", interval=15000, disabled=not CAN_UPDATE),
+            dcc.Store(id="upd-state"),
+            dcc.Store(id="db-refresh", data=0),
+        ], className="updbar", style=None if CAN_UPDATE else {"display": "none"}),
+    ]
+
+
+HIDDEN = {"display": "none"}
+
+
+def panels(first_visible: bool = True):
+    """The six tab panels (Corridor explorer ... Auction calendar). Only the
+    first is visible at the start, and only when these tabs come first."""
+    return [
         # Tabs only switch which panel is visible; every picker keeps its value.
-        html.Div(id="panel-corridor", children=[
+        html.Div(id="panel-corridor", style=None if first_visible else HIDDEN, children=[
             html.Div([ctl("Corridor", dd("c-corridor")), ctl("Horizon", dd("c-horizon")),
                       ctl("Product", dd("c-product"))], className="controls"),
             dcc.Loading(html.Div(id="c-body"), type="dot", delay_show=400)]),
@@ -659,6 +1498,16 @@ def full_layout():
         html.Div(id="panel-lookup", style={"display": "none"}, children=[
             html.Div([ctl("Buyer", dd("l-buyer"), wide=True)], className="controls"),
             dcc.Loading(html.Div(id="l-body"), type="dot", delay_show=400)]),
+        html.Div(id="panel-bmap", style={"display": "none"}, children=[
+            html.Div([
+                ctl("Buyer", dd("bm-buyer"), wide=True),
+                ctl("Month", dd("bm-month")),
+                ctl("Tenor", dcc.Checklist(
+                    id="bm-tenor", options=["All"] + TENOR_ORDER, value=["All"],
+                    inline=True, className="seg"), wide=True),
+                dcc.Store(id="bm-tenor-prev", data=["All"]),
+            ], className="controls"),
+            dcc.Loading(html.Div(id="bm-body"), type="dot", delay_show=400)]),
         html.Div(id="panel-top", style={"display": "none"}, children=[
             html.Div([
                 ctl("Scope", dcc.RadioItems(id="t-scope", options=["All time", "Year", "Month"],
@@ -667,6 +1516,21 @@ def full_layout():
                 ctl("Month", dd("t-month"), id_="t-month-box"),
             ], className="controls"),
             dcc.Loading(html.Div(id="t-body"), type="dot", delay_show=400)]),
+        html.Div(id="panel-cal", style={"display": "none"}, children=[
+            html.Div(id="cal-head"),
+            dcc.Store(id="cal-html"),
+            html.Div(id="cal-box", className="calbox")]),   # filled by CAL_PAINT_JS
+    ]
+
+
+def full_layout():
+    return html.Div([
+        html.H1("JAO auction data"),
+        *header_parts(),
+        dcc.Tabs(id="tabs", value="corridor", children=[
+            dcc.Tab(label=label, value=value, style=TAB_STYLE, selected_style=TAB_SELECTED)
+            for value, label in TABS]),
+        *panels(),
     ], className="wrap")
 
 
@@ -684,8 +1548,40 @@ def make_layout():
 
 app = Dash(__name__, title="JAO auction data", update_title=None)
 app.index_string = app.index_string.replace("</head>", f"<style>{CSS}</style></head>")
+
+# Opening any dropdown puts the cursor straight in its search box, so you can
+# type at once instead of clicking "Search" first (Peter, 2026-10-13). Dash's
+# own dropdown focuses the first option on open; this waits a moment and
+# moves focus to the search input whenever a dropdown's list appears.
+DROPDOWN_FOCUS_JS = """
+new MutationObserver(function (muts) {
+  muts.forEach(function (m) {
+    m.addedNodes.forEach(function (n) {
+      if (!(n instanceof HTMLElement)) return;
+      var inp = n.matches('input.dash-dropdown-search') ? n
+                : n.querySelector('input.dash-dropdown-search');
+      if (inp) setTimeout(function () { inp.focus(); }, 60);
+    });
+  });
+}).observe(document.documentElement, {childList: true, subtree: true});
+"""
+app.index_string = app.index_string.replace(
+    "</body>", "<script>" + DROPDOWN_FOCUS_JS + "</script></body>")
 app.layout = make_layout
 app.validation_layout = full_layout()
+
+
+# Buyer picked when a buyer tab first opens (Peter, 2026-10-13: "orsted
+# should be default pick"). JAO spells it without the slash-o.
+DEFAULT_BUYER = "Orsted Salg & Service A /S"
+
+
+def default_buyer(buyers: list[str]) -> str | None:
+    """DEFAULT_BUYER if it's in the list, else any other Orsted entity,
+    else None (keep() then falls back to the first buyer)."""
+    if DEFAULT_BUYER in buyers:
+        return DEFAULT_BUYER
+    return next((b for b in buyers if "orsted" in b.lower() or "ørsted" in b.lower()), None)
 
 
 def keep(value, allowed, fallback=None):
@@ -698,7 +1594,7 @@ def keep(value, allowed, fallback=None):
     return allowed[0] if allowed else None
 
 
-@app.callback([Output(f"panel-{v}", "style") for v, _ in TABS], Input("tabs", "value"))
+@_callback([Output(f"panel-{v}", "style") for v, _ in TABS], Input("tabs", "value"))
 def switch_tab(tab):
     return [{"display": "block" if v == tab else "none"} for v, _ in TABS]
 
@@ -706,7 +1602,7 @@ def switch_tab(tab):
 # ---------------------------------------------------------------------
 # 1. Corridor explorer
 # ---------------------------------------------------------------------
-@app.callback(
+@_callback(
     Output("c-corridor", "options"), Output("c-corridor", "value"),
     Output("c-horizon", "options"), Output("c-horizon", "value"),
     Output("c-product", "options"), Output("c-product", "value"),
@@ -823,7 +1719,7 @@ def corridor_explorer(corridor, horizon, product, tab):
 # ---------------------------------------------------------------------
 # 2. Buyers by month
 # ---------------------------------------------------------------------
-@app.callback(
+@_callback(
     Output("m-horizon", "options"), Output("m-horizon", "value"),
     Output("m-month", "options"), Output("m-month", "value"),
     Output("m-corridor", "options"), Output("m-corridor", "value"),
@@ -877,7 +1773,7 @@ def buyers_by_month(horizon, year_month, buyers_corridor, tab):
 # ---------------------------------------------------------------------
 # 3. Buyer lookup
 # ---------------------------------------------------------------------
-@app.callback(
+@_callback(
     Output("l-buyer", "options"), Output("l-buyer", "value"), Output("l-body", "children"),
     Input("l-buyer", "value"), Input("tabs", "value"),
 )
@@ -888,7 +1784,7 @@ def buyer_lookup(buyer, tab):
     if not buyers:
         return [], None, note("No winners recorded yet - run python eic_lookup.py after a "
                               "backfill.", "info")
-    buyer = keep(buyer, buyers)
+    buyer = keep(buyer, buyers, default_buyer(buyers))
     purchases = load_purchases_for_buyer(buyer)
     if purchases.empty:
         return buyers, buyer, note(f"No purchases found for {buyer}.", "info")
@@ -910,9 +1806,110 @@ def buyer_lookup(buyer, tab):
 
 
 # ---------------------------------------------------------------------
+# 3b. Buyer lookup map
+# ---------------------------------------------------------------------
+@_callback(
+    Output("bm-tenor", "value"), Output("bm-tenor-prev", "data"),
+    Input("bm-tenor", "value"), State("bm-tenor-prev", "data"),
+)
+def bm_tenor_pick(value, prev):
+    """Make "All" and the single tenors exclude each other (Peter,
+    2026-10-13: "if year is selected it only shows the year corridors").
+    Before this, clicking Yearly while All was still ticked gave
+    ["All", "Yearly"] - which still meant everything, so the map didn't
+    change. Now: ticking a tenor drops All; ticking All drops the tenors;
+    unticking the last one goes back to All."""
+    value, prev = list(value or []), list(prev or ["All"])
+    added = [v for v in value if v not in prev]
+    if not value or "All" in added:
+        new = ["All"]
+    else:
+        new = [t for t in TENOR_ORDER if t in value]
+        if not new:
+            new = ["All"]
+    if new == value:
+        return no_update, new
+    return new, new
+
+
+@_callback(
+    Output("bm-buyer", "options"), Output("bm-buyer", "value"),
+    Output("bm-month", "options"), Output("bm-month", "value"),
+    Output("bm-body", "children"),
+    Input("bm-buyer", "value"), Input("bm-month", "value"),
+    Input("bm-tenor", "value"), Input("tabs", "value"), Input("db-refresh", "data"),
+)
+def buyer_lookup_map(buyer, year_month, tenor_value, tab, _refresh=None):
+    if tab != "bmap":
+        return [no_update] * 5
+    buyers = load_all_buyers()
+    if not buyers:
+        return ([], None, no_update, no_update,
+                note("No winners recorded yet - run python eic_lookup.py after a "
+                     "backfill.", "info"))
+    buyer = keep(buyer, buyers, default_buyer(buyers))
+
+    year_months = load_delivery_months()
+    if not year_months:
+        return (buyers, buyer, [], None, note("No auctions saved yet.", "info"))
+    # Peter: "default month is always current" - today's own month (CET,
+    # matching the delivery-month convention used throughout this tab),
+    # not just the latest month with any data at all.
+    today_month = pd.Timestamp.now(tz="CET").strftime("%Y-%m")
+    default_month = today_month if today_month in year_months else year_months[-1]
+    year_month = keep(year_month, year_months, default_month)
+
+    # "All" (or nothing) = every tenor, one colour. Any tenors ticked =
+    # only those, one colour each - even if all five are ticked by hand.
+    # Comma-joined and canonically ordered because @cached needs a
+    # hashable argument, not the raw list from the Checklist.
+    picked = [t for t in TENOR_ORDER if t in (tenor_value or [])]
+    split = bool(picked) and "All" not in (tenor_value or [])
+    if split:
+        tenors_arg, tenor_clause = ",".join(picked), f", {' + '.join(picked)} only"
+    else:
+        tenors_arg, tenor_clause = "All", ""
+
+    head = [buyers, buyer, year_months, year_month]
+    counts = load_buyer_map_data(buyer, year_month, tenors_arg)
+
+    if counts.empty:
+        return head + [note(f"No corridors held by {buyer} in {year_month}"
+                             f"{tenor_clause}.", "info")]
+
+    n_corridors = counts["corridor_code"].nunique()
+    n_wins = int(counts["wins"].sum())
+    headline = (f"{buyer} holds {n_corridors} corridor direction(s) ({n_wins} "
+                f"win(s) behind them) in {year_month}{tenor_clause} - by DELIVERY "
+                "period, not when the auction closed, so a multi-year auction won "
+                "long ago still counts (unlike Top buyers' Month/Year, which count "
+                "by when the auction closed).")
+    if split:
+        how = ("One arrow per direction, on the real border crossing, "
+               "coloured by tenor (legend under the map) - an arrow won in "
+               "several of the picked tenors is striped in their colours.")
+    else:
+        how = ("All tenors in one colour - tick tenors to see only those, one "
+               "colour each. One arrow per direction, on the real border "
+               "crossing; two side by side means both ways.")
+    body = [
+        note(f"{headline} {how} Hover an arrow for its win count."),
+        render_buyer_map(counts, split),
+        table(counts.assign(corridor_code=counts["corridor_code"].map(display_code))
+              .sort_values("corridor_code", kind="stable"),
+              order=["corridor_code", "horizon_name", "win_date", "wins"],
+              names={"corridor_code": "Corridor", "horizon_name": "Tenor",
+                     "win_date": "Win date", "wins": "Wins"},
+              page_size=None),
+    ]
+    return head + [body]
+    return head + [body]
+
+
+# ---------------------------------------------------------------------
 # 4. Top buyers
 # ---------------------------------------------------------------------
-@app.callback(
+@_callback(
     Output("t-year-box", "style"), Output("t-month-box", "style"),
     Output("t-year", "options"), Output("t-year", "value"),
     Output("t-month", "options"), Output("t-month", "value"),
@@ -971,6 +1968,85 @@ def top_buyers(scope_label, year, year_month, tab):
 
 
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# 6. Auction calendar
+# ---------------------------------------------------------------------
+@_callback(
+    Output("upd-status", "children"), Output("upd-btn", "disabled"),
+    Output("upd-tick", "interval"), Output("upd-state", "data"), Output("db-refresh", "data"),
+    Input("upd-btn", "n_clicks"), Input("upd-tick", "n_intervals"),
+    State("upd-state", "data"), State("db-refresh", "data"),
+)
+def update_database(n_clicks, _tick, last_state, refresh):
+    """The "Update database" button and its status line. Polls every 2 s
+    while a run is going, every 15 s otherwise. When a run finishes, bumps
+    db-refresh so the open calendar / map redraw with the new data."""
+    if not CAN_UPDATE:
+        return "", True, 60000, no_update, no_update
+    prefix = ""
+    if ctx.triggered_id == "upd-btn" and n_clicks:
+        if not start_update():
+            prefix = "Already running. "
+    if update_is_running():
+        text = update_status_text()
+        if not text.endswith("%).") and "running" not in text:
+            text = "Starting the update..."
+        return prefix + text, True, 2000, "running", no_update
+    bump = (refresh or 0) + 1 if last_state == "running" else no_update
+    return prefix + update_status_text(), False, 15000, "idle", bump
+
+
+@_callback(Output("cal-head", "children"), Output("cal-html", "data"),
+              Input("tabs", "value"), Input("db-refresh", "data"))
+def auction_calendar(tab, _refresh):
+    """All non-daily auctions from the 1st of this month on (Peter,
+    2026-10-13: "all nondaily auctions starting with today on onwards. you
+    can scroll back to earlier auctions but only for current month"). The
+    box opens scrolled to today; scrolling up shows the rest of this month,
+    nothing older."""
+    if tab != "cal":
+        return no_update, no_update
+    now = pd.Timestamp.now(tz="CET")
+    first_day = now.normalize().replace(day=1)
+    cal = load_auction_calendar(first_day.strftime("%Y-%m-%d"))
+    if cal.empty:
+        return note("No auctions in the database from this month on.", "info"), ""
+    upcoming = cal[cal["closes"] >= now.normalize()]
+    n_auctions = int(upcoming["corridors"].map(len).sum())
+    last = load_last_fetch()
+    fetched = f" Auction list as of the last scrape ({last} CET)." if last else ""
+    head = note(
+        f"{n_auctions} auctions from today to {cal['closes'].max():%d %b %Y}, "
+        f"grouped by when the bidding closes. Opens on today - scroll up for "
+        f"earlier this month (from {first_day.day} {_MONTH_ABBR[first_day.month - 1]}). "
+        f"Times CET. Daily and intraday not included. Struck-through corridors "
+        f"were cancelled by JAO.{fetched}")
+    return head, render_calendar_html(cal, now)
+
+
+CAL_PAINT_JS = """
+function (html_text) {
+    var box = document.getElementById('cal-box');
+    if (!box || typeof html_text !== 'string') { return window.dash_clientside.no_update; }
+    box.innerHTML = html_text;
+    var go = function () {
+        var a = box.querySelector('[data-anchor="today"]');
+        var head = box.querySelector('thead');
+        if (a) {
+            box.scrollTop += a.getBoundingClientRect().top - box.getBoundingClientRect().top
+                             - (head ? head.offsetHeight : 0);
+        }
+    };
+    requestAnimationFrame(function () { requestAnimationFrame(go); });
+    return window.dash_clientside.no_update;
+}
+"""
+_clientside_callback(CAL_PAINT_JS, Output("cal-html", "storage_type"), Input("cal-html", "data"))
+
+
+register_callbacks(app)      # this file's own app (run on its own, port 8055)
+
+
 def main():
     global DB_PATH
     ap = argparse.ArgumentParser(description="JAO auction data (Dash)")

@@ -31,6 +31,7 @@ import calendar
 import functools
 import io
 import sqlite3
+import os
 import sys
 import threading
 import webbrowser
@@ -196,6 +197,29 @@ START_YEAR = 2020
 # directory, so it still finds jao_data.db regardless of where
 # `streamlit run` was invoked from.
 JAO_DB_FILE = Path(__file__).resolve().parent.parent / "jao_scraper" / "jao_data.db"
+
+
+def _load_jao_tabs():
+    """The JAO auction tabs (Corridor explorer, Buyers by month, Buyer lookup,
+    Buyer lookup map, Top buyers, Auction calendar) come from jao_dash.py,
+    merged into this tool on 2026-10-13 (Peter: "merge jao auction data app
+    and LTCAP tool"). Found next to this file (online copy) or in
+    ..\jao_scraper (the PC). Without it the tool has just its own 5 tabs."""
+    here = Path(__file__).resolve().parent
+    for folder in (here, here.parent / "jao_scraper"):
+        if (folder / "jao_dash.py").is_file():
+            if str(folder) not in sys.path:
+                sys.path.append(str(folder))
+            break
+    try:
+        import jao_dash
+    except Exception as exc:  # noqa: BLE001 - the tool must still start
+        print(f"JAO tabs left out (jao_dash.py not loaded: {exc})", file=sys.stderr, flush=True)
+        return None
+    return jao_dash
+
+
+jd = _load_jao_tabs()
 
 # A handful of this project's ENTSO-E zone codes don't match JAO's own
 # corridor-code country tokens directly -- confirmed against JAO's real
@@ -2139,6 +2163,9 @@ HB_CAPTION = (
     "Count of hours per period where the price was below the threshold. "
     "The countries here are picked separately from the Year comparison tab."
 )
+# Countries 3 and 4 on the Hours below threshold tab (Peter, 2026-10-13:
+# "make room for 2 more countries default is ES HU").
+HB_EXTRA_DEFAULTS = ("ES", "HU")
 NO_JAO_TEXT = "No JAO auction data found (jao_data.db)."
 NBSP = "\u00a0"  # an empty label that still takes one line of height
 
@@ -2208,9 +2235,17 @@ def serve_layout():
         html.Div(className="yc-controls", children=[
             field("Country 1", dropdown("hb-c1", PICKER_ZONES, country_1)),
             field("Country 2", dropdown("hb-c2", PICKER_ZONES, country_2)),
+            field("Country 3", dropdown("hb-c3", PICKER_ZONES, _default_zone(HB_EXTRA_DEFAULTS[0], 2))),
+            field("Country 4", dropdown("hb-c4", PICKER_ZONES, _default_zone(HB_EXTRA_DEFAULTS[1], 3))),
             field("Resolution", radio("hb-res", resolutions, resolutions[0])),
+            # step=1: arrows move 1 EUR, and any whole number can be typed
+            # in - Dash drops a typed number that doesn't fit the step (with
+            # step=10, typing 37 silently counted as 0). debounce: wait until
+            # typing pauses before recalculating (Peter, 2026-10-13: "step is
+            # 1 euro and you should be able to fill in manually").
             field("Threshold (EUR/MWh)", dcc.Input(
-                id="hb-threshold", type="number", value=0, step=10, className="yc-number")),
+                id="hb-threshold", type="number", value=0, step=1, debounce=0.6,
+                className="yc-number")),
         ]),
         loading("hb"),
     ])
@@ -2267,15 +2302,21 @@ def serve_layout():
         loading("ov"),
     ])
 
+    # JAO tabs only when jao_dash.py loaded and its database is there.
+    jao_ok = jd is not None and Path(jd.DB_PATH).is_file()
+    jao_tabs = list(jd.TABS) if jao_ok else []
     return html.Div(className="yc-page", children=[
-        html.H1("Average price -- year comparison"),
+        html.H1("LTCAP tool"),
         html.Div(
-            "Average price by period of year, across years, for two countries. "
-            "Data from entsoe_data.db.", className="yc-caption"),
+            "Prices across years, hours below a threshold, corridor margins and market "
+            "value (entsoe_data.db), plus JAO capacity auctions: corridors, buyers, buyer "
+            "map, top buyers and the auction calendar (jao_data.db).", className="yc-caption"),
+        *(jd.header_parts() if jao_ok else []),
         dcc.Tabs(id="tabs", value="yc", className="yc-tabs", children=[
-            dcc.Tab(label=label, value=value) for value, label in TAB_LABELS
+            dcc.Tab(label=label, value=value) for value, label in TAB_LABELS + jao_tabs
         ]),
         tab_yc, tab_hb, tab_cm, tab_mv, tab_ov,
+        *(jd.panels(first_visible=False) if jao_ok else []),
     ])
 
 
@@ -2342,13 +2383,17 @@ document.addEventListener('scroll', function (event) {
 }, true);
 """
 
-app = Dash(__name__, title="Year comparison", update_title=None)
+app = Dash(__name__, title="LTCAP tool", update_title=None)
 app.index_string = (
     app.index_string
-    .replace("{%css%}", "{%css%}<style>" + CSS + "</style>")
-    .replace("{%renderer%}", "{%renderer%}<script>" + SCROLL_SYNC_JS + "</script>")
+    # JAO tabs' styles first, so this tool's own page styles win where both set one
+    .replace("{%css%}", "{%css%}<style>" + (jd.CSS if jd else "") + CSS + "</style>")
+    .replace("{%renderer%}", "{%renderer%}<script>" + SCROLL_SYNC_JS
+             + (jd.DROPDOWN_FOCUS_JS if jd else "") + "</script>")
 )
 app.layout = serve_layout
+if jd is not None:
+    jd.register_callbacks(app)          # the JAO tabs' callbacks, on this app
 
 
 # ---- callbacks -------------------------------------------------------
@@ -2474,20 +2519,29 @@ def _threshold(value) -> float:
     Input("tabs", "value"),
     Input("hb-c1", "value"),
     Input("hb-c2", "value"),
+    Input("hb-c3", "value"),
+    Input("hb-c4", "value"),
     Input("hb-res", "value"),
     Input("hb-threshold", "value"),
 )
-def render_hours_below(active, country_1, country_2, resolution, threshold):
+def render_hours_below(active, country_1, country_2, country_3, country_4, resolution, threshold):
+    """Four countries, as two rows of two tables (four side by side would
+    run far off the screen); scrolling one table scrolls its row partner."""
     if active != "hb" or not country_1 or not country_2 or resolution not in RESOLUTIONS:
         return no_update
     problem = _missing_data_box()
     if problem:
         return problem
     threshold = _threshold(threshold)
-    return tables_row([
-        hours_below_view(_entsoe_zone(country_1), resolution, threshold, label=country_1),
-        hours_below_view(_entsoe_zone(country_2), resolution, threshold, label=country_2),
-    ])
+
+    def view(country):
+        return hours_below_view(_entsoe_zone(country), resolution, threshold, label=country)
+
+    rows = [tables_row([view(country_1), view(country_2)])]
+    extra = [view(c) for c in (country_3, country_4) if c]
+    if extra:
+        rows.append('<hr class="yc-rule">' + tables_row(extra))
+    return "".join(rows)
 
 
 def _pick_year(years: list, current):
@@ -2629,14 +2683,21 @@ def main():
         DB_PATH = find_db(args.db)
     if args.jao_db:
         JAO_DB_FILE = Path(args.jao_db).expanduser().resolve()
+        if jd is not None:
+            jd.DB_PATH = JAO_DB_FILE
     for label, path in (("entsoe_data.db", DB_PATH), ("jao_data.db", JAO_DB_FILE)):
         if not Path(path).is_file():
             print(f"Warning: {label} not found at {path}", file=sys.stderr, flush=True)
     url = f"http://127.0.0.1:{args.port}/"
-    print(f"Year comparison (Dash): {url}   databases: {DB_PATH} | {JAO_DB_FILE}", flush=True)
-    if args.open:
-        threading.Timer(1.2, webbrowser.open, args=(url,)).start()
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    # use_reloader (dashboard standard): the app restarts by itself when this
+    # file changes, so an edit shows up on the next browser refresh. Only the
+    # first (watcher) process prints and opens the browser.
+    if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        print(f"LTCAP tool (Dash): {url}   databases: {DB_PATH} | {JAO_DB_FILE}", flush=True)
+        if args.open:
+            threading.Timer(3.5, webbrowser.open, args=(url,)).start()
+    app.run(host=args.host, port=args.port, debug=args.debug,
+            use_reloader=True, reloader_type="stat")
 
 
 if __name__ == "__main__":

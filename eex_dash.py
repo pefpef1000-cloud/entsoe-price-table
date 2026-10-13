@@ -1,10 +1,11 @@
 """
-EEX market data viewer - Dash version
-=====================================
+Energy futures viewer - Dash version
+====================================
 
-A local dashboard over `eex_market_data.db` (built by eex_market_scraper.py).
-Replaces the two Streamlit viewers (eex_dashboard.py and
-eex_market_dashboard.py) with one Dash app that does what both did.
+A local dashboard over EEX futures: power and gas from `eex_market_data.db`
+(eex_market_scraper.py), plus TTF gas and EUA carbon from `eex_gas_eua.db`
+(eex_gas_eua_scraper.py), which adds EUA and daily candles back to ~Nov 2020
+- also for expired contracts.
 
 Run it (Windows, in the folder this file sits in):
 
@@ -80,6 +81,26 @@ def find_db(explicit: str | None = None) -> Path | None:
 
 DB_PATH = find_db()
 
+# TTF + EUA (eex_gas_eua_scraper.py). Optional: the app works without it.
+GAS_DB_NAME = "eex_gas_eua.db"
+
+
+def gas_db() -> Path | None:
+    """eex_gas_eua.db next to the main database, or next to this file."""
+    for folder in ([DB_PATH.parent] if DB_PATH else []) + [HERE]:
+        p = folder / GAS_DB_NAME
+        if p.exists():
+            return p
+    return None
+
+
+# Contracts from eex_gas_eua.db: long name, product, maturity, unit.
+# EUA trades as December contracts -> own maturity "December", label Dec-26.
+GAS_EUA = {
+    "G3BM": ("EEX TTF Natural Gas Month Future", "Base", "Month", "EUR", "MWh"),
+    "FEUA": ("EEX EUA Future", "Base", "December", "EUR", "tCO2"),
+}
+
 
 # ---------------------------------------------------------------------
 # Colours - same colour-blind-checked palette as the Streamlit viewer.
@@ -120,6 +141,8 @@ def market_of(long_name: str | None, short_code: str) -> tuple[str, str]:
     if "Option" in name:
         m = JAPAN.match(name)
         return (f"JP {m.group(1)} option" if m else name), "Other"
+    if "EUA" in name:
+        return "EUA", "Carbon"
     if "Natural Gas" in name:
         return "Gas " + name.split(" Natural Gas")[0], "Gas"
     if name.startswith("Nordic System Price"):
@@ -142,7 +165,7 @@ def market_of(long_name: str | None, short_code: str) -> tuple[str, str]:
 MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 DAY_CODE = re.compile(r"^D[BP](\d{2})$")
-MATURITY_ORDER = ["Year", "Quarter", "Month", "Week", "Weekend", "Day"]
+MATURITY_ORDER = ["Year", "Quarter", "Month", "December", "Week", "Weekend", "Day"]
 
 
 def delivery_date(short_code: str, delivery: str, maturity: str) -> date | None:
@@ -186,7 +209,7 @@ def delivery_label(d: date | None, maturity: str, raw: str) -> str:
         return f"Cal-{yy}"
     if maturity == "Quarter":
         return f"Q{(d.month - 1) // 3 + 1}-{yy}"
-    if maturity == "Month":
+    if maturity in ("Month", "December"):
         return f"{MON[d.month - 1]}-{yy}"
     if maturity == "Week":
         return f"W{d.isocalendar()[1]:02d} · {d.day} {MON[d.month - 1]}"
@@ -208,9 +231,38 @@ _lock = threading.Lock()
 _cache: dict = {}
 
 
+def load_gas_eua(path: Path | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Settlements and the list of contracts with candles from eex_gas_eua.db,
+    shaped like eex_market_prices. Empty frames if the file isn't there."""
+    cols = ["short_code", "delivery", "trade_date", "product", "maturity_type",
+            "settlement_price", "volume", "gross_open_interest", "currency", "uom",
+            "fetched_at", "long_name"]
+    if path is None:
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=["short_code", "delivery"])
+    try:
+        with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+            st = pd.read_sql_query(
+                """SELECT short_code, delivery, trade_date, settle AS settlement_price,
+                          volume, open_int AS gross_open_interest, fetched_at
+                   FROM gas_eua_settlement""", conn)
+            oh = pd.read_sql_query(
+                """SELECT DISTINCT short_code, delivery FROM gas_eua_ohlc
+                   WHERE trades > 0 AND open IS NOT NULL""", conn)
+    except Exception:
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=["short_code", "delivery"])
+    st = st[st["short_code"].isin(GAS_EUA)].copy()
+    meta = pd.DataFrame(
+        [(c, *v) for c, v in GAS_EUA.items()],
+        columns=["short_code", "long_name", "product", "maturity_type", "currency", "uom"])
+    st = st.merge(meta, on="short_code")[cols]
+    oh = oh[oh["short_code"].isin(GAS_EUA)]
+    return st, oh
+
+
 def load() -> dict:
     path = DB_PATH
-    mtime = path.stat().st_mtime
+    gpath = gas_db()
+    mtime = (path.stat().st_mtime, gpath.stat().st_mtime if gpath else None)
     with _lock:
         if _cache.get("key") == (str(path), mtime):
             return _cache["data"]
@@ -232,6 +284,15 @@ def load() -> dict:
                 runs = pd.DataFrame()
 
         prices["delivery"] = prices["delivery"].astype(str)
+        # TTF / EUA from eex_gas_eua.db. Where both databases have the same
+        # contract and day (TTF months), the power database's row is kept.
+        g_set, g_ohlc = load_gas_eua(gpath)
+        if not g_set.empty:
+            g_set["delivery"] = g_set["delivery"].astype(str)
+            have = set(zip(prices.short_code, prices.delivery, prices.trade_date.astype(str)))
+            new = [k not in have for k in zip(g_set.short_code, g_set.delivery, g_set.trade_date)]
+            prices = pd.concat([prices, g_set[new]], ignore_index=True)
+        prices["delivery"] = prices["delivery"].astype(str)
         names = {c: market_of(n, c) for c, n in
                  prices[["short_code", "long_name"]].drop_duplicates().itertuples(index=False)}
         prices["market"] = prices["short_code"].map(lambda c: names[c][0])
@@ -248,11 +309,31 @@ def load() -> dict:
 
         settled = prices[prices["settlement_price"].notna()]
         markets = (settled[["market", "group"]].drop_duplicates()
-                   .assign(o=lambda f: f["group"].map({"Power": 0, "Gas": 1}).fillna(2))
+                   .assign(o=lambda f: f["group"].map({"Power": 0, "Gas": 1, "Carbon": 2}).fillna(3))
                    .sort_values(["o", "market"]))
-        data = {"prices": prices, "settled": settled, "runs": runs,
+        # Contracts with candles but no settlement stored (expired TTF months
+        # and EUA Decembers from the 2020+ backfill): listed as deliveries too.
+        older = []
+        for code, dlv in g_ohlc.itertuples(index=False):
+            dlv = str(dlv)
+            if ((settled["short_code"] == code) & (settled["delivery"] == dlv)).any():
+                continue
+            long_name, product, maturity, cur, uom = GAS_EUA[code]
+            dd_ = delivery_date(code, dlv, maturity)
+            if dd_ is None:
+                continue
+            mk, grp = market_of(long_name, code)
+            older.append(dict(short_code=code, delivery=dlv, product=product,
+                              maturity_type=maturity, currency=cur, uom=uom,
+                              long_name=long_name, market=mk, group=grp,
+                              dkey=dd_.isoformat(), dlabel=delivery_label(dd_, maturity, dlv),
+                              unit=f"{cur}/{uom}"))
+        older = pd.DataFrame(older, columns=["short_code", "delivery", "product", "maturity_type",
+                                             "currency", "uom", "long_name", "market", "group",
+                                             "dkey", "dlabel", "unit"])
+        data = {"prices": prices, "settled": settled, "runs": runs, "older": older,
                 "markets": markets[["market", "group"]].values.tolist(),
-                "path": path, "mtime": mtime}
+                "path": path, "gas_path": gpath, "mtime": mtime}
         _cache["key"], _cache["data"] = (str(path), mtime), data
         return data
 
@@ -452,7 +533,7 @@ def runs_tab():
 def make_layout():
     if DB_PATH is None:
         return html.Div([
-            html.H1("EEX market data"),
+            html.H1("Energy futures"),
             html.Div(className="warn", children=[
                 f"Can't find {DB_NAME}. It is created the first time "
                 "eex_market_scraper.py runs. Looked in:",
@@ -465,7 +546,7 @@ def make_layout():
 
 def full_layout():
     return html.Div([
-        html.H1("EEX market data"),
+        html.H1("Energy futures"),
         html.Div(id="header-line", className="sub"),
         # Tabs only switch which panel is visible. All four panels stay in
         # the page, so every dropdown keeps its selection when you switch
@@ -492,7 +573,7 @@ TAB_STYLE = {"padding": "7px 12px", "fontSize": 14, "color": INK["muted"],
 TAB_SELECTED = {**TAB_STYLE, "color": INK["text"], "fontWeight": 600,
                 "borderBottom": f"3px solid {SERIES[0]}"}
 
-app = Dash(__name__, title="EEX market data")
+app = Dash(__name__, title="Energy futures")
 app.index_string = app.index_string.replace("</head>", f"<style>{CSS}</style></head>")
 app.layout = make_layout   # a function: re-evaluated on every page load
 # Callbacks are checked against the full page, even when the database
@@ -550,7 +631,8 @@ def switch_tab(tab):
 def header(_):
     d = load()
     s = d["settled"]
-    return (f"{d['path'].name} · {len(s):,} settlements · {s['short_code'].nunique()} contracts · "
+    extra = f" + {d['gas_path'].name}" if d.get("gas_path") else ""
+    return (f"{d['path'].name}{extra} · {len(s):,} settlements · {s['short_code'].nunique()} contracts · "
             f"{s['market'].nunique()} markets · trade dates {s['trade_date'].min()} to "
             f"{s['trade_date'].max()}")
 
@@ -787,15 +869,34 @@ def load_ohlc(short_code: str, delivery: str) -> pd.DataFrame:
     grows to hundreds of thousands of rows with the backfill, so it is
     not held in memory). Days without a priced trade are left out.
     Empty if the table doesn't exist yet."""
+    frames = []
     try:
         uri = f"{DB_PATH.resolve().as_uri()}?mode=ro"
         with closing(sqlite3.connect(uri, uri=True)) as conn:
-            return pd.read_sql_query(
+            frames.append(pd.read_sql_query(
                 f"SELECT {', '.join(OHLC_COLS)} FROM eex_market_ohlc "
                 "WHERE short_code = ? AND delivery = ? AND trades > 0 AND open IS NOT NULL "
-                "ORDER BY trade_date", conn, params=(short_code, str(delivery)))
+                "ORDER BY trade_date", conn, params=(short_code, str(delivery))))
     except Exception:
+        pass
+    # TTF / EUA history back to 2020 lives in eex_gas_eua.db.
+    gpath = gas_db() if short_code in GAS_EUA else None
+    if gpath:
+        try:
+            with closing(sqlite3.connect(f"{gpath.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+                frames.append(pd.read_sql_query(
+                    "SELECT trade_date, open, high, low, last, trades, volume AS tick_volume "
+                    "FROM gas_eua_ohlc WHERE short_code = ? AND delivery = ? "
+                    "AND trades > 0 AND open IS NOT NULL", conn,
+                    params=(short_code, str(delivery))))
+        except Exception:
+            pass
+    frames = [f for f in frames if not f.empty]
+    if not frames:
         return pd.DataFrame(columns=OHLC_COLS)
+    # Same day in both databases: the first (power database) wins.
+    return (pd.concat(frames, ignore_index=True).drop_duplicates("trade_date")
+            .sort_values("trade_date").reset_index(drop=True))
 
 
 def in_range(df, start, end):
@@ -830,7 +931,12 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
     market = keep(market, [o["value"] for o in m_opts], "DE")
     products, product, maturities, maturity, f = chain(s, market, product, maturity,
                                                        default_maturity="Month")
-    dels = f.drop_duplicates("dkey").sort_values("dkey")
+    # Expired TTF / EUA contracts have candles but no stored settlement.
+    old = d["older"]
+    old = old[(old["market"] == market) & (old["product"] == product) &
+              (old["maturity_type"] == maturity)]
+    dels = (pd.concat([f[["dkey", "dlabel"]], old[["dkey", "dlabel"]]])
+            .drop_duplicates("dkey").sort_values("dkey"))
     if dkey not in set(dels["dkey"]):
         # Default: the front contract (nearest delivery still trading) -
         # liquid, and the one with candles. Kept until the user picks
@@ -840,9 +946,17 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
 
     allrows = history_frame(market, product, maturity, dkey)
     full = allrows.dropna(subset=["settlement_price"])
-    candles = style == "Candles"
-    ohlc_all = (load_ohlc(full["short_code"].iloc[0], full["delivery"].iloc[0])
-                if not full.empty else pd.DataFrame(columns=OHLC_COLS))
+    if not full.empty:
+        ref = full.iloc[-1]
+    elif (old["dkey"] == dkey).any():
+        ref = old[old["dkey"] == dkey].iloc[0]
+    else:
+        ref = None
+    # Expired contract: candles only, whatever the toggle says.
+    only_candles = full.empty and ref is not None
+    candles = style == "Candles" or only_candles
+    ohlc_all = (load_ohlc(ref["short_code"], ref["delivery"])
+                if ref is not None else pd.DataFrame(columns=OHLC_COLS))
     # The trade feed goes back years (nightly backfill); settlements only
     # ~6 weeks. In candle mode the date picker spans both.
     dates = list(full["trade_date"]) + (list(ohlc_all["trade_date"]) if candles else [])
@@ -851,7 +965,7 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
         start, end = lo, hi
     out = [m_opts, market, opts(products), product, opts(maturities), maturity,
            del_opts, dkey, lo, hi, start, end]
-    if full.empty:
+    if ref is None or (full.empty and ohlc_all.empty):
         return out + [graph(empty_fig("Nothing stored for that delivery."))]
 
     h = in_range(full, start, end)
@@ -859,7 +973,6 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
     if h.empty and (not candles or o.empty):
         return out + [note("Nothing stored in the chosen trade-date range.")]
 
-    ref = full.iloc[-1]
     code, unit, uom, label = ref["short_code"], ref["unit"], ref["uom"], ref["dlabel"]
 
     tiles = []
@@ -888,12 +1001,24 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
 
     x = pd.to_datetime(h["trade_date"])
     xo = pd.to_datetime(o["trade_date"])
-    notes = [note(f"{code} — {ref['long_name'] or ''}.  Settlements: EEX only serves ~6 weeks, "
-                  "so they go as deep as your scraper's run history.")]
+    if only_candles:
+        notes = [note(f"{code} — {ref['long_name'] or ''}.  Expired before settlements were "
+                      "collected, so this shows daily candles from EEX's trade feed only "
+                      "(eex_gas_eua_scraper.py).")]
+    else:
+        notes = [note(f"{code} — {ref['long_name'] or ''}.  Settlements: EEX only serves ~6 weeks, "
+                      "so they go as deep as your scraper's run history.")]
 
-    if candles and not o.empty:
-        pf = fig_base(f"{code} {label} — daily open/high/low/last, settlement dotted — {unit}",
-                      unit, 380)
+    if only_candles and style != "Candles":
+        # Expired contract, Line chosen: the daily last traded price.
+        pf = fig_base(f"{code} {label} — last traded price per day — {unit}", unit, 320)
+        pf.add_trace(go.Scatter(x=xo, y=o["last"], name="Last", mode="lines+markers",
+                                line=dict(color=SERIES[0], width=2), marker=dict(size=5),
+                                hovertemplate="%{y:.2f}"))
+        pf.update_layout(showlegend=False)
+    elif candles and not o.empty:
+        pf = fig_base(f"{code} {label} — daily open/high/low/last"
+                      + ("" if h.empty else ", settlement dotted") + f" — {unit}", unit, 380)
         pf.add_trace(go.Candlestick(
             x=xo, open=o["open"], high=o["high"], low=o["low"], close=o["last"],
             name="Open/high/low/last",
@@ -905,7 +1030,7 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
                                     hovertemplate="%{y:.2f}"))
         pf.update_layout(xaxis_rangeslider_visible=False)
         notes.append(note("Candles: first, highest, lowest and last trade of each day, from "
-                          "every trade on EEX (eex_ohlc_scraper.py). Days without a trade have "
+                          "every trade on EEX (eex_ohlc_scraper.py; TTF/EUA also eex_gas_eua_scraper.py). Days without a trade have "
                           "no candle. Colour: green = closed above its open, red = below. "
                           "History grows further back as the nightly backfill runs."))
     else:
@@ -955,8 +1080,9 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
     body = notes + [
         kpis,
         html.Div(graph(pf), className="card"),
-        html.Div([html.Div(graph(vf), className="card"), html.Div(graph(of), className="card")],
-                 className="row2"),
+        (html.Div(graph(vf), className="card") if h.empty else
+         html.Div([html.Div(graph(vf), className="card"), html.Div(graph(of), className="card")],
+                  className="row2")),
         html.Details([html.Summary(f"Table — {code} {label}, every stored trading day"),
                       table(tbl.sort_values("trade_date", ascending=False))]),
     ]
@@ -973,7 +1099,22 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
 def download_csv(_, market, product, maturity, dkey, start, end):
     every = history_frame(market, product, maturity, dkey)
     if every.empty:
-        return no_update
+        # Expired TTF / EUA contract: candles only.
+        old = load()["older"]
+        old = old[(old["market"] == market) & (old["product"] == product) &
+                  (old["maturity_type"] == maturity) & (old["dkey"] == dkey)]
+        if old.empty:
+            return no_update
+        code, delivery = old["short_code"].iloc[0], old["delivery"].iloc[0]
+        ohlc = load_ohlc(code, delivery)
+        if start and end:
+            ohlc = in_range(ohlc, start, end)
+        if ohlc.empty:
+            return no_update
+        ohlc.insert(1, "short_code", code)
+        ohlc.insert(2, "delivery", delivery)
+        return dcc.send_data_frame(ohlc.to_csv, f"eex_{code}_{dkey}.csv",
+                                   index=False, encoding="utf-8-sig")
     code, delivery = every["short_code"].iloc[0], every["delivery"].iloc[0]
     h = in_range(every, start, end) if start and end else every
     cols = ["trade_date", "short_code", "delivery", "dlabel", "settlement_price", "currency",
@@ -1038,7 +1179,9 @@ def data_and_runs(_, tab):
         table(runs) if not runs.empty else note("No runs logged yet."),
         html.H3("Markets in the database", style={"fontSize": 15}),
         table(by_market, page_size=25),
-        note(f"Database: {d['path']}"),
+        note(f"Database: {d['path']}"
+             + (f"  ·  TTF/EUA: {d['gas_path']}" if d.get("gas_path") else
+                "  ·  eex_gas_eua.db not found - no EUA, no TTF history before Aug 2026")),
     ]
     return body
 
@@ -1046,7 +1189,7 @@ def data_and_runs(_, tab):
 # ---------------------------------------------------------------------
 def main():
     global DB_PATH
-    ap = argparse.ArgumentParser(description="EEX market data viewer (Dash)")
+    ap = argparse.ArgumentParser(description="Energy futures viewer (Dash)")
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--db", default=None, help="path to eex_market_data.db")
