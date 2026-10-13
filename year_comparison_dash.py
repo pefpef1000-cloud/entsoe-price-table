@@ -2307,16 +2307,20 @@ def serve_layout():
     jao_tabs = list(jd.TABS) if jao_ok else []
     return html.Div(className="yc-page", children=[
         html.H1("LTCAP tool"),
-        html.Div(
-            "Prices across years, hours below a threshold, corridor margins and market "
-            "value (entsoe_data.db), plus JAO capacity auctions: corridors, buyers, buyer "
-            "map, top buyers and the auction calendar (jao_data.db).", className="yc-caption"),
-        *(jd.header_parts() if jao_ok else []),
         dcc.Tabs(id="tabs", value="yc", className="yc-tabs", children=[
             dcc.Tab(label=label, value=value) for value, label in TAB_LABELS + jao_tabs
         ]),
         tab_yc, tab_hb, tab_cm, tab_mv, tab_ov,
         *(jd.panels(first_visible=False) if jao_ok else []),
+        # Description, JAO note and "Update database" at the bottom of the
+        # page (Peter, 2026-10-13: "move this to the bottom").
+        html.Div(className="yc-footer", children=[
+            html.Div(
+                "Prices across years, hours below a threshold, corridor margins and market "
+                "value (entsoe_data.db), plus JAO capacity auctions: corridors, buyers, buyer "
+                "map, top buyers and the auction calendar (jao_data.db).", className="yc-caption"),
+            *(jd.header_parts() if jao_ok else []),
+        ]),
     ])
 
 
@@ -2365,6 +2369,7 @@ body { margin: 0; background: #ffffff; color: #1f2430;
 .yc-stats { display: flex; flex-wrap: wrap; gap: 10px 36px; margin: 8px 0 4px; }
 .yc-metric-label { font-size: 13px; color: #555b6a; }
 .yc-metric-value { font-size: 30px; font-weight: 600; line-height: 1.2; }
+.yc-footer { margin-top: 36px; padding-top: 12px; border-top: 1px solid #e3e5ea; }
 """
 
 # Scrolling one table of a row scrolls the others in that row with it, so
