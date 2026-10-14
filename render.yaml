@@ -25,6 +25,7 @@ services:
         - entsoe_dash.py
         - jao_dash.py
         - eex_dash.py
+        - futures_vs_spot_dash.py
         - requirements-online.txt
         - render.yaml
     envVars:

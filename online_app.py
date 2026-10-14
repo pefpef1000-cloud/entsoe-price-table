@@ -7,6 +7,7 @@ online_app.py -- the ONLINE version (on Render) of the Dash dashboards:
     /dayahead/   forwards to /        (merged into Day-ahead prices 2026-10-14)
     /auctions/   forwards to /years/  (merged into the LTCAP tool 2026-10-13)
     /futures/    Power futures        (eex_dash.py) -- behind a password
+    /futures-vs-spot/  Futures vs spot (futures_vs_spot_dash.py) -- same password
                  (FUTURES_PASSWORD): EEX data may not be republished
 
 The dashboard files are the same files as on the PC, unchanged. This file
@@ -385,6 +386,7 @@ ed = sys.modules.get("entsoe_dash") or importlib.import_module("entsoe_dash")
 # No page of its own any more - /auctions/ now forwards to /years/.
 jd = sys.modules.get("jao_dash") or importlib.import_module("jao_dash")
 eex = _import_under("eex_dash", "/futures/")
+fvs = _import_under("futures_vs_spot_dash", "/futures-vs-spot/")
 
 pt.DB_PATH = PRICE_DB
 yc.DB_PATH = HISTORY_DB
@@ -392,6 +394,8 @@ yc.JAO_DB_FILE = JAO_DB
 ed.DB_PATH = HISTORY_DB
 jd.DB_PATH = JAO_DB
 eex.DB_PATH = EEX_DB
+fvs.EEX_DB = EEX_DB          # futures (EEX)
+fvs.SPOT_DB = HISTORY_DB     # day-ahead prices (ENTSO-E)
 
 
 def _dayahead_connect():
@@ -439,6 +443,7 @@ PAGES = [
     ("pt", "Day-ahead prices", "/"),
     ("yc", "LTCAP tool", "/years/"),
     ("eex", "Power futures", "/futures/"),
+    ("fvs", "Futures vs spot", "/futures-vs-spot/"),
 ]
 
 
@@ -486,6 +491,7 @@ APPS = {
     "pt": (pt, pt.serve_layout, [PRICE_DB], prices_note),
     "yc": (yc, yc.serve_layout, [HISTORY_DB, JAO_DB], history_note),
     "eex": (eex, eex.make_layout, [EEX_DB], history_note),
+    "fvs": (fvs, fvs.make_layout, [EEX_DB, HISTORY_DB], history_note),
 }
 
 
@@ -499,7 +505,8 @@ def _page_for(key):
     return page
 
 
-VALIDATION = {"pt": pt.validation_layout, "yc": yc.serve_layout, "eex": eex.full_layout}
+VALIDATION = {"pt": pt.validation_layout, "yc": yc.serve_layout, "eex": eex.full_layout,
+              "fvs": fvs.full_layout}
 for _key, (_module, _build, _needs, _note) in APPS.items():
     _module.app.index_string = _module.app.index_string.replace(
         "{%css%}", "{%css%}<style>" + NAV_CSS + "</style>")
@@ -556,6 +563,9 @@ server.wsgi_app = DispatcherMiddleware(server.wsgi_app, {
     "/auctions": _moved_to("/years/"),
     "/futures": PasswordGate(eex.app.server, os.environ.get("FUTURES_PASSWORD", ""),
                              "Power futures"),
+    # Same password and realm, so the browser asks only once for both pages.
+    "/futures-vs-spot": PasswordGate(fvs.app.server, os.environ.get("FUTURES_PASSWORD", ""),
+                                     "Power futures"),
 })
 
 
@@ -583,7 +593,7 @@ def _rss_mb() -> int:
 
 
 def free_memory() -> None:
-    for module in (pt, yc, ed, jd, eex):
+    for module in (pt, yc, ed, jd, eex, fvs):
         cache = getattr(module, "_cache", None)
         lock = getattr(module, "_cache_lock", None) or getattr(module, "_lock", None)
         if cache is None:
