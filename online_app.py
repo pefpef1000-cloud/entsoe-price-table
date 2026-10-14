@@ -27,7 +27,7 @@ only does three things around them:
          load_forecast.db.gz    day-ahead prices (load forecast)
          jao_history.db.gz      year comparison, capacity auctions
          eex_market_data.db.gz  power futures
-  2. Looks for newer files: prices every 2 minutes, history every 10 minutes
+  2. Looks for newer files: prices every minute, history every 10 minutes
      (and at every start -- Render's free plan stops the app after 15 idle
      minutes).
   3. Serves both dashboards from one web address, with a link bar on top.
@@ -72,7 +72,7 @@ RELEASE_URL = os.environ.get(
 DATA_DIR = Path(os.environ.get("DATA_DIR", Path(tempfile.gettempdir()) / "online_data")).resolve()
 LOCAL_TZ = ZoneInfo("Europe/Copenhagen")
 REFRESH_SECONDS = max(60, int(float(os.environ.get("REFRESH_MINUTES", "10")) * 60))
-PRICE_REFRESH_SECONDS = max(30, int(float(os.environ.get("PRICE_REFRESH_MINUTES", "2")) * 60))
+PRICE_REFRESH_SECONDS = max(30, int(float(os.environ.get("PRICE_REFRESH_MINUTES", "1")) * 60))
 
 ACTIONS_DB = DATA_DIR / "actions_prices.db"     # GitHub Actions' entsoe_data.db
 PC_RECENT_DB = DATA_DIR / "pc_recent_prices.db"  # last 14 days from Peter's PC
@@ -464,7 +464,7 @@ def history_note() -> str:
 
 def prices_note() -> str:
     when = _status.get("pc_prices_uploaded_at")
-    return f"Prices from the PC uploaded {when}, from GitHub checked every 2 min" if when else ""
+    return f"Prices from the PC uploaded {when}, both sources checked every minute" if when else ""
 
 
 def wait_page():
