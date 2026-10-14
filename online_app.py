@@ -1,10 +1,11 @@
 """
 online_app.py -- the ONLINE version (on Render) of the Dash dashboards:
 
-    /            Hourly price table   (price_table_dash.py)
-    /years/      Year comparison      (year_comparison_dash.py, all 5 tabs)
-    /dayahead/   Day-ahead prices     (entsoe_dash.py)
-    /auctions/   Capacity auctions    (jao_dash.py)
+    /            Day-ahead prices     (price_table_dash.py: hourly price table
+                                       + the charts of entsoe_dash.py as a tab)
+    /years/      LTCAP tool           (year_comparison_dash.py + jao_dash.py tabs)
+    /dayahead/   forwards to /        (merged into Day-ahead prices 2026-10-14)
+    /auctions/   forwards to /years/  (merged into the LTCAP tool 2026-10-13)
     /futures/    Power futures        (eex_dash.py) -- behind a password
                  (FUTURES_PASSWORD): EEX data may not be republished
 
@@ -375,7 +376,10 @@ def _import_under(module_name: str, prefix: str):
 
 pt = _import_under("price_table_dash", "/")
 yc = _import_under("year_comparison_dash", "/years/")
-ed = _import_under("entsoe_dash", "/dayahead/")
+# entsoe_dash (day-ahead charts) is a tab of price_table_dash since
+# 2026-10-14: price_table_dash imports it, so it is loaded already.
+# No page of its own any more - /dayahead/ now forwards to /.
+ed = sys.modules.get("entsoe_dash") or importlib.import_module("entsoe_dash")
 # jao_dash (capacity auctions) is merged into the LTCAP tool since 2026-10-13:
 # year_comparison_dash imports it and shows its tabs, so it is loaded already.
 # No page of its own any more - /auctions/ now forwards to /years/.
@@ -400,6 +404,8 @@ def _dayahead_connect():
 
 
 ed._connect = _dayahead_connect
+ed.NO_DB_TEXT = ("The price history for the charts is not uploaded yet. It comes with the "
+                 "next upload from the PC (after its 04:00 and 13:00 runs) - reload later.")
 
 # Tenors left out of the Corridor margins / Market value pickers online.
 # Daily needs ~1.1 GB of memory (1.5 million hourly auction rows), more than
@@ -430,9 +436,8 @@ NAV_CSS = """
            font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif; }
 """
 PAGES = [
-    ("pt", "Hourly price table", "/"),
+    ("pt", "Day-ahead prices", "/"),
     ("yc", "LTCAP tool", "/years/"),
-    ("ed", "Day-ahead prices", "/dayahead/"),
     ("eex", "Power futures", "/futures/"),
 ]
 
@@ -480,7 +485,6 @@ def wait_page():
 APPS = {
     "pt": (pt, pt.serve_layout, [PRICE_DB], prices_note),
     "yc": (yc, yc.serve_layout, [HISTORY_DB, JAO_DB], history_note),
-    "ed": (ed, ed.make_layout, [HISTORY_DB, LOAD_DB], history_note),
     "eex": (eex, eex.make_layout, [EEX_DB], history_note),
 }
 
@@ -495,8 +499,7 @@ def _page_for(key):
     return page
 
 
-VALIDATION = {"pt": pt.serve_layout, "yc": yc.serve_layout, "ed": ed.full_layout,
-              "eex": eex.full_layout}
+VALIDATION = {"pt": pt.validation_layout, "yc": yc.serve_layout, "eex": eex.full_layout}
 for _key, (_module, _build, _needs, _note) in APPS.items():
     _module.app.index_string = _module.app.index_string.replace(
         "{%css%}", "{%css%}<style>" + NAV_CSS + "</style>")
@@ -549,7 +552,7 @@ def _moved_to(location: str):
 server = pt.app.server
 server.wsgi_app = DispatcherMiddleware(server.wsgi_app, {
     "/years": yc.app.server,
-    "/dayahead": ed.app.server,
+    "/dayahead": _moved_to("/"),
     "/auctions": _moved_to("/years/"),
     "/futures": PasswordGate(eex.app.server, os.environ.get("FUTURES_PASSWORD", ""),
                              "Power futures"),

@@ -1,5 +1,14 @@
 """
-price_table_dash.py - one day, every country side by side (Dash version).
+price_table_dash.py - the "Day-ahead prices" app (Dash), port 8051.
+
+Two tabs (merged 2026-10-14, Peter: "merge hourly price table and day ahead
+prices"):
+  - Hourly price table: one day, every country side by side (this file).
+  - Day-ahead charts: up to 5 zones, day / week / month, load forecast -
+    that is entsoe_dash.py (same folder), shown here as a tab. Its charts
+    are only drawn once the tab is opened.
+
+HOURLY PRICE TABLE
 
 Same table as price_table.py (the Streamlit one), same numbers, same colours:
 
@@ -36,6 +45,7 @@ data - just change the date or reload the page.
 """
 
 import argparse
+import os
 import re
 import sqlite3
 import sys
@@ -48,6 +58,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from dash import Dash, Input, Output, State, ctx, dcc, html
+
+# The "Day-ahead charts" tab = entsoe_dash.py from the same folder. If it
+# can't be loaded, the price table still works on its own (no tabs then).
+try:
+    import entsoe_dash as ed
+except Exception as exc:  # noqa: BLE001
+    print(f"Day-ahead charts tab left out - entsoe_dash.py could not be loaded: {exc}",
+          file=sys.stderr, flush=True)
+    ed = None
+
+APP_TITLE = "Day-ahead prices"
+TABS = [("table", "Hourly price table"), ("charts", "Day-ahead charts")]
 
 DB_NAME = "entsoe_data.db"
 DEFAULT_PORT = 8051
@@ -566,10 +588,37 @@ def serve_layout():
     tomorrow = date.today() + timedelta(days=1)
     choices = zone_choices(tomorrow)
     ref = "DE_LU" if "DE_LU" in choices or not choices else choices[0]
-    return html.Div(className="pt-page", children=[
+    charts = ed.make_layout(title=False) if ed is not None else None
+    return _page(tomorrow, choices, ref, charts)
+
+
+def validation_layout():
+    """Every component of both tabs, without reading the database - so Dash
+    knows all ids even when the charts tab shows a 'no data' note instead."""
+    tomorrow = date.today() + timedelta(days=1)
+    charts = ed.full_layout(title=False) if ed is not None else None
+    return _page(tomorrow, [], "DE_LU", charts)
+
+
+def _page(tomorrow, choices, ref, charts):
+    table = _table_panel(tomorrow, choices, ref, headline=charts is None)
+    if charts is None:
+        return table
+    return html.Div([
+        html.Div(className="dp-head", children=dcc.Tabs(
+            id="dp-tabs", value="table", className="dp-tabs",
+            children=[dcc.Tab(label=label, value=value) for value, label in TABS])),
+        table,
+        html.Div(id="dp-panel-charts", style={"display": "none"}, children=charts),
+    ])
+
+
+def _table_panel(tomorrow, choices, ref, headline):
+    """The price table. headline=False when the tab bar above already names it."""
+    return html.Div(id="dp-panel-table", className="pt-page", children=[
         # Everything except the table sits in two compact rows at the top.
         html.Div(className="pt-top", children=[
-            html.H1("Hourly prices"),
+            *([html.H1("Hourly prices")] if headline else []),
             html.Div(className="pt-date-box", children=dcc.DatePickerSingle(
                 id="pt-date", date=tomorrow.isoformat(), display_format="YYYY-MM-DD",
                 first_day_of_week=1, clearable=False)),
@@ -643,13 +692,36 @@ body { margin: 0; background: #ffffff; color: #1f2430;
 .pt-table thead th.pt-group { text-align: left; color: #1f2430; }
 .pt-table .pt-group-start { border-left: 3px solid #8a8f9c; }
 .pt-caption { color: #6b7180; font-size: 13px; margin-top: 10px; }
+.dp-head { padding: 12px 24px 0; }
+.dp-tabs { margin: 0; }
+#dp-panel-table.pt-page { padding-top: 14px; }
+#dp-panel-charts .wrap { max-width: none; margin: 0; padding: 6px 24px 40px; }
 """
 
 DB_PATH = find_db()  # main() replaces it when --db is given
 
-app = Dash(__name__, title="Hourly prices", update_title=None)
-app.index_string = app.index_string.replace("{%css%}", "{%css%}<style>" + CSS + "</style>")
+if ed is not None:
+    ed.DB_PATH = DB_PATH
+
+app = Dash(__name__, title=APP_TITLE, update_title=None)
+# The charts tab's CSS first, so this file's rules (body, fonts) win.
+_ALL_CSS = (ed.CSS if ed is not None else "") + CSS
+app.index_string = app.index_string.replace("{%css%}", "{%css%}<style>" + _ALL_CSS + "</style>")
 app.layout = serve_layout
+app.validation_layout = validation_layout()
+
+if ed is not None:
+    @app.callback(
+        Output("dp-panel-table", "style"),
+        Output("dp-panel-charts", "style"),
+        Input("dp-tabs", "value"),
+    )
+    def show_tab(active):
+        hidden = {"display": "none"}
+        return ({} if active == "table" else hidden), ({} if active == "charts" else hidden)
+
+    # The charts are only drawn while their tab is open.
+    ed.register_callbacks(app, active_when=("dp-tabs", "charts"))
 
 
 @app.callback(
@@ -739,7 +811,7 @@ app.clientside_callback(PAINT_JS, Output("pt-html", "storage_type"), Input("pt-h
 
 def main():
     global DB_PATH
-    parser = argparse.ArgumentParser(description="Hourly day-ahead price table (Dash).")
+    parser = argparse.ArgumentParser(description="Day-ahead prices: hourly price table + charts (Dash).")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--host", default="127.0.0.1",
                         help="0.0.0.0 to reach it from the phone / Tailscale")
@@ -749,13 +821,20 @@ def main():
     args = parser.parse_args()
 
     DB_PATH = find_db(args.db)
-    if not DB_PATH.is_file():
-        print(f"Warning: database not found at {DB_PATH}", file=sys.stderr, flush=True)
+    if ed is not None:
+        ed.DB_PATH = DB_PATH
     url = f"http://127.0.0.1:{args.port}/"
-    print(f"Hourly price table (Dash): {url}   database: {DB_PATH}", flush=True)
-    if args.open:
-        threading.Timer(1.2, webbrowser.open, args=(url,)).start()
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    # use_reloader: restarts the app whenever this file (or entsoe_dash.py)
+    # changes, so an update shows up on the next browser refresh. Only the
+    # first (watcher) process prints and opens the browser.
+    if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        if not DB_PATH.is_file():
+            print(f"Warning: database not found at {DB_PATH}", file=sys.stderr, flush=True)
+        print(f"{APP_TITLE} (Dash): {url}   database: {DB_PATH}", flush=True)
+        if args.open:
+            threading.Timer(3.5, webbrowser.open, args=(url,)).start()
+    app.run(host=args.host, port=args.port, debug=args.debug,
+            use_reloader=True, reloader_type="stat")
 
 
 if __name__ == "__main__":

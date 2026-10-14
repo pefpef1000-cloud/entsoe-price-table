@@ -33,6 +33,12 @@ First time only:
 
 The database is opened READ-ONLY. Results are kept until the database
 file changes, then re-read - refresh the page or touch a picker.
+
+Since 2026-10-14 this is also the "Day-ahead charts" tab of the Day-ahead
+prices app (price_table_dash.py, port 8051) - Peter: "merge hourly price
+table and day ahead prices". price_table_dash imports this file and uses
+make_layout(title=False) + register_callbacks(). It still runs on its own
+too (port 8056), but Dash Hub only starts the merged app now.
 """
 
 from __future__ import annotations
@@ -46,12 +52,14 @@ from pathlib import Path
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, dash_table, dcc, html
+from dash.exceptions import PreventUpdate
 from dash.dash_table.Format import Format, Group, Scheme
 
 DEFAULT_PORT = 8056
 DB_NAME = "entsoe_data.db"
 DB_PATH = Path(__file__).resolve().parent / DB_NAME   # main() replaces it with --db
 NONE_OPTION = "None"  # shown in zone pickers 2-5; means "not selected"
+NO_DB_TEXT = None     # the online app sets its own "no data yet" text here
 
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
 FONT = "'Segoe UI', Inter, Arial, sans-serif"
@@ -434,7 +442,8 @@ def ctl(label, component, id_=None):
     return html.Div([html.Label(label, className="head"), component], className="ctl", **kw)
 
 
-def full_layout(zones=None):
+def full_layout(zones=None, title=True):
+    """title=False: without the headline (as a tab of the Day-ahead prices app)."""
     zones = zones or []
     pickers = []
     for i in range(1, 6):
@@ -449,7 +458,7 @@ def full_layout(zones=None):
                                                      value=value, clearable=False)))
     today = pd.Timestamp.now(tz="CET").date().isoformat()
     return html.Div([
-        html.H1("ENTSO-E day-ahead price dashboard"),
+        *([html.H1("ENTSO-E day-ahead price dashboard")] if title else []),
         html.Div(pickers, className="controls"),
         html.Div([
             ctl("View", dcc.RadioItems(id="view", options=["Day", "Week", "Month"], value="Day",
@@ -466,36 +475,25 @@ def full_layout(zones=None):
     ], className="wrap")
 
 
-def make_layout():
+def make_layout(title=True):
     """Built on every page load, so the date always starts on today."""
-    head = html.H1("ENTSO-E day-ahead price dashboard")
-    if not DB_PATH.exists():
-        return html.Div([head, note(f"No {DB_NAME} found at {DB_PATH} - run fetch_data.py "
-                                    "first, then reload this page.", "warn")], className="wrap")
+    head = [html.H1("ENTSO-E day-ahead price dashboard")] if title else []
+    if not Path(DB_PATH).exists():
+        text = NO_DB_TEXT or (f"No {DB_NAME} found at {DB_PATH} - run fetch_data.py "
+                              "first, then reload this page.")
+        return html.Div([*head, note(text, "warn")], className="wrap")
     zones = load_zones()
     if not zones:
-        return html.Div([head, note("No data yet - run fetch_data.py first, then reload "
-                                    "this page.", "warn")], className="wrap")
-    return full_layout(zones)
+        return html.Div([*head, note("No data yet - run fetch_data.py first, then reload "
+                                     "this page.", "warn")], className="wrap")
+    return full_layout(zones, title=title)
 
 
-app = Dash(__name__, title="ENTSO-E price dashboard", update_title=None)
-app.index_string = app.index_string.replace("</head>", f"<style>{CSS}</style></head>")
-app.layout = make_layout
-app.validation_layout = full_layout()
-
-
-@app.callback(Output("date-box", "style"), Input("view", "value"))
 def date_box(view):
     # Only "Day" needs a date - Week/Month show every period on record.
     return {} if view == "Day" else {"display": "none"}
 
 
-@app.callback(
-    Output("body", "children"),
-    *[Input(f"zone-{i}", "value") for i in range(1, 6)],
-    Input("view", "value"), Input("date", "date"), Input("forecast", "value"),
-)
 def update(z1, z2, z3, z4, z5, view, day, forecast):
     choices = [z1, z2, z3, z4, z5]
     # Picking the same zone twice just shows it once.
@@ -543,6 +541,37 @@ def update(z1, z2, z3, z4, z5, view, day, forecast):
     if forecast_data is not None:
         body += [note("Load forecast values (MW):"), table(forecast_data)]
     return body
+
+
+_UPDATE_INPUTS = [*[Input(f"zone-{i}", "value") for i in range(1, 6)],
+                  Input("view", "value"), Input("date", "date"), Input("forecast", "value")]
+
+
+def register_callbacks(target_app, active_when=None) -> None:
+    """Hook the callbacks onto an app: this file's own, or the Day-ahead prices
+    app (price_table_dash.py). active_when=(tabs id, tab value): only draw
+    while that tab is open - the charts read 5 zones' whole history, which
+    the price table tab doesn't need."""
+    target_app.callback(Output("date-box", "style"), Input("view", "value"))(date_box)
+    if active_when is None:
+        target_app.callback(Output("body", "children"), *_UPDATE_INPUTS)(update)
+        return
+    tabs_id, wanted = active_when
+
+    def update_when_open(z1, z2, z3, z4, z5, view, day, forecast, tab):
+        if tab != wanted:
+            raise PreventUpdate
+        return update(z1, z2, z3, z4, z5, view, day, forecast)
+
+    target_app.callback(Output("body", "children"), *_UPDATE_INPUTS,
+                        Input(tabs_id, "value"))(update_when_open)
+
+
+app = Dash(__name__, title="ENTSO-E price dashboard", update_title=None)
+app.index_string = app.index_string.replace("</head>", f"<style>{CSS}</style></head>")
+app.layout = make_layout
+app.validation_layout = full_layout()
+register_callbacks(app)
 
 
 # ---------------------------------------------------------------------
