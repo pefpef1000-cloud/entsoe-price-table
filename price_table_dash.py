@@ -45,6 +45,7 @@ data - just change the date or reload the page.
 """
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -778,8 +779,31 @@ def update_table(day_text, nordic, core, switch, ref_zone, range_value):
         return to_html(_warning("Pick a date.")), ""
     notes, table_div, caption = render(
         day, bool(nordic), bool(core), bool(switch), ref_zone, _parse_range(range_value))
+    # The nightly price check (check_prices.py): one line in the caption, and
+    # a warning under the table when it found something.
+    check = price_check_status()
+    if check:
+        caption = f"{caption} Nightly price check {check['when']:%Y-%m-%d %H:%M}: {check['summary']}."
+        if not check.get("ok", True):
+            notes = [notes, _warning([
+                html.B("The nightly price check found something: "),
+                check["summary"].removeprefix("CHECK: "),
+                f". Details in {PRICE_CHECK_FILE} next to the database."])]
     # The table first; the warnings (missing zones etc.) go below it.
     return to_html([table_div, notes]), caption
+
+
+PRICE_CHECK_FILE = "price_check_status.json"  # written by check_prices.py (nightly)
+
+
+def price_check_status():
+    """The nightly price check's result (check_prices.py), or None."""
+    try:
+        status = json.loads((Path(DB_PATH).parent / PRICE_CHECK_FILE).read_text(encoding="utf-8"))
+        status["when"] = datetime.fromisoformat(status["checked_at"])
+        return status
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 RANGE_BUTTON_STEP = 0.10  # EUR/MWh per click on the - / + buttons
