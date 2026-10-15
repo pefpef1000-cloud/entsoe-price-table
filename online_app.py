@@ -26,7 +26,9 @@ only does three things around them:
          entsoe_history.db.gz   year comparison, day-ahead prices
          load_forecast.db.gz    day-ahead prices (load forecast)
          jao_history.db.gz      year comparison, capacity auctions
-         eex_market_data.db.gz  power futures
+         eex_market_data.db.gz.locked  power futures -- locked with the
+                                FUTURES_PASSWORD on the PC (the repo is
+                                public), unlocked here with the same one
   2. Looks for newer files: prices every minute, history every 10 minutes
      (and at every start -- Render's free plan stops the app after 15 idle
      minutes).
@@ -43,8 +45,10 @@ import base64
 import ctypes
 import gc
 import gzip
+import hashlib
 import hmac
 import importlib
+import io
 import json
 import os
 import shutil
@@ -86,10 +90,16 @@ EEX_DB = DATA_DIR / "eex_market_data.db"
 # it is new before the history file (whose change refreshes the caches).
 HISTORY_FILES = [
     ("load_forecast.db.gz", LOAD_DB, False),
-    ("eex_market_data.db.gz", EEX_DB, False),
+    ("eex_market_data.db.gz.locked", EEX_DB, False),   # never the unlocked one
     ("entsoe_history.db.gz", HISTORY_DB, True),
     ("jao_history.db.gz", JAO_DB, True),
 ]
+FUTURES_PASSWORD = os.environ.get("FUTURES_PASSWORD", "")
+# Lock format, the same as in upload_online_data.py on the PC:
+# MAGIC + salt (16 bytes) + nonce (12 bytes) + AES-256-GCM(gzip file),
+# key = PBKDF2-SHA256(password, salt, LOCK_ITERATIONS).
+LOCK_MAGIC = b"ONLINE-DATA-LOCK-1\n"
+LOCK_ITERATIONS = 200_000
 STAMP_NAME = "stamp.json"          # written last by upload_online_data.py
 PC_RECENT_NAME = "recent_prices.db.gz"
 PC_RECENT_STAMP_NAME = "recent_stamp.json"
@@ -115,7 +125,7 @@ _http.headers["User-Agent"] = "entsoe-price-table-online"
 _state_lock = threading.Lock()
 _merge_lock = threading.Lock()
 _status = {"history": "not downloaded yet", "history_uploaded_at": None,
-           "pc_prices_uploaded_at": None}
+           "pc_prices_uploaded_at": None, "unlock_problem": None}
 
 
 def log(text):
@@ -151,9 +161,36 @@ def _make_readable(path: Path) -> None:
         raise ValueError(f"{path.name}: no tables in the downloaded file")
 
 
-def _download(url: str, dest: Path, gunzip: bool = False, headers: dict | None = None):
+class UnlockError(Exception):
+    """A locked file could not be opened (no / wrong password, damaged)."""
+
+
+def unlock_bytes(blob: bytes, password: str) -> bytes:
+    if not password:
+        raise UnlockError("FUTURES_PASSWORD is not set in Render")
+    if not blob.startswith(LOCK_MAGIC) or len(blob) < len(LOCK_MAGIC) + 28:
+        raise UnlockError("not a locked file")
+    try:
+        from cryptography.exceptions import InvalidTag  # noqa: PLC0415
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: PLC0415
+    except ImportError as exc:
+        raise UnlockError("the 'cryptography' package is missing "
+                          "(requirements-online.txt)") from exc
+    rest = blob[len(LOCK_MAGIC):]
+    salt, nonce, sealed = rest[:16], rest[16:28], rest[28:]
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, LOCK_ITERATIONS, dklen=32)
+    try:
+        return AESGCM(key).decrypt(nonce, sealed, LOCK_MAGIC)
+    except InvalidTag as exc:
+        raise UnlockError("wrong password: futures_password.txt on the PC is not the same "
+                          "as FUTURES_PASSWORD in Render") from exc
+
+
+def _download(url: str, dest: Path, gunzip: bool = False, headers: dict | None = None,
+              password: str | None = None):
     """Download to a temporary file, check it, then swap it in. Returns the
-    response headers, or None if the server said "not modified"."""
+    response headers, or None if the server said "not modified". With
+    `password`, the file is a locked .gz: unlocked, then unzipped."""
     tmp = dest.with_name(dest.name + ".download")
     try:
         with _http.get(url, stream=True, timeout=(20, 600), headers=headers or {}) as r:
@@ -161,7 +198,10 @@ def _download(url: str, dest: Path, gunzip: bool = False, headers: dict | None =
                 return None
             r.raise_for_status()
             with open(tmp, "wb") as out:
-                source = gzip.GzipFile(fileobj=r.raw) if gunzip else r.raw
+                if password is not None:
+                    source = gzip.GzipFile(fileobj=io.BytesIO(unlock_bytes(r.content, password)))
+                else:
+                    source = gzip.GzipFile(fileobj=r.raw) if gunzip else r.raw
                 shutil.copyfileobj(source, out, 1024 * 1024)
             response_headers = dict(r.headers)
         _make_readable(tmp)
@@ -263,23 +303,40 @@ def refresh_history() -> None:
     stamp_text = r.text
     with _state_lock:
         state = _load_state()
-    have_files = all(path.is_file() for _, path, _ in HISTORY_FILES)
+    # Optional files missing last time (not uploaded / not unlockable) do
+    # not count, or every check would download all ~100 MB again.
+    skipped_before = set(state.get("history_skipped", []))
+    have_files = all(path.is_file() for name, path, _ in HISTORY_FILES
+                     if name not in skipped_before)
     if have_files and state.get("history_stamp") == stamp_text:
         _set_uploaded_at(stamp_text)
         _status["history"] = "ok"
         return
     _status["history"] = "downloading"
     started = time.time()
+    skipped = []
     for name, path, required in HISTORY_FILES:
+        locked = name.endswith(".locked")
         try:
-            _download(f"{RELEASE_URL}/{name}", path, gunzip=True)
+            _download(f"{RELEASE_URL}/{name}", path, gunzip=True,
+                      password=FUTURES_PASSWORD if locked else None)
+            if locked:
+                _status["unlock_problem"] = None
         except requests.HTTPError as exc:
             if required or exc.response is None or exc.response.status_code != 404:
                 raise
+            skipped.append(name)
             log(f"{name} is not in the release yet - its page waits")
+        except UnlockError as exc:
+            if required:
+                raise
+            skipped.append(name)
+            _status["unlock_problem"] = str(exc)
+            log(f"{name} could not be unlocked ({exc}) - its pages wait")
     with _state_lock:
         state = _load_state()
         state["history_stamp"] = stamp_text
+        state["history_skipped"] = skipped
         _save_state(state)
     _set_uploaded_at(stamp_text)
     _status["history"] = "ok"
@@ -473,6 +530,11 @@ def wait_page():
         text = [html.B("No data uploaded yet. "),
                 "Run upload_online_data.py once on the PC. "
                 "This page checks again every 20 seconds."]
+    elif state == "ok" and _status.get("unlock_problem"):
+        text = [html.B("The EEX file could not be unlocked: "),
+                f"{_status['unlock_problem']}. Fix: run \"Set online password.bat\" on "
+                "the PC with the same password as in Render. This page checks again "
+                "every 20 seconds."]
     elif state == "ok":
         text = [html.B("The data for this page is not uploaded yet. "),
                 "It comes with the next upload from the PC (after its 04:00 and "
