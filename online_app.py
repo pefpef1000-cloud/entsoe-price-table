@@ -583,8 +583,9 @@ for _key, (_module, _build, _needs, _note) in APPS.items():
 
 
 class PasswordGate:
-    """HTTP password (the browser asks once, any user name) in front of one
-    app. EEX data may not be republished, and this site is public."""
+    """HTTP password (the browser asks once, any user name) in front of an
+    app. Since 2026-10-15 the whole site sits behind it (same password as
+    Power futures); EEX data may not be republished, and this site is public."""
 
     def __init__(self, app, password: str, realm: str):
         self.app, self.password, self.realm = app, password, realm
@@ -592,7 +593,7 @@ class PasswordGate:
     def __call__(self, environ, start_response):
         if not self.password:
             start_response("403 Forbidden", [("Content-Type", "text/html; charset=utf-8")])
-            return [b"<p style='font-family:sans-serif;margin:24px'>Power futures is switched "
+            return [b"<p style='font-family:sans-serif;margin:24px'>The dashboards are switched "
                     b"off online until a password is set: in Render, open the service, "
                     b"Environment, add <b>FUTURES_PASSWORD</b>.</p>"]
         header = environ.get("HTTP_AUTHORIZATION", "")
@@ -619,16 +620,25 @@ def _moved_to(location: str):
 
 
 server = pt.app.server
-server.wsgi_app = DispatcherMiddleware(server.wsgi_app, {
+_dispatch = DispatcherMiddleware(server.wsgi_app, {
     "/years": yc.app.server,
     "/dayahead": _moved_to("/"),
     "/auctions": _moved_to("/years/"),
-    "/futures": PasswordGate(eex.app.server, os.environ.get("FUTURES_PASSWORD", ""),
-                             "Power futures"),
-    # Same password and realm, so the browser asks only once for both pages.
-    "/futures-vs-spot": PasswordGate(fvs.app.server, os.environ.get("FUTURES_PASSWORD", ""),
-                                     "Power futures"),
+    "/futures": eex.app.server,
+    "/futures-vs-spot": fvs.app.server,
 })
+# One password for every page (Peter, 2026-10-15: "all pages same pw").
+# /healthz stays open: Render's health check calls it without a password.
+_gate = PasswordGate(_dispatch, os.environ.get("FUTURES_PASSWORD", ""), "Dashboards")
+
+
+def _site(environ, start_response):
+    if environ.get("PATH_INFO", "") == "/healthz":
+        return _dispatch(environ, start_response)
+    return _gate(environ, start_response)
+
+
+server.wsgi_app = _site
 
 
 @server.route("/healthz")
