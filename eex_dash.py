@@ -28,6 +28,12 @@ Four tabs:
     Forward curve   settlement by delivery period on one trade date,
                     with an earlier date overlaid to show how it moved
     Area spreads    one delivery period across markets, plus A-B spread
+    Correlation     correlation of daily % changes, all power markets + TTF,
+                    API2/API4 and EUA for one tenor, N trading days (+/-)
+    Production costs  gas and coal plant cost (fuel + carbon) per country and
+                    tenor, clean spark (CSS) and clean dark (CDS) spreads,
+                    grids of every country; gas defaults ICE (50 %, TTF), 0.184 tCO2/MWh gas,
+                    coal 45 % API2 (Platts) (coal + EUR/USD from ice_market_data.db)
     Price history   one contract over time: price (line or daily candles),
                     volume, open interest, key numbers and a CSV download
     Data & runs     what is in the database, how fresh each maturity is,
@@ -50,6 +56,7 @@ from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, ctx, dash_table, dcc, html, no_update
@@ -445,6 +452,8 @@ h1 {{ font-size:22px; margin:0; }}
             margin:12px 0; }}
 .ctl {{ display:flex; flex-direction:column; min-width:140px; }}
 .ctl.wide {{ min-width:280px; flex:1; }}
+.grp {{ align-self:center; font-size:12px; font-weight:600; color:{INK['text']};
+        padding:0 2px 0 8px; border-left:3px solid {INK['grid']}; }}
 .ctl label {{ font-size:12px; color:{INK['muted']}; margin-bottom:3px; }}
 .card {{ background:{INK['card']}; border:1px solid {INK['grid']}; border-radius:8px;
         padding:10px 12px; margin-bottom:12px; }}
@@ -471,12 +480,29 @@ h1 {{ font-size:22px; margin:0; }}
 .seg input {{ display:none; }}
 .seg label:has(input:checked) {{ background:{SERIES[0]}; }}
 .seg label:has(input:checked), .seg label:has(input:checked) * {{ color:#fff !important; }}
+/* Production costs tab: compact, so all tiles fit on one row */
+#panel-spark .controls {{ gap:8px; margin:6px 0; }}
+#panel-spark .controls {{ align-items:flex-end; }}
+#panel-spark .ctl {{ min-width:96px; }}
+#panel-spark .grp {{ align-self:flex-end; padding-bottom:7px; margin-left:4px; }}
+#panel-spark .ctl label {{ font-size:11px; margin-bottom:2px; }}
+#panel-spark .Select-control, #panel-spark .dash-dropdown {{ font-size:13px; }}
+#panel-spark .kpis {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(118px, 1fr));
+                      gap:6px; margin:4px 0 10px; }}
+#panel-spark .kpi {{ min-width:0; padding:5px 8px; }}
+#panel-spark .kpi-label {{ font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+#panel-spark .kpi-value {{ font-size:17px; }}
+#panel-spark .kpi-delta {{ font-size:11px; }}
+#panel-spark .note {{ font-size:12px; margin:3px 0; }}
+#panel-spark .btn {{ padding:5px 10px; font-size:12px; }}
 details summary {{ cursor:pointer; color:{INK['muted']}; font-size:13px; margin:6px 0; }}
 """
 
 
-def ctl(label, component, wide=False):
-    return html.Div([html.Label(label), component], className="ctl wide" if wide else "ctl")
+def ctl(label, component, wide=False, narrow=False):
+    return html.Div([html.Label(label), component],
+                    className="ctl wide" if wide else "ctl",
+                    style={"minWidth": 0} if narrow else None)
 
 
 def dd(id_, multi=False, clearable=False):
@@ -505,6 +531,94 @@ def spread_tab():
             ctl("Spread", dd("s-left")), ctl("minus", dd("s-right")),
         ], className="controls"),
         html.Div(id="s-body"),
+    ])
+
+
+# ICE's EU spark spreads (German / Dutch / Italian Spark Spread (TTF), ICE Endex
+# contract specs): "assumes a fuel efficiency of 50%", fuel cost = gas price
+# divided by 0.5, no carbon. The clean spark adds EUA x carbon factor, where
+# the carbon factor follows from natural gas's emission factor divided by the
+# efficiency. TTF is priced per MWh of GROSS calorific value, so the factor is
+# on that basis: 0.184 tCO2/MWh (Platts: 0.053942 tCO2/MMBtu HHV). Peter,
+# 2026-10-14; was 0.202 (net basis), which overstated carbon by ~10 %.
+ICE_EFFICIENCY = 50.0          # percent
+GAS_EMISSION = 0.184           # tCO2 per MWh gas, gross calorific value (TTF basis)
+SPARK_TENORS = ["Month", "Quarter", "Year"]
+
+
+def carbon_factor(eff_pct):
+    return round(GAS_EMISSION / (eff_pct / 100), 4)
+
+
+# Coal: no ICE dark spread contract exists, so the Platts convention
+# (European Electricity methodology): 6.978 MWh/t, 0.757 tCO2/MWh power at
+# 45 % = 0.341 per MWh coal. Default efficiency 45 % as Platts (Peter,
+# 2026-10-14), editable.
+# API2/API4 are quoted in USD per tonne of 6,000 kcal/kg NAR coal
+# = 25.12 GJ = 6.978 MWh. IPCC default for hard coal: 94.6 kg CO2/GJ
+# = 0.341 tCO2 per MWh of coal.
+COAL_EFFICIENCY = 45.0
+COAL_EMISSION = 0.341
+COAL_MWH_PER_T = 6.978
+COAL_COLOR = "#6e5440"
+
+
+def coal_factor(eff_pct):
+    return round(COAL_EMISSION / (eff_pct / 100), 4)
+
+
+def num_input(id_, value, step, width=80):
+    return dcc.Input(id=id_, type="number", value=value, step=step, debounce=True,
+                     style={"height": 36, "width": width, "padding": "0 6px", "boxSizing": "border-box",
+                            "border": f"1px solid {INK['axis']}", "borderRadius": 6,
+                            "fontSize": 14, "fontFamily": "inherit"})
+
+
+def spark_tab():
+    return html.Div([
+        html.Div([
+            ctl("Country", dd("sp-market")), ctl("Power", dd("sp-product")),
+            ctl("Tenor", dd("sp-maturity")), ctl("Delivery", dd("sp-delivery")),
+            ctl("Gas hub", dd("sp-gas")),
+            html.Div("Gas plant", className="grp"),
+            ctl("Efficiency %", num_input("sp-eff", ICE_EFFICIENCY, 0.1), narrow=True),
+            ctl("tCO2/MWh", num_input("sp-cf", carbon_factor(ICE_EFFICIENCY), "any", 90), narrow=True),
+            html.Div("Coal plant", className="grp"),
+            ctl("Coal", dcc.Dropdown(id="sp-coal", options=["API2", "API4"], value="API2",
+                                     clearable=False, style={"minWidth": 110})),
+            ctl("Efficiency %", num_input("sp-ceff", COAL_EFFICIENCY, 0.1), narrow=True),
+            ctl("tCO2/MWh", num_input("sp-ccf", coal_factor(COAL_EFFICIENCY), "any", 90), narrow=True),
+            html.Div(html.Button("Reset defaults", id="sp-reset", className="btn"), className="ctl"),
+        ], className="controls"),
+        html.Div(f"Carbon factors follow the efficiency: {GAS_EMISSION} tCO2 per MWh gas, "
+                 f"{COAL_EMISSION} per MWh coal, ÷ efficiency. Type over one to use your own.",
+                 className="note"),
+        html.Div(id="sp-body"),
+    ])
+
+
+# Correlation of daily % changes over the last N trading days. 30 = about
+# six weeks: long enough to be stable, short enough to show regime changes,
+# and inside the ~6 weeks of settlements EEX serves (Peter, 2026-10-14).
+CORR_DAYS = 30
+
+
+def corr_tab():
+    small = {"height": 36, "width": 36, "padding": 0, "fontSize": 18, "lineHeight": "1"}
+    return html.Div([
+        html.Div([
+            ctl("Power", dd("co-product")), ctl("Tenor", dd("co-maturity")),
+            ctl("Delivery", dd("co-delivery")),
+            ctl("Coal", dcc.Dropdown(id="co-coal", options=["API2", "API4"], value="API2",
+                                     clearable=False)),
+            ctl("Trading days", html.Div([
+                html.Button("−", id="co-minus", className="btn", style=small),
+                num_input("co-days", CORR_DAYS, 1, 70),
+                html.Button("+", id="co-plus", className="btn", style=small),
+            ], style={"display": "flex", "gap": "4px", "alignItems": "center"})),
+            ctl("Hedge / rolling for", dd("co-focus")),
+        ], className="controls"),
+        html.Div(id="co-body"),
     ])
 
 
@@ -557,6 +671,8 @@ def full_layout():
             for value, label in TABS]),
         html.Div(curve_tab(), id="panel-curve", style={"display": "none"}),
         html.Div(spread_tab(), id="panel-spread", style={"display": "none"}),
+        html.Div(spark_tab(), id="panel-spark", style={"display": "none"}),
+        html.Div(corr_tab(), id="panel-corr", style={"display": "none"}),
         html.Div(history_tab(), id="panel-history"),
         html.Div(runs_tab(), id="panel-runs", style={"display": "none"}),
         html.Div("Source: EEX. For information only - systematic republication "
@@ -564,8 +680,8 @@ def full_layout():
     ], className="wrap")
 
 
-TABS = [("curve", "Forward curve"), ("spread", "Area spreads"),
-        ("history", "Price history"), ("runs", "Data & runs")]
+TABS = [("curve", "Forward curve"), ("spread", "Area spreads"), ("spark", "Production costs"),
+        ("corr", "Correlation"), ("history", "Price history"), ("runs", "Data & runs")]
 
 TAB_STYLE = {"padding": "7px 12px", "fontSize": 14, "color": INK["muted"],
              "backgroundColor": INK["bg"], "border": "none",
@@ -847,6 +963,794 @@ def area_spreads(product, maturity, dkey, picked, left, right, tab):
         body.append(note("Pick two different markets to see a spread."))
     body.append(html.Details([html.Summary(f"Table — {label} by market"),
                               table(wide.sort_values("trade_date", ascending=False))]))
+    return out + [body]
+
+
+# ---------------------------------------------------------------------
+# 2b. Spark spread
+# ---------------------------------------------------------------------
+@app.callback(Output("sp-eff", "value"), Output("sp-cf", "value"),
+              Input("sp-eff", "value"), Input("sp-reset", "n_clicks"),
+              prevent_initial_call=True)
+def spark_factor(eff, _):
+    """New efficiency -> carbon factor recalculated. Reset -> ICE values.
+    A carbon factor typed by hand stays until the efficiency changes."""
+    if ctx.triggered_id == "sp-reset":
+        return ICE_EFFICIENCY, carbon_factor(ICE_EFFICIENCY)
+    if eff is None or eff <= 0 or eff > 100:
+        return no_update, no_update
+    return no_update, carbon_factor(eff)
+
+
+@app.callback(Output("sp-ceff", "value"), Output("sp-ccf", "value"),
+              Input("sp-ceff", "value"), Input("sp-reset", "n_clicks"),
+              prevent_initial_call=True)
+def coal_factor_cb(eff, _):
+    if ctx.triggered_id == "sp-reset":
+        return COAL_EFFICIENCY, coal_factor(COAL_EFFICIENCY)
+    if eff is None or eff <= 0 or eff > 100:
+        return no_update, no_update
+    return no_update, coal_factor(eff)
+
+
+ICE_DB = "ice_market_data.db"
+_coal_cache: dict = {}
+
+
+def ice_db() -> Path | None:
+    """ice_market_data.db from ice_scraper (a sibling folder on the Desktop)."""
+    roots = ([DB_PATH.parent] if DB_PATH else []) + [HERE]
+    for r in roots:
+        for c in (r.parent / "ice_scraper" / ICE_DB, r / ICE_DB):
+            if c.exists():
+                return c
+    return None
+
+
+def load_coal():
+    """{'prices': {(product, trade_date, strip): usd}, 'fx': Series date->usd_per_eur}
+    from ice_market_data.db, cached on file mtime. None if missing."""
+    path = ice_db()
+    if path is None:
+        return None
+    key = (str(path), path.stat().st_mtime)
+    if _coal_cache.get("key") == key:
+        return _coal_cache["data"]
+    try:
+        with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+            px = pd.read_sql_query(
+                "SELECT product, strip, trade_date, price FROM ice_settlement "
+                "WHERE product IN ('API2', 'API4')", conn)
+            try:
+                fx = pd.read_sql_query("SELECT date, usd_per_eur FROM ecb_eurusd ORDER BY date", conn)
+            except Exception:
+                fx = pd.DataFrame(columns=["date", "usd_per_eur"])
+    except Exception:
+        return None
+    data = {"prices": {(p, t, s): v for p, s, t, v in px.itertuples(index=False)},
+            "fx": fx.set_index("date")["usd_per_eur"], "path": path}
+    _coal_cache["key"], _coal_cache["data"] = key, data
+    return data
+
+
+def coal_strips(maturity: str, d) -> list[list[str]]:
+    """ICE strip names for a power delivery, best first: the matching
+    contract, then the sets whose average stands in for it."""
+    yy = f"{d.year % 100:02d}"
+    if maturity == "Month":
+        return [[f"{MON[d.month - 1]}{yy}"]]
+    if maturity == "Quarter":
+        q = (d.month - 1) // 3 + 1
+        return [[f"Q{q} {yy}"], [f"{MON[m - 1]}{yy}" for m in range(3 * q - 2, 3 * q + 1)]]
+    return [[f"Cal {yy}"], [f"Q{q} {yy}" for q in range(1, 5)],
+            [f"{MON[m]}{yy}" for m in range(12)]]
+
+
+def add_coal(m: pd.DataFrame, coal, hub: str, maturity: str, ceff: float, ccf: float):
+    """Add coal columns + CDS to a spark frame. Coal in EUR per MWh of coal
+    = USD/t ÷ EUR/USD ÷ 6.978. EUR/USD: ECB rate of that day, else the last
+    one up to 7 days before."""
+    m = m.copy()
+    usd, src, strip, fxv, fxd = [], [], [], [], []
+    fx = coal["fx"] if coal else pd.Series(dtype=float)
+    for r in m.itertuples(index=False):
+        price = s_name = sr = None
+        if coal:
+            for i, names in enumerate(coal_strips(maturity, r.ddate)):
+                vals = [coal["prices"].get((hub, r.trade_date, n)) for n in names]
+                if all(v is not None for v in vals):
+                    price = sum(vals) / len(vals)
+                    s_name = names[0] if i == 0 else None
+                    sr = "contract" if i == 0 else "average"
+                    break
+        rate = rdate = None
+        if len(fx):
+            prior = fx.loc[:r.trade_date]
+            if len(prior) and (pd.Timestamp(r.trade_date) - pd.Timestamp(prior.index[-1])).days <= 7:
+                rate, rdate = float(prior.iloc[-1]), prior.index[-1]
+        usd.append(price); src.append(sr); strip.append(s_name); fxv.append(rate); fxd.append(rdate)
+    m["coal_usd"] = pd.to_numeric(pd.Series(usd, index=m.index), errors="coerce")
+    m["coal_src"], m["coal_strip"] = src, strip
+    m["fx"] = pd.to_numeric(pd.Series(fxv, index=m.index), errors="coerce")
+    m["fx_date"] = fxd
+    m["coal_eur_th"] = m["coal_usd"] / m["fx"] / COAL_MWH_PER_T
+    m["coal_fuel_cost"] = m["coal_eur_th"] / (ceff / 100)
+    m["coal_carbon_cost"] = m["eua"].astype(float) * ccf
+    m["coal_cost"] = m["coal_fuel_cost"] + m["coal_carbon_cost"]
+    m["gas_cost"] = m["fuel_cost"] + m["carbon_cost"]
+    m["cds"] = m["power"] - m["coal_cost"]
+    return m
+
+
+def spread_grid(grid: pd.DataFrame, col: str, title: str):
+    cols = grid.drop_duplicates("dkey").sort_values("dkey")[["dkey", "dlabel"]]
+    mat = grid.pivot_table(index="market", columns="dkey", values=col).reindex(columns=cols["dkey"])
+    mat = mat.loc[mat.mean(axis=1).sort_values(ascending=False).index]
+    lim = float(np.nanmax(np.abs(mat.values))) if mat.notna().values.any() else 1.0
+    text = [[("" if pd.isna(v) else f"{v:.1f}") for v in row] for row in mat.values]
+    hm = go.Figure(go.Heatmap(
+        z=mat.values, x=cols["dlabel"].tolist(), y=mat.index.tolist(),
+        zmin=-lim, zmax=lim, zmid=0,
+        colorscale=[[0, INK["down"]], [0.5, "#f7f7f4"], [1, INK["up"]]],
+        text=text, texttemplate="%{text}", textfont=dict(size=11),
+        hovertemplate="%{y} %{x}: %{z:.2f} EUR/MWh<extra></extra>",
+        colorbar=dict(title="EUR/MWh", thickness=12)))
+    hm.update_layout(
+        title=dict(text=title, x=0, xanchor="left", font=dict(size=14, color=INK["text"])),
+        height=max(260, 28 * len(mat) + 120), margin=dict(l=90, r=40, t=48, b=40),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Segoe UI, Inter, Arial, sans-serif", size=12, color=INK["muted"]))
+    hm.update_yaxes(autorange="reversed")
+    hm.update_xaxes(side="top", tickangle=0 if len(cols) <= 14 else -45)
+    return hm
+
+
+def eua_prices() -> pd.DataFrame:
+    """EUA December prices per trade date: EEX settlement, else the day's
+    last trade (eex_gas_eua.db candles). Columns trade_date, dec_year,
+    eua, eua_src."""
+    d = load()
+    s = d["settled"]
+    st = s[s["market"] == "EUA"][["trade_date", "ddate", "settlement_price"]].copy()
+    st["dec_year"] = st["ddate"].map(lambda x: x.year)
+    st = st.rename(columns={"settlement_price": "eua"}).drop(columns="ddate")
+    st["eua_src"] = "settlement"
+    rows = [st]
+    have = set(zip(st.trade_date, st.dec_year))
+    for dlv in sorted(set(d["older"].query("market == 'EUA'")["delivery"]) |
+                      set(s[s["market"] == "EUA"]["delivery"])):
+        o = load_ohlc("FEUA", dlv)
+        if o.empty:
+            continue
+        y = int(str(dlv)[:4])
+        o = o[[(t, y) not in have for t in o["trade_date"]]]
+        if not o.empty:
+            rows.append(pd.DataFrame({"trade_date": o["trade_date"], "dec_year": y,
+                                      "eua": o["last"], "eua_src": "last trade"}))
+    return pd.concat(rows, ignore_index=True)
+
+
+def pick_eua(eua: pd.DataFrame, trade_date: str, year: int):
+    """EUA for power delivered in `year` on one trade date: the Dec-`year`
+    contract, else the first later December, else the furthest one quoted
+    (power runs further out than EUA). Returns (price, dec_year, source)."""
+    day = eua[eua["trade_date"] == trade_date]
+    if day.empty:
+        return None, None, None
+    later = day[day["dec_year"] >= year].sort_values("dec_year")
+    row = (later if not later.empty else day.sort_values("dec_year").tail(1)).iloc[0]
+    return row["eua"], int(row["dec_year"]), row["eua_src"]
+
+
+def spark_frame(power: pd.DataFrame, gas: pd.DataFrame, eua: pd.DataFrame,
+                eff: float, cf: float) -> pd.DataFrame:
+    """One row per trade date with both power and gas settled. EUA from the
+    same day; if that day has none (EUA scraper not run yet), the latest EUA
+    from up to 7 days before, marked 'carried'."""
+    m = (power[["trade_date", "dkey", "ddate", "settlement_price"]]
+         .rename(columns={"settlement_price": "power"})
+         .merge(gas[["trade_date", "dkey", "settlement_price"]]
+                .rename(columns={"settlement_price": "gas"}), on=["trade_date", "dkey"]))
+    dates = sorted(eua["trade_date"].unique())
+    out = []
+    for r in m.itertuples(index=False):
+        price, dec, src = pick_eua(eua, r.trade_date, r.ddate.year)
+        if price is None:
+            prior = [t for t in dates if t < r.trade_date and
+                     (pd.Timestamp(r.trade_date) - pd.Timestamp(t)).days <= 7]
+            if prior:
+                price, dec, src = pick_eua(eua, prior[-1], r.ddate.year)
+                src = f"carried from {prior[-1]}"
+        out.append((price, dec, src))
+    m["eua"], m["eua_dec"], m["eua_src"] = zip(*out) if out else ([], [], [])
+    m["fuel_cost"] = m["gas"] / (eff / 100)
+    m["carbon_cost"] = m["eua"].astype(float) * cf
+    m["ice_spark"] = m["power"] - m["fuel_cost"]
+    m["clean_spark"] = m["ice_spark"] - m["carbon_cost"]
+    return m.sort_values(["dkey", "trade_date"])
+
+
+def all_clean_sparks(power: pd.DataFrame, gas: pd.DataFrame, eua: pd.DataFrame,
+                     eff: float, cf: float, maturity: str) -> pd.DataFrame:
+    """Clean spark for every country and delivery of one tenor, on the latest
+    trade date that has gas settlements. Only power rows of that day are
+    used, so this stays fast."""
+    power = power[power["maturity_type"] == maturity]
+    if power.empty or gas.empty:
+        return pd.DataFrame()
+    td = min(power["trade_date"].max(), gas["trade_date"].max())
+    p = power[power["trade_date"] == td]
+    g = gas[gas["trade_date"] == td]
+    rows = []
+    for mk, pm in p.groupby("market"):
+        fr = spark_frame(pm, g, eua, eff, cf)
+        if not fr.empty:
+            fr["market"] = mk
+            rows.append(fr)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True)
+    labels = p.drop_duplicates("dkey").set_index("dkey")["dlabel"]
+    out["dlabel"] = out["dkey"].map(labels)
+    return out
+
+
+@app.callback(
+    Output("sp-market", "options"), Output("sp-market", "value"),
+    Output("sp-product", "options"), Output("sp-product", "value"),
+    Output("sp-maturity", "options"), Output("sp-maturity", "value"),
+    Output("sp-delivery", "options"), Output("sp-delivery", "value"),
+    Output("sp-gas", "options"), Output("sp-gas", "value"),
+    Output("sp-body", "children"),
+    Input("sp-market", "value"), Input("sp-product", "value"),
+    Input("sp-maturity", "value"), Input("sp-delivery", "value"),
+    Input("sp-gas", "value"), Input("sp-eff", "value"), Input("sp-cf", "value"),
+    Input("sp-coal", "value"), Input("sp-ceff", "value"), Input("sp-ccf", "value"),
+    Input("tabs", "value"),
+)
+def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ceff, ccf, tab):
+    if tab != "spark":
+        return [no_update] * 11
+    d = load()
+    s = d["settled"]
+    euro = s[s["unit"] == "EUR/MWh"]
+    pw = euro[(euro["group"] == "Power") & euro["maturity_type"].isin(SPARK_TENORS)]
+    gs = euro[(euro["group"] == "Gas") & (euro["product"] == "Base") &
+              euro["maturity_type"].isin(SPARK_TENORS)]
+
+    markets = sorted(pw["market"].unique())
+    market = keep(market, markets, "DE")
+    f = pw[pw["market"] == market]
+    products = [p for p in ("Base", "Peak") if p in set(f["product"])]
+    product = keep(product, products, "Base")
+    f = f[f["product"] == product]
+    maturities = [m for m in SPARK_TENORS
+                  if m in set(f["maturity_type"]) and m in set(gs["maturity_type"])]
+    maturity = keep(maturity, maturities, "Year")
+    f = f[f["maturity_type"] == maturity]
+    g_all = gs[gs["maturity_type"] == maturity]
+    hubs = sorted(g_all["market"].unique())
+    gas_hub = keep(gas_hub, hubs, "Gas TTF")
+    g = g_all[g_all["market"] == gas_hub]
+
+    # Only deliveries that both power and gas quote.
+    both = sorted(set(f["dkey"]) & set(g["dkey"]))
+    dels = f[f["dkey"].isin(both)].drop_duplicates("dkey").sort_values("dkey")
+    del_opts = [{"label": l, "value": k} for k, l in zip(dels["dkey"], dels["dlabel"])]
+    if dkey not in both or ctx.triggered_id in ("sp-maturity", "sp-market"):
+        dkey = front_delivery(f[f["dkey"].isin(both)])
+    hub_opts = [{"label": h.replace("Gas ", ""), "value": h} for h in hubs]
+    out = [opts(markets), market, opts(products), product, opts(maturities), maturity,
+           del_opts, dkey, hub_opts, gas_hub]
+
+    if eff is None or not (0 < eff <= 100):
+        return out + [html.Div("Efficiency must be between 0 and 100 %.", className="warn")]
+    cf = 0.0 if cf is None else float(cf)
+    if not dkey:
+        return out + [graph(empty_fig(f"No {maturity.lower()} delivery that both {market} "
+                                      f"{product} and {gas_hub} quote."))]
+
+    eua = eua_prices()
+    if eua.empty:
+        return out + [html.Div("No EUA prices found - needs eex_gas_eua.db "
+                               "(eex_gas_eua_scraper.py).", className="warn")]
+    if ceff is None or not (0 < ceff <= 100):
+        return out + [html.Div("Coal efficiency must be between 0 and 100 %.", className="warn")]
+    ccf = 0.0 if ccf is None else float(ccf)
+    coal = load_coal()
+    coal_hub = coal_hub or "API2"
+
+    allx = add_coal(spark_frame(f[f["dkey"].isin(both)], g, eua, eff, cf),
+                    coal, coal_hub, maturity, ceff, ccf)
+    hist = allx[allx["dkey"] == dkey]
+    if hist.empty:
+        return out + [graph(empty_fig("No trade date with both power and gas settled."))]
+    label = dels.set_index("dkey")["dlabel"][dkey]
+    gas_name = gas_hub.replace("Gas ", "")
+    unit = "EUR/MWh"
+    has_coal = hist["cds"].notna().any()
+
+    # --- KPI tiles ---------------------------------------------------
+    last = hist.iloc[-1]
+    prev = hist.iloc[-2] if len(hist) > 1 else None
+
+    def dd(col):
+        if prev is None or pd.isna(last[col]) or pd.isna(prev[col]):
+            return None
+        return last[col] - prev[col]
+
+    def dtxt(v, base):
+        return f"{fmt(v, sign=True)} day-on-day" if v is not None else base
+
+    eua_txt = (f"Dec-{last['eua_dec'] % 100:02d}" if pd.notna(last["eua_dec"]) else "—")
+    tiles = [
+        kpi(f"CSS · {last['trade_date']}", fmt(last["clean_spark"]),
+            dtxt(dd("clean_spark"), unit), dd("clean_spark")),
+        kpi(f"CDS · {coal_hub}", fmt(last["cds"]),
+            dtxt(dd("cds"), unit) if has_coal else "no coal price yet", dd("cds")),
+        kpi(f"{market} {product} {label}", fmt(last["power"]), "EUR/MWh"),
+        kpi(f"Gas plant · {eff:g} %", fmt(last["gas_cost"]),
+            f"{fmt(last['fuel_cost'])} + {fmt(last['carbon_cost'])} CO2",
+            None if dd("gas_cost") is None else -dd("gas_cost")),
+        kpi(f"Coal plant · {ceff:g} %", fmt(last["coal_cost"]),
+            f"{fmt(last['coal_fuel_cost'])} + {fmt(last['coal_carbon_cost'])} CO2",
+            None if dd("coal_cost") is None else -dd("coal_cost")),
+        kpi(f"{gas_name} {label}", fmt(last["gas"]), "EUR/MWh"),
+        kpi(f"{coal_hub} {last['coal_strip'] or label}", fmt(last["coal_usd"]),
+            f"USD/t = {fmt(last['coal_eur_th'])} €/MWh"),
+        kpi(f"EUA {eua_txt}", fmt(last["eua"]), "EUR/t"),
+        kpi("EUR/USD", fmt(last["fx"], 4), f"ECB {last['fx_date'] or '—'}"),
+    ]
+    tiles = html.Div(tiles, className="kpis")
+
+    notes = [note(f"CSS = power − gas ÷ {eff:g} % − EUA × {cf:.3f}.   "
+                  f"CDS = power − {coal_hub} (USD/t ÷ EUR/USD ÷ {COAL_MWH_PER_T} MWh/t) ÷ "
+                  f"{ceff:g} % − EUA × {ccf:.3f}.   Gas: ICE defaults (50 %, TTF), "
+                  f"{GAS_EMISSION} tCO2/MWh gas (gross CV). Coal: Platts defaults (45 %, "
+                  f"6,000 kcal/kg, {COAL_EMISSION} tCO2/MWh coal).")]
+    if coal is None:
+        notes.append(html.Div("No coal prices found: needs ice_market_data.db with API2/API4 "
+                              "(run ice_scraper.py --backfill --products API2,API4).",
+                              className="warn"))
+    elif hist["coal_usd"].notna().any() and hist["fx"].isna().all():
+        notes.append(html.Div("No EUR/USD rate yet - CDS left blank. Run ice_scraper.py once "
+                              "(it now also fetches the ECB rate).", className="warn"))
+    elif not has_coal:
+        notes.append(html.Div(f"No {coal_hub} price for {label} - CDS left blank. ICE lists "
+                              "API2 months to ~2 years out, quarters and the next Cal only.",
+                              className="warn"))
+    if hist["eua"].isna().any():
+        notes.append(html.Div(f"{int(hist['eua'].isna().sum())} day(s) without an EUA price: "
+                              "clean spreads left blank there.", className="warn"))
+    carried = hist["eua_src"].astype(str).str.startswith("carried").sum()
+    if carried:
+        notes.append(note(f"EUA: {carried} day(s) carry the previous day's EUA "
+                          "(EUA scraper not run for that day yet)."))
+    if has_coal and (hist["coal_src"] == "average").any():
+        notes.append(note(f"{coal_hub} {label} not listed as one contract: average of its "
+                          "quarters/months used."))
+
+    x = pd.to_datetime(hist["trade_date"])
+    xs = dict(rangebreaks=[dict(bounds=["sat", "mon"])])
+
+    # --- 1. CSS + CDS (left) with production costs (right) ---------------
+    f1 = fig_base(f"{market} {product} {label}: clean spark and clean dark spread, "
+                  "with production costs", unit, 380)
+    f1.add_trace(go.Scatter(x=x, y=hist["clean_spark"], name="CSS (left)", mode="lines+markers",
+                            line=dict(color=SERIES[0], width=2.5), marker=dict(size=5),
+                            hovertemplate="%{y:.2f}"))
+    f1.add_trace(go.Scatter(x=x, y=hist["cds"], name="CDS (left)", mode="lines+markers",
+                            line=dict(color=COAL_COLOR, width=2.5), marker=dict(size=5),
+                            hovertemplate="%{y:.2f}"))
+    f1.add_hline(y=0, line=dict(color=INK["axis"], width=1))
+    f1.add_trace(go.Scatter(x=x, y=hist["gas_cost"], name="Gas plant cost (right)",
+                            mode="lines", yaxis="y2",
+                            line=dict(color=SERIES[0], width=1.5, dash="dot"),
+                            hovertemplate="%{y:.2f}"))
+    f1.add_trace(go.Scatter(x=x, y=hist["coal_cost"], name="Coal plant cost (right)",
+                            mode="lines", yaxis="y2",
+                            line=dict(color=COAL_COLOR, width=1.5, dash="dot"),
+                            hovertemplate="%{y:.2f}"))
+    f1.update_layout(
+        yaxis=dict(title=dict(text="Clean spread — EUR/MWh")),
+        yaxis2=dict(title=dict(text="Production cost — EUR/MWh power"), overlaying="y",
+                    side="right", showgrid=False, zeroline=False, linecolor=INK["axis"],
+                    tickformat=".0f"),
+        showlegend=True)
+    f1.update_xaxes(**xs)
+
+    # --- 2. Production cost, stacked, one chart per plant -----------------
+    def cost_chart(title, fuel, carbon, fuel_name, fuel_rgba):
+        fig = fig_base(title, unit, 320)
+        fig.add_trace(go.Scatter(x=x, y=fuel, name=fuel_name, mode="lines", stackgroup="c",
+                                 line=dict(width=1, color=fuel_rgba.replace("0.35", "1")),
+                                 fillcolor=fuel_rgba, hovertemplate="%{y:.2f}"))
+        fig.add_trace(go.Scatter(x=x, y=carbon, name="Carbon", mode="lines", stackgroup="c",
+                                 line=dict(width=1, color=SERIES[3]),
+                                 fillcolor="rgba(237,161,0,0.35)", hovertemplate="%{y:.2f}"))
+        fig.add_trace(go.Scatter(x=x, y=hist["power"], name=f"Power {market}", mode="lines",
+                                 line=dict(color=INK["text"], width=2), hovertemplate="%{y:.2f}"))
+        fig.update_xaxes(**xs)
+        return fig
+
+    f2a = cost_chart(f"Gas plant ({gas_name}, {eff:g} %) — {unit}", hist["fuel_cost"],
+                     hist["carbon_cost"], "Gas", "rgba(42,120,214,0.35)")
+    f2b = cost_chart(f"Coal plant ({coal_hub}, {ceff:g} %) — {unit}", hist["coal_fuel_cost"],
+                     hist["coal_carbon_cost"], "Coal", "rgba(110,84,64,0.35)")
+
+    # --- 3. Curves on the latest trade date ------------------------------
+    td = hist["trade_date"].max()
+    cur = allx[allx["trade_date"] == td].sort_values("dkey").merge(dels[["dkey", "dlabel"]], on="dkey")
+    order = dict(categoryorder="array", categoryarray=cur["dlabel"].tolist(),
+                 tickangle=0 if len(cur) <= 14 else -45)
+    f4 = fig_base(f"CSS and CDS by delivery on {td} — {unit}", unit, 340, dates=False)
+    f4.add_trace(go.Bar(x=cur["dlabel"], y=cur["clean_spark"], name="CSS",
+                        marker_color=SERIES[0], hovertemplate="%{y:.2f}"))
+    f4.add_trace(go.Bar(x=cur["dlabel"], y=cur["cds"], name="CDS",
+                        marker_color=COAL_COLOR, hovertemplate="%{y:.2f}"))
+    f4.add_hline(y=0, line=dict(color=INK["axis"], width=1))
+    f4.update_layout(barmode="group")
+    f4.update_xaxes(**order)
+    f5 = fig_base(f"Production cost by delivery on {td} vs {market} {product} power — {unit}",
+                  unit, 340, dates=False)
+    f5.add_trace(go.Scatter(x=cur["dlabel"], y=cur["power"], name=f"Power {market}",
+                            mode="lines+markers", line=dict(color=INK["text"], width=2.5),
+                            marker=dict(size=8), hovertemplate="%{y:.2f}"))
+    f5.add_trace(go.Scatter(x=cur["dlabel"], y=cur["gas_cost"], name="Gas plant cost",
+                            mode="lines+markers", line=dict(color=SERIES[0], width=2, dash="dot"),
+                            marker=dict(size=7), hovertemplate="%{y:.2f}"))
+    f5.add_trace(go.Scatter(x=cur["dlabel"], y=cur["coal_cost"], name="Coal plant cost",
+                            mode="lines+markers", line=dict(color=COAL_COLOR, width=2, dash="dot"),
+                            marker=dict(size=7), hovertemplate="%{y:.2f}"))
+    f5.update_xaxes(**order)
+
+    # --- 4. All countries: CSS and CDS grids -------------------------------
+    grid = all_clean_sparks(pw[pw["product"] == product], g_all[g_all["market"] == gas_hub],
+                            eua, eff, cf, maturity)
+    grid_block = []
+    if not grid.empty:
+        grid = add_coal(grid, coal, coal_hub, maturity, ceff, ccf)
+        gd = grid["trade_date"].iloc[0]
+        for col, name, sub in (("clean_spark", "clean spark spreads (CSS)",
+                                f"{gas_name} gas, {eff:g} % / {cf:.3f}"),
+                               ("cds", "clean dark spreads (CDS)",
+                                f"{coal_hub} coal, {ceff:g} % / {ccf:.3f}")):
+            if grid[col].notna().any():
+                grid_block.append(html.Div(graph(spread_grid(
+                    grid, col, f"All {name} — {product} {maturity.lower()}, {sub}, "
+                               f"settlements {gd}")), className="card"))
+        grid_block.append(note("Green = the plant earns more than fuel + carbon, red = it "
+                               "doesn't. Same fuel price, efficiency and carbon factor for every "
+                               "country. Rows sorted by average across the curve."))
+
+    tbl = hist[["trade_date", "power", "gas", "fuel_cost", "coal_usd", "fx", "coal_eur_th",
+                "coal_fuel_cost", "eua", "eua_dec", "carbon_cost", "coal_carbon_cost",
+                "gas_cost", "coal_cost", "clean_spark", "cds"]].copy()
+    tbl["eua_dec"] = tbl["eua_dec"].map(lambda v: f"Dec-{int(v) % 100:02d}" if pd.notna(v) else "")
+    tbl = tbl.rename(columns={"clean_spark": "css", "fuel_cost": "gas_fuel_cost",
+                              "carbon_cost": "gas_carbon_cost"})
+    body = notes + [
+        tiles,
+        html.Div(graph(f1), className="card"),
+        html.Div([html.Div(graph(f2a), className="card"), html.Div(graph(f2b), className="card")],
+                 className="row2"),
+        html.Div([html.Div(graph(f4), className="card"), html.Div(graph(f5), className="card")],
+                 className="row2"),
+        *grid_block,
+        html.Details([html.Summary(f"Table — {market} {product} {label}, every trade date"),
+                      table(tbl.sort_values("trade_date", ascending=False))]),
+    ]
+    return out + [body]
+
+
+# ---------------------------------------------------------------------
+# 2c. Correlation
+# ---------------------------------------------------------------------
+def ols(y: pd.Series, X: pd.DataFrame) -> dict:
+    """OLS with a constant. statsmodels if installed, else numpy (same
+    numbers, no extra package needed). Returns coef, t-stats, R2, resid."""
+    try:
+        import statsmodels.api as sm
+        res = sm.OLS(y, sm.add_constant(X)).fit()
+        return {"coef": res.params.drop("const"), "t": res.tvalues.drop("const"),
+                "r2": res.rsquared, "resid": res.resid, "fitted": res.fittedvalues,
+                "engine": "statsmodels"}
+    except ImportError:
+        A = np.column_stack([np.ones(len(X)), X.values])
+        beta, *_ = np.linalg.lstsq(A, y.values, rcond=None)
+        fitted = A @ beta
+        resid = y.values - fitted
+        dof = max(len(y) - A.shape[1], 1)
+        cov = (resid @ resid / dof) * np.linalg.pinv(A.T @ A)
+        se = np.sqrt(np.diag(cov))
+        r2 = 1 - (resid @ resid) / (((y - y.mean()) ** 2).sum() or 1)
+        return {"coef": pd.Series(beta[1:], index=X.columns),
+                "t": pd.Series(beta[1:] / se[1:], index=X.columns), "r2": r2,
+                "resid": pd.Series(resid, index=y.index),
+                "fitted": pd.Series(fitted, index=y.index), "engine": "numpy"}
+
+
+HEDGE_UNITS = {"TTF": "MWh gas", "EUA": "t CO2", "API2": "t coal", "API4": "t coal"}
+
+
+def hedge_block(wide: pd.DataFrame, focus: str, fuels: list, days: int, label: str,
+                product: str):
+    """Hedge ratios for one power market: regress its daily price change
+    (EUR/MWh) on the daily changes of TTF (EUR/MWh), EUA (EUR/t) and coal
+    (EUR/t) over the window. Coefficient = units of fuel per MWh of power."""
+    if focus not in wide:
+        return []
+    chg = wide.diff().iloc[1:]
+    cols = [focus] + [f for f in fuels if f in chg]
+    win = chg[cols].tail(days).dropna()
+    if len(win) < 10 or len(cols) < 2:
+        return [note(f"Hedge ratios need at least 10 days where {focus} and all fuels "
+                     f"have a price (have {len(win)}).")]
+    y = win[focus]
+    coal = next((f for f in fuels if f in ("API2", "API4")), None)
+    models = [("TTF only", ["TTF"]), ("TTF + EUA", ["TTF", "EUA"]),
+              (f"TTF + EUA + {coal}", ["TTF", "EUA", coal])]
+    rows, fits = [], {}
+    raw_sd = y.std()
+    for name, xs in models:
+        xs = [x for x in xs if x and x in win]
+        if not xs or name in fits:
+            continue
+        r = ols(y, win[xs])
+        fits[name] = r
+        row = {"model": name, "R²": round(r["r2"], 2),
+               "risk removed": f"{(1 - r['resid'].std() / raw_sd) * 100:.0f} %",
+               "left-over risk €/MWh/day": round(r["resid"].std(), 2)}
+        for fu in ["TTF", "EUA", coal]:
+            if fu in r["coef"]:
+                row[f"{fu} ({HEDGE_UNITS[fu]}/MWh)"] = (
+                    f"{r['coef'][fu]:.3f}  (t {r['t'][fu]:.1f})")
+            elif fu:
+                row[f"{fu} ({HEDGE_UNITS[fu]}/MWh)"] = ""
+        rows.append(row)
+    # What a power plant at default settings would hedge with, for reference.
+    gas_eua = carbon_factor(ICE_EFFICIENCY)
+    coal_t = 1 / (COAL_EFFICIENCY / 100 * COAL_MWH_PER_T)
+    ref = [{"model": f"Gas plant {ICE_EFFICIENCY:g} % (reference)", "R²": "", "risk removed": "",
+            "left-over risk €/MWh/day": "",
+            f"TTF ({HEDGE_UNITS['TTF']}/MWh)": f"{100 / ICE_EFFICIENCY:.3f}",
+            f"EUA ({HEDGE_UNITS['EUA']}/MWh)": f"{gas_eua:.3f}"},
+           {"model": f"Coal plant {COAL_EFFICIENCY:g} % (reference)", "R²": "", "risk removed": "",
+            "left-over risk €/MWh/day": "",
+            f"EUA ({HEDGE_UNITS['EUA']}/MWh)": f"{coal_factor(COAL_EFFICIENCY):.3f}"}]
+    if coal:
+        ref[1][f"{coal} ({HEDGE_UNITS[coal]}/MWh)"] = f"{coal_t:.3f}"
+    tbl = pd.DataFrame(rows + ref).fillna("")
+
+    # Chart: cumulative change of power vs the TTF + EUA hedge.
+    best = fits.get("TTF + EUA") or next(iter(fits.values()))
+    x = pd.to_datetime(win.index)
+    cf = fig_base(f"{focus} {product} {label}: cumulative price change vs hedge "
+                  f"(TTF + EUA fit) — EUR/MWh", "EUR/MWh", 320)
+    cf.add_trace(go.Scatter(x=x, y=y.cumsum(), name=f"{focus} power", mode="lines",
+                            line=dict(color=INK["text"], width=2.5), hovertemplate="%{y:.2f}"))
+    cf.add_trace(go.Scatter(x=x, y=best["fitted"].cumsum(), name="Hedge portfolio",
+                            mode="lines", line=dict(color=SERIES[0], width=2, dash="dot"),
+                            hovertemplate="%{y:.2f}"))
+    cf.add_trace(go.Scatter(x=x, y=best["resid"].cumsum(), name="Hedged position",
+                            mode="lines", line=dict(color=SERIES[2], width=2),
+                            hovertemplate="%{y:.2f}"))
+    cf.add_hline(y=0, line=dict(color=INK["axis"], width=1))
+    cf.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+
+    # Chart: rolling TTF-only hedge ratio.
+    rr = fig_base(f"{focus} {product} {label}: rolling {days}-day hedge ratio vs TTF "
+                  "(MWh gas per MWh power)", "MWh gas / MWh", 280)
+    both = chg[[focus, "TTF"]].dropna() if "TTF" in chg else pd.DataFrame()
+    if len(both) > days:
+        beta = (both[focus].rolling(days).cov(both["TTF"]) / both["TTF"].rolling(days).var()).dropna()
+        rr.add_trace(go.Scatter(x=pd.to_datetime(beta.index), y=beta, mode="lines",
+                                line=dict(color=SERIES[0], width=2), name="TTF ratio",
+                                hovertemplate="%{y:.2f}"))
+        rr.add_hline(y=100 / ICE_EFFICIENCY, line=dict(color=INK["axis"], width=1, dash="dash"),
+                     annotation_text=f"gas plant {ICE_EFFICIENCY:g} %", annotation_position="top left")
+        rr.update_layout(showlegend=False)
+        rr.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    else:
+        rr = empty_fig(f"Rolling hedge ratio needs more than {days} days of history "
+                       f"(have {len(both)}).", 280)
+
+    return [
+        html.H3(f"Hedge ratios — {focus} {product} {label}, {len(win)} trading days",
+                style={"fontSize": 15, "margin": "18px 0 4px"}),
+        note("Regression of the daily change in the power price (EUR/MWh) on the daily changes "
+             "in TTF (EUR/MWh), EUA (EUR/t) and coal (EUR/t, ECB rate). Each number is how much "
+             "of that fuel to trade per MWh of power (sell power → buy fuel). t above ~2 = "
+             "statistically solid. TTF and EUA move together, so with both in, the split between "
+             "them is less certain than their sum. Engine: " + best["engine"] + "."),
+        table(tbl, 10),
+        html.Div([html.Div(graph(cf), className="card"), html.Div(graph(rr), className="card")],
+                 className="row2"),
+    ]
+
+
+@app.callback(Output("co-days", "value"),
+              Input("co-minus", "n_clicks"), Input("co-plus", "n_clicks"),
+              State("co-days", "value"), prevent_initial_call=True)
+def corr_days(_m, _p, days):
+    days = int(days or CORR_DAYS)
+    days += -1 if ctx.triggered_id == "co-minus" else 1
+    return max(5, min(days, 500))
+
+
+def corr_prices(product, maturity, dkey, coal_hub):
+    """Daily prices for one delivery: every power market (EUR/MWh), TTF,
+    coal (EUR/t via ECB EUR/USD) and EUA (Dec of the delivery year).
+    Wide frame, one column per instrument, index = trade date."""
+    d = load()
+    s = d["settled"]
+    s = s[(s["unit"] == "EUR/MWh") & (s["maturity_type"] == maturity) & (s["dkey"] == dkey)]
+    pw = s[(s["group"] == "Power") & (s["product"] == product)]
+    wide = pw.pivot_table(index="trade_date", columns="market", values="settlement_price")
+    ttf = s[s["market"] == "Gas TTF"].set_index("trade_date")["settlement_price"]
+    wide["TTF"] = ttf
+    if wide.empty:
+        return wide, None
+    ddate = date.fromisoformat(dkey)
+    coal = load_coal()
+    if coal:
+        vals = {}
+        for td in wide.index:
+            for names in coal_strips(maturity, ddate):
+                v = [coal["prices"].get((coal_hub, td, n)) for n in names]
+                if all(x is not None for x in v):
+                    fx = coal["fx"].loc[:td]
+                    if len(fx):
+                        vals[td] = sum(v) / len(v) / float(fx.iloc[-1])
+                    break
+        wide[coal_hub] = pd.Series(vals)
+    eua = eua_prices()
+    if not eua.empty:
+        wide["EUA"] = pd.Series({td: pick_eua(eua, td, ddate.year)[0] for td in wide.index},
+                                dtype=float)
+    wide = wide.sort_index()
+    return wide, ddate
+
+
+@app.callback(
+    Output("co-product", "options"), Output("co-product", "value"),
+    Output("co-maturity", "options"), Output("co-maturity", "value"),
+    Output("co-delivery", "options"), Output("co-delivery", "value"),
+    Output("co-focus", "options"), Output("co-focus", "value"),
+    Output("co-body", "children"),
+    Input("co-product", "value"), Input("co-maturity", "value"),
+    Input("co-delivery", "value"), Input("co-coal", "value"),
+    Input("co-days", "value"), Input("co-focus", "value"), Input("tabs", "value"),
+)
+def correlation(product, maturity, dkey, coal_hub, days, focus, tab):
+    if tab != "corr":
+        return [no_update] * 9
+    d = load()
+    s = d["settled"]
+    pw = s[(s["group"] == "Power") & (s["unit"] == "EUR/MWh") & s["maturity_type"].isin(SPARK_TENORS)]
+    products = [p for p in ("Base", "Peak") if p in set(pw["product"])]
+    product = keep(product, products, "Base")
+    pw = pw[pw["product"] == product]
+    maturities = [m for m in SPARK_TENORS if m in set(pw["maturity_type"])]
+    maturity = keep(maturity, maturities, "Year")
+    f = pw[pw["maturity_type"] == maturity]
+    ttf = s[(s["market"] == "Gas TTF") & (s["maturity_type"] == maturity)]
+    both = sorted(set(f["dkey"]) & set(ttf["dkey"]))
+    dels = f[f["dkey"].isin(both)].drop_duplicates("dkey").sort_values("dkey")
+    # New tenor -> front delivery again (Cal-27 and Jan-27 share a start date).
+    if dkey not in both or ctx.triggered_id == "co-maturity":
+        de = f[(f["market"] == "DE") & f["dkey"].isin(both)]
+        dkey = front_delivery(de if not de.empty else f[f["dkey"].isin(both)])
+    del_opts = [{"label": l, "value": k} for k, l in zip(dels["dkey"], dels["dlabel"])]
+    days = int(days) if days else CORR_DAYS
+    days = max(5, days)
+    coal_hub = coal_hub or "API2"
+
+    wide, ddate = corr_prices(product, maturity, dkey, coal_hub) if dkey else (pd.DataFrame(), None)
+    fuels = [c for c in ("TTF", coal_hub, "EUA") if c in wide.columns and wide[c].notna().any()]
+    powers = sorted(c for c in wide.columns if c not in ("TTF", "API2", "API4", "EUA"))
+    focus_opts = opts(powers)
+    focus = keep(focus, powers, "DE")
+    out = [opts(products), product, opts(maturities), maturity, del_opts, dkey, focus_opts, focus]
+    if wide.empty:
+        return out + [graph(empty_fig("No prices for that delivery."))]
+
+    label = dels.set_index("dkey")["dlabel"].get(dkey, dkey)
+    # Daily % changes. A non-positive price (possible for power) can't give a
+    # % change, so those days drop out for that market only.
+    rets = wide.where(wide > 0).pct_change(fill_method=None) * 100
+    rets = rets.iloc[1:]
+    avail = len(rets)
+    win = rets.tail(days)
+    min_obs = max(5, int(0.7 * len(win)))
+    enough = [c for c in win.columns if win[c].notna().sum() >= min_obs]
+    cols = [c for c in fuels if c in enough] + [c for c in powers if c in enough]
+    win = win[cols]
+    corr = win.corr(min_periods=min_obs)
+    first, last = (win.index.min(), win.index.max()) if len(win) else ("—", "—")
+
+    notes = [note(f"Pearson correlation of daily % changes in settlement prices, {product} "
+                  f"{label}, last {len(win)} trading days ({first} → {last}). Fuels first, then "
+                  f"power markets sorted by correlation with TTF. {coal_hub} converted to EUR "
+                  f"with the ECB rate; EUA = Dec-{ddate.year % 100:02d} (or the next December quoted).")]
+    if days > avail:
+        notes.append(html.Div(f"Only {avail} trading days of changes stored for {label} - "
+                              f"using all of them. Settlements go back to "
+                              f"{wide.index.min()}.", className="warn"))
+    dropped = [c for c in wide.columns if c not in cols]
+    if dropped:
+        notes.append(note(f"Left out (fewer than {min_obs} days with a price in the window): "
+                          f"{', '.join(dropped)}."))
+    if len(cols) < 2:
+        return out + notes + [graph(empty_fig("Not enough overlapping prices."))]
+
+    # Order: fuels, then power by correlation with TTF (strongest first).
+    if "TTF" in corr:
+        pw_sorted = sorted([c for c in cols if c in powers],
+                           key=lambda c: -(corr.loc[c, "TTF"] if pd.notna(corr.loc[c, "TTF"]) else -9))
+        order = [c for c in cols if c not in powers] + pw_sorted
+        corr = corr.loc[order, order]
+
+    # --- 1. Matrix ---------------------------------------------------
+    text = [[("" if pd.isna(v) else f"{v:.2f}") for v in row] for row in corr.values]
+    hm = go.Figure(go.Heatmap(
+        z=corr.values, x=corr.columns.tolist(), y=corr.index.tolist(), zmin=-1, zmax=1, zmid=0,
+        colorscale=[[0, INK["down"]], [0.5, "#f7f7f4"], [1, SERIES[0]]],
+        text=text, texttemplate="%{text}", textfont=dict(size=10),
+        hovertemplate="%{y} vs %{x}: %{z:.2f}<extra></extra>",
+        colorbar=dict(title="corr", thickness=12)))
+    n = len(corr)
+    hm.update_layout(
+        title=dict(text=f"Correlation matrix — {product} {label}, {len(win)} trading days to {last}",
+                   x=0, xanchor="left", font=dict(size=14, color=INK["text"])),
+        height=max(420, 24 * n + 140), margin=dict(l=90, r=40, t=80, b=40),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Segoe UI, Inter, Arial, sans-serif", size=11, color=INK["muted"]))
+    hm.update_yaxes(autorange="reversed")
+    hm.update_xaxes(side="top", tickangle=-45)
+
+    # --- 2. Each market vs the three fuels ---------------------------
+    pm = [c for c in corr.index if c in powers]
+    bars = fig_base(f"Power vs fuels — correlation of daily changes, {product} {label}",
+                    "correlation", 340, dates=False)
+    fuel_col = {"TTF": SERIES[0], coal_hub: COAL_COLOR, "EUA": SERIES[3]}
+    for fu in [c for c in fuels if c in corr.columns]:
+        bars.add_trace(go.Bar(x=pm, y=corr.loc[pm, fu], name=fu, marker_color=fuel_col[fu],
+                              hovertemplate="%{x} vs " + fu + ": %{y:.2f}<extra></extra>"))
+    bars.update_layout(barmode="group")
+    bars.update_yaxes(range=[-1, 1])
+    bars.update_xaxes(tickangle=-45)
+
+    # --- 3. Rolling correlation of the chosen market vs the fuels ----
+    roll = fig_base(f"{focus} {product} {label}: rolling {len(win)}-day correlation with fuels",
+                    "correlation", 320)
+    if focus in rets:
+        for fu in [c for c in fuels if c in rets]:
+            rc = rets[focus].rolling(len(win), min_periods=min_obs).corr(rets[fu]).dropna()
+            if not rc.empty:
+                roll.add_trace(go.Scatter(x=pd.to_datetime(rc.index), y=rc, name=fu, mode="lines",
+                                          line=dict(color=fuel_col[fu], width=2),
+                                          hovertemplate="%{y:.2f}"))
+        roll.update_yaxes(range=[-1, 1])
+        roll.add_hline(y=0, line=dict(color=INK["axis"], width=1))
+        roll.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    if not roll.data:
+        roll = empty_fig(f"Rolling correlation needs more than {len(win)} days of history "
+                         f"(have {avail}). It fills in as the scrapers collect more.")
+
+    # Tiles: the chosen market's correlations + realised volatility.
+    vol = win.std() * np.sqrt(252)
+    tiles = [kpi(f"{focus} vs {fu}", fmt(corr.loc[focus, fu]) if focus in corr.index else "—",
+                 f"{len(win)} days") for fu in fuels if fu in corr.columns]
+    tiles += [kpi(f"Volatility {c}", f"{vol[c]:.0f} %", "annualised, same days")
+              for c in [focus] + [f for f in fuels if f in vol]]
+    tbl = corr.round(2).reset_index().rename(columns={"index": ""})
+    body = notes + [html.Div(tiles, className="kpis"),
+                    *hedge_block(wide, focus, fuels, days, label, product),
+                    html.Div(graph(hm), className="card"),
+                    html.Div(graph(bars), className="card"),
+                    html.Div(graph(roll), className="card"),
+                    html.Details([html.Summary("Table — correlation matrix"), table(tbl, 40)])]
     return out + [body]
 
 

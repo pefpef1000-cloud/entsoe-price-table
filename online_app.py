@@ -9,6 +9,10 @@ online_app.py -- the ONLINE version (on Render) of the Dash dashboards:
     /futures/    Power futures        (eex_dash.py) -- behind a password
     /futures-vs-spot/  Futures vs spot (futures_vs_spot_dash.py) -- same password
                  (FUTURES_PASSWORD): EEX data may not be republished
+    /balance/    Balance sheet        (balance_sheet_dash.py)
+    /weather/    Weather forecasts    (ecmwf_dash.py; its "Check for new data"
+                                       button is hidden online - the PC sends
+                                       new runs after each weather update)
 
 The dashboard files are the same files as on the PC, unchanged. This file
 only does three things around them:
@@ -29,7 +33,17 @@ only does three things around them:
          eex_market_data.db.gz.locked  power futures -- locked with the
                                 FUTURES_PASSWORD on the PC (the repo is
                                 public), unlocked here with the same one
-  2. Looks for newer files: prices every minute, history every 10 minutes
+         eex_gas_eua.db.gz.locked     power futures (TTF gas + EUA), locked
+         ice_market_data.db.gz.locked power futures (coal), balance sheet
+                                (spark spread), locked
+       weather + balance sheet (own stamp weather_stamp.json, sent after
+       every weather update on the PC):
+         ecmwf_data.db.gz       weather forecasts, balance sheet (model
+                                wind/solar, temperature)
+         balance_data.db.gz     balance sheet (last 40 days of load, load
+                                model, wind/solar, prices)
+  2. Looks for newer files: prices every minute, history and weather every
+     10 minutes
      (and at every start -- Render's free plan stops the app after 15 idle
      minutes).
   3. Serves both dashboards from one web address, with a link bar on top.
@@ -85,15 +99,27 @@ HISTORY_DB = DATA_DIR / "entsoe_history.db"
 JAO_DB = DATA_DIR / "jao_history.db"
 LOAD_DB = DATA_DIR / "load_forecast.db"
 EEX_DB = DATA_DIR / "eex_market_data.db"
+EEX_GAS_DB = DATA_DIR / "eex_gas_eua.db"        # eex_dash finds it next to EEX_DB
+ICE_DB = DATA_DIR / "ice_market_data.db"        # eex_dash finds it next to EEX_DB
+WEATHER_DB = DATA_DIR / "ecmwf_data.db"
+BALANCE_DB = DATA_DIR / "balance_data.db"
 # (file in the release, local copy, required). The optional ones are left
 # out until the PC uploads them; their pages wait. Load forecast first, so
 # it is new before the history file (whose change refreshes the caches).
 HISTORY_FILES = [
     ("load_forecast.db.gz", LOAD_DB, False),
     ("eex_market_data.db.gz.locked", EEX_DB, False),   # never the unlocked one
+    ("eex_gas_eua.db.gz.locked", EEX_GAS_DB, False),
+    ("ice_market_data.db.gz.locked", ICE_DB, False),
     ("entsoe_history.db.gz", HISTORY_DB, True),
     ("jao_history.db.gz", JAO_DB, True),
 ]
+# Weather + balance sheet: own stamp, uploaded after every weather update.
+WEATHER_FILES = [
+    ("balance_data.db.gz", BALANCE_DB, False),
+    ("ecmwf_data.db.gz", WEATHER_DB, False),
+]
+WEATHER_STAMP_NAME = "weather_stamp.json"
 FUTURES_PASSWORD = os.environ.get("FUTURES_PASSWORD", "")
 # Lock format, the same as in upload_online_data.py on the PC:
 # MAGIC + salt (16 bytes) + nonce (12 bytes) + AES-256-GCM(gzip file),
@@ -125,6 +151,7 @@ _http.headers["User-Agent"] = "entsoe-price-table-online"
 _state_lock = threading.Lock()
 _merge_lock = threading.Lock()
 _status = {"history": "not downloaded yet", "history_uploaded_at": None,
+           "weather": "not downloaded yet", "weather_uploaded_at": None,
            "pc_prices_uploaded_at": None, "unlock_problem": None}
 
 
@@ -293,11 +320,21 @@ def rebuild_price_db() -> None:
 
 
 def refresh_history() -> None:
-    """The year comparison's two databases, from the release -- only when the
-    small stamp.json there is different from the one we have."""
-    r = _http.get(f"{RELEASE_URL}/{STAMP_NAME}", timeout=(20, 60))
+    """LTCAP tool, charts and futures files, from the release -- only when
+    the small stamp.json there is different from the one we have."""
+    _refresh_group("history", STAMP_NAME, HISTORY_FILES)
+
+
+def refresh_weather() -> None:
+    """Weather + balance sheet files (own stamp: the PC sends them after
+    every weather update, without touching the big history files)."""
+    _refresh_group("weather", WEATHER_STAMP_NAME, WEATHER_FILES)
+
+
+def _refresh_group(group: str, stamp_name: str, files: list) -> None:
+    r = _http.get(f"{RELEASE_URL}/{stamp_name}", timeout=(20, 60))
     if r.status_code == 404:
-        _status["history"] = "no history uploaded yet (run upload_online_data.py on the PC)"
+        _status[group] = f"no {group} uploaded yet (run upload_online_data.py on the PC)"
         return
     r.raise_for_status()
     stamp_text = r.text
@@ -305,17 +342,17 @@ def refresh_history() -> None:
         state = _load_state()
     # Optional files missing last time (not uploaded / not unlockable) do
     # not count, or every check would download all ~100 MB again.
-    skipped_before = set(state.get("history_skipped", []))
-    have_files = all(path.is_file() for name, path, _ in HISTORY_FILES
+    skipped_before = set(state.get(f"{group}_skipped", []))
+    have_files = all(path.is_file() for name, path, _ in files
                      if name not in skipped_before)
-    if have_files and state.get("history_stamp") == stamp_text:
-        _set_uploaded_at(stamp_text)
-        _status["history"] = "ok"
+    if have_files and state.get(f"{group}_stamp") == stamp_text:
+        _set_uploaded_at(stamp_text, group)
+        _status[group] = "ok"
         return
-    _status["history"] = "downloading"
+    _status[group] = "downloading"
     started = time.time()
     skipped = []
-    for name, path, required in HISTORY_FILES:
+    for name, path, required in files:
         locked = name.endswith(".locked")
         try:
             _download(f"{RELEASE_URL}/{name}", path, gunzip=True,
@@ -335,13 +372,13 @@ def refresh_history() -> None:
             log(f"{name} could not be unlocked ({exc}) - its pages wait")
     with _state_lock:
         state = _load_state()
-        state["history_stamp"] = stamp_text
-        state["history_skipped"] = skipped
+        state[f"{group}_stamp"] = stamp_text
+        state[f"{group}_skipped"] = skipped
         _save_state(state)
-    _set_uploaded_at(stamp_text)
-    _status["history"] = "ok"
-    log(f"history updated in {time.time() - started:.0f} s "
-        f"(uploaded {_status['history_uploaded_at'] or '?'})")
+    _set_uploaded_at(stamp_text, group)
+    _status[group] = "ok"
+    log(f"{group} updated in {time.time() - started:.0f} s "
+        f"(uploaded {_status[f'{group}_uploaded_at'] or '?'})")
 
 
 def _uploaded_at(stamp_text: str):
@@ -352,8 +389,8 @@ def _uploaded_at(stamp_text: str):
         return None
 
 
-def _set_uploaded_at(stamp_text: str) -> None:
-    _status["history_uploaded_at"] = _uploaded_at(stamp_text)
+def _set_uploaded_at(stamp_text: str, group: str = "history") -> None:
+    _status[f"{group}_uploaded_at"] = _uploaded_at(stamp_text)
 
 
 def refresh_prices() -> None:
@@ -372,12 +409,13 @@ def _refresh_loop() -> None:
     next_history = 0.0
     while True:
         if time.monotonic() >= next_history:
-            try:
-                refresh_history()
-            except Exception as exc:  # noqa: BLE001
-                log(f"could not refresh history: {exc}")
-                if _status["history"] == "downloading":
-                    _status["history"] = "download failed - retrying in a few minutes"
+            for group, job in (("history", refresh_history), ("weather", refresh_weather)):
+                try:
+                    job()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"could not refresh {group}: {exc}")
+                    if _status[group] == "downloading":
+                        _status[group] = "download failed - retrying in a few minutes"
             next_history = time.monotonic() + REFRESH_SECONDS
         time.sleep(PRICE_REFRESH_SECONDS)
         try:
@@ -444,15 +482,44 @@ ed = sys.modules.get("entsoe_dash") or importlib.import_module("entsoe_dash")
 jd = sys.modules.get("jao_dash") or importlib.import_module("jao_dash")
 eex = _import_under("eex_dash", "/futures/")
 fvs = _import_under("futures_vs_spot_dash", "/futures-vs-spot/")
+bs = _import_under("balance_sheet_dash", "/balance/")
+wx = _import_under("ecmwf_dash", "/weather/")
 
 pt.DB_PATH = PRICE_DB
 yc.DB_PATH = HISTORY_DB
 yc.JAO_DB_FILE = JAO_DB
 ed.DB_PATH = HISTORY_DB
 jd.DB_PATH = JAO_DB
-eex.DB_PATH = EEX_DB
+eex.DB_PATH = EEX_DB         # gas_db() / ice_db() look next to it: EEX_GAS_DB, ICE_DB
 fvs.EEX_DB = EEX_DB          # futures (EEX)
 fvs.SPOT_DB = HISTORY_DB     # day-ahead prices (ENTSO-E)
+wx.DB_PATH = WEATHER_DB
+wx.ENTSOE_DB = BALANCE_DB    # Model quality tab: ENTSO-E wind/solar, last 14 days
+
+
+def _if_there(path: Path):
+    """The balance sheet's file finders: our files once they are downloaded
+    (an explicit path that does not exist would make it fail)."""
+    return lambda: path if path.is_file() else None
+
+
+bs.entsoe_path = _if_there(BALANCE_DB)
+bs.ecmwf_path = _if_there(WEATHER_DB)
+bs.ice_path = _if_there(ICE_DB)
+
+
+# Weather: no downloads online (the PC runs them and sends the result).
+# The button is hidden (CSS below); the status line says where the data
+# comes from.
+def _weather_status() -> dict:
+    stamp = _status.get("weather_uploaded_at")
+    return {"finished": stamp.replace(" ", "T") if stamp else None,
+            "summary": "online copy - the PC sends each new ECMWF/GFS run after its "
+                       "weather update (07:15, 10:15, 19:15, 22:15)."}
+
+
+wx.start_update = lambda: False
+wx.update_status = _weather_status
 
 
 def _dayahead_connect():
@@ -498,9 +565,11 @@ NAV_CSS = """
 """
 PAGES = [
     ("pt", "Day-ahead prices", "/"),
+    ("bs", "Balance sheet", "/balance/"),
     ("yc", "LTCAP tool", "/years/"),
     ("eex", "Power futures", "/futures/"),
     ("fvs", "Futures vs spot", "/futures-vs-spot/"),
+    ("wx", "Weather forecasts", "/weather/"),
 ]
 
 
@@ -519,14 +588,19 @@ def history_note() -> str:
     return f"Data from the PC uploaded {when}" if when else ""
 
 
+def weather_note() -> str:
+    when = _status.get("weather_uploaded_at")
+    return f"Data from the PC uploaded {when}" if when else ""
+
+
 def prices_note() -> str:
     when = _status.get("pc_prices_uploaded_at")
     return f"Prices from the PC uploaded {when}, both sources checked every minute" if when else ""
 
 
-def wait_page():
-    state = _status["history"]
-    if state.startswith("no history"):
+def wait_page(group: str = "history"):
+    state = _status[group]
+    if state.startswith("no "):
         text = [html.B("No data uploaded yet. "),
                 "Run upload_online_data.py once on the PC. "
                 "This page checks again every 20 seconds."]
@@ -538,9 +612,11 @@ def wait_page():
     elif state == "ok":
         text = [html.B("The data for this page is not uploaded yet. "),
                 "It comes with the next upload from the PC (after its 04:00 and "
-                "13:00 runs). This page checks again every 20 seconds."]
+                "13:00 runs%s). This page checks again every 20 seconds."
+                % (" and its weather updates" if group == "weather" else "")]
     else:
-        text = [html.B("The data is being downloaded (about 100 MB). "),
+        text = [html.B("The data is being downloaded (about %s). "
+                       % ("50 MB" if group == "weather" else "150 MB")),
                 f"Status: {state}. This page reloads by itself every 20 seconds."]
     return html.Div([
         html.Div(text, className="ol-wait"),
@@ -554,7 +630,10 @@ APPS = {
     "yc": (yc, yc.serve_layout, [HISTORY_DB, JAO_DB], history_note),
     "eex": (eex, eex.make_layout, [EEX_DB], history_note),
     "fvs": (fvs, fvs.make_layout, [EEX_DB, HISTORY_DB], history_note),
+    "bs": (bs, bs.layout, [BALANCE_DB], weather_note),
+    "wx": (wx, wx.serve_layout, [WEATHER_DB], weather_note),
 }
+APP_GROUP = {"bs": "weather", "wx": "weather"}   # whose download status the wait page shows
 
 
 def _page_for(key):
@@ -562,16 +641,40 @@ def _page_for(key):
 
     def page():
         if not all(path.is_file() for path in needs):
-            return html.Div([nav(key), wait_page()])
+            return html.Div([nav(key), wait_page(APP_GROUP.get(key, "history"))])
         return html.Div([nav(key, note()), build()])
     return page
 
 
-VALIDATION = {"pt": pt.validation_layout, "yc": yc.serve_layout, "eex": eex.full_layout,
-              "fvs": fvs.full_layout}
+def _balance_validation():
+    """The balance sheet's layout lists the countries from its database,
+    which may not be downloaded yet at start: built with an empty list."""
+    real = bs.countries
+    bs.countries = dict
+    try:
+        return bs.layout()
+    finally:
+        bs.countries = real
+
+
+def _years_validation():
+    """The LTCAP tool's JAO tabs are only in its page once jao_history.db is
+    downloaded. At start it is not there yet (Render starts with an empty
+    disk), so their parts are added here - without them the browser refuses
+    every JAO callback ("ID not found in layout") and those tabs stay empty."""
+    page = yc.serve_layout()
+    if jd is not None and not Path(jd.DB_PATH).is_file():
+        page = html.Div([page, *jd.panels(first_visible=False), *jd.header_parts()])
+    return page
+
+
+VALIDATION = {"pt": pt.validation_layout, "yc": _years_validation, "eex": eex.full_layout,
+              "fvs": fvs.full_layout, "bs": _balance_validation, "wx": wx.serve_layout}
+# Weather: the "Check for new data" button starts downloads on the PC only.
+EXTRA_CSS = {"wx": "#upd-btn { display: none; }"}
 for _key, (_module, _build, _needs, _note) in APPS.items():
     _module.app.index_string = _module.app.index_string.replace(
-        "{%css%}", "{%css%}<style>" + NAV_CSS + "</style>")
+        "{%css%}", "{%css%}<style>" + NAV_CSS + EXTRA_CSS.get(_key, "") + "</style>")
     _module.app.layout = _page_for(_key)
     _module.app.validation_layout = html.Div([nav(_key, "x"), wait_page(), VALIDATION[_key]()])
     _module.app.clientside_callback(
@@ -626,6 +729,8 @@ _dispatch = DispatcherMiddleware(server.wsgi_app, {
     "/auctions": _moved_to("/years/"),
     "/futures": eex.app.server,
     "/futures-vs-spot": fvs.app.server,
+    "/balance": bs.app.server,
+    "/weather": wx.app.server,
 })
 # One password for every page (Peter, 2026-10-15: "all pages same pw").
 # /healthz stays open: Render's health check calls it without a password.
@@ -665,6 +770,13 @@ def _rss_mb() -> int:
 
 
 def free_memory() -> None:
+    # Caches that are safe to empty whole. The weather app's _cache also
+    # holds its loaded tables (it reads _cache["key"] directly), so only its
+    # per-run MW frames and the accuracy table are dropped.
+    bs._CACHE.clear()
+    eex._coal_cache.clear()
+    wx._cache.get("mw", {}).clear()
+    wx._cache["acc"] = {}
     for module in (pt, yc, ed, jd, eex, fvs):
         cache = getattr(module, "_cache", None)
         lock = getattr(module, "_cache_lock", None) or getattr(module, "_lock", None)
