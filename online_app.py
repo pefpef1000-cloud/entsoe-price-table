@@ -454,19 +454,30 @@ def prepare_data() -> None:
 # ---------------------------------------------------------------------
 prepare_data()
 
+import dash  # noqa: E402
 from dash import Input, Output, dcc, html  # noqa: E402
 from werkzeug.middleware.dispatcher import DispatcherMiddleware  # noqa: E402
 
 
 def _import_under(module_name: str, prefix: str):
     """Import a Dash app module so that its pages and requests live under
-    `prefix` (Dash reads this setting when the app is created)."""
-    if prefix == "/":
-        return importlib.import_module(module_name)
-    os.environ["DASH_REQUESTS_PATHNAME_PREFIX"] = prefix
+    `prefix` (Dash reads this setting when the app is created).
+
+    Dash also CALLS a layout function the moment a module assigns it
+    (app.layout = layout), as a check. A layout that reads its database
+    then breaks the start: on Render nothing is downloaded yet, and the
+    balance sheet even found this repo's own entsoe_data.db (no load tables)
+    -> "no such table: load_forecast_mw" -> exit 1 (deploy 2976db7 failed,
+    2026-10-16). So during the import that check gets an empty page; the
+    real pages and validation layouts are set further down in this file."""
+    real_layout_value = dash.Dash._layout_value
+    dash.Dash._layout_value = lambda self: html.Div()
+    if prefix != "/":
+        os.environ["DASH_REQUESTS_PATHNAME_PREFIX"] = prefix
     try:
         return importlib.import_module(module_name)
     finally:
+        dash.Dash._layout_value = real_layout_value
         os.environ.pop("DASH_REQUESTS_PATHNAME_PREFIX", None)
 
 
