@@ -739,6 +739,7 @@ def top_tab():
             ctl("Trade date", dcc.DatePickerSingle(id="t-date", display_format="DD MMM YYYY",
                                                    first_day_of_week=1)),
             ctl("Group", dd("t-group")),
+            ctl("Country", dd("t-market")),
             ctl("Maturity", dd("t-maturity")),
             ctl("Contracts in delivery", dcc.RadioItems(
                 id="t-delivering", options=["Hide", "Show"], value="Hide", inline=True,
@@ -2594,18 +2595,20 @@ def top_table(df: pd.DataFrame, cols: list, key: str):
     Output("t-date", "min_date_allowed"), Output("t-date", "max_date_allowed"),
     Output("t-date", "disabled_days"), Output("t-date", "date"),
     Output("t-group", "options"), Output("t-group", "value"),
+    Output("t-market", "options"), Output("t-market", "value"),
     Output("t-maturity", "options"), Output("t-maturity", "value"),
     Output("t-body", "children"),
-    Input("t-date", "date"), Input("t-group", "value"), Input("t-maturity", "value"),
-    Input("t-delivering", "value"), Input("tabs", "value"),
+    Input("t-date", "date"), Input("t-group", "value"), Input("t-market", "value"),
+    Input("t-maturity", "value"), Input("t-delivering", "value"), Input("tabs", "value"),
 )
-def top_contracts(day, group, maturity, delivering, tab):
+def top_contracts(day, group, market, maturity, delivering, tab):
     if tab != "top":
-        return [no_update] * 9
+        return [no_update] * 11
     p = load()["prices"]
     traded = sorted(p.loc[p["volume"] > 0, "trade_date"].unique())
     if not traded:
-        return [None, None, [], None, [], None, [], None, note("No traded volume stored yet.")]
+        return [None, None, [], None, [], None, [], None, [], None,
+                note("No traded volume stored yet.")]
     all_days = set(p["trade_date"].unique())
     lo, hi = traded[0], traded[-1]
     # Default: the last trading day with volume (Peter: "default last trading day").
@@ -2628,12 +2631,24 @@ def top_contracts(day, group, maturity, delivering, tab):
     group = keep(group, groups, "All")
     if group != "All":
         f = f[f["group"] == group]
+    # Country (Peter, 2026-10-17): "*" = no open interest on this date
+    # (all contracts shown for that country have OI 0 or none reported).
+    order = [m for m, _g in load()["markets"]]
+    present = set(f["market"])
+    countries = [m for m in order if m in present] + sorted(present - set(order))
+    oi_by = f.groupby("market")["oi"].sum(min_count=1)
+    no_oi = {m for m in countries if not (oi_by.get(m, 0) > 0)}
+    market_opts = [{"label": "All", "value": "All"}] + [
+        {"label": f"{m} *" if m in no_oi else m, "value": m} for m in countries]
+    market = keep(market, ["All"] + countries, "All")
+    if market != "All":
+        f = f[f["market"] == market]
     mats = ["All"] + [m for m in MATURITY_ORDER if m in set(f["maturity_type"])]
     maturity = keep(maturity, mats, "All")
     if maturity != "All":
         f = f[f["maturity_type"] == maturity]
     out = [p["trade_date"].min(), p["trade_date"].max(), disabled, day,
-           opts(groups), group, opts(mats), maturity]
+           opts(groups), group, market_opts, market, opts(mats), maturity]
     if f.empty:
         return out + [note(f"Nothing quoted on {day} for that selection.")]
 
@@ -2682,7 +2697,9 @@ def top_contracts(day, group, maturity, delivering, tab):
              "lot is 12× a month lot. Δ OI = change since the contract's previous trade date. "
              + (f"{hidden} contracts already in delivery are hidden (their open interest is "
                 "frozen by EEX). " if hidden else "")
-             + "Click a column header to re-sort; hover a contract for its EEX code."),
+             + "Click a column header to re-sort; hover a contract for its EEX code."
+             + (f" Country list: * = no open interest on {day} "
+                f"({len(no_oi)} of {len(countries)})." if no_oi else "")),
     ]
     return out + [body]
 
