@@ -47,6 +47,11 @@ from dash import Dash, Input, Output, dash_table, dcc, html
 from dash.dash_table.Format import Format, Group, Scheme
 
 HERE = Path(__file__).resolve().parent
+try:  # where the database lives (entsoe_db_location.txt), see entsoe_db.py
+    from entsoe_db import entsoe_db_path as _edp
+    _ENTSOE_DB = _edp()
+except ImportError:
+    _ENTSOE_DB = None
 TZ = "Europe/Brussels"
 DEFAULT_PORT = 8059
 DEFAULT_COUNTRY = "DE"
@@ -56,12 +61,13 @@ FONT = "Segoe UI, Roboto, Helvetica, Arial, sans-serif"
 # Sources that can be subtracted from load.  Add new ones here:
 #   key: (label, table, [columns summed], [columns that must be present])
 # Wind rule (project standard): onshore missing -> empty, offshore missing -> 0.
+# Order = display order (Peter 2026-10-16: solar first, temperature always last).
 SOURCES = {
+    "solar": ("Solar", "wind_solar_forecast", ["solar_mw"], ["solar_mw"]),
     "wind": ("Wind", "wind_solar_forecast",
              ["wind_onshore_mw", "wind_offshore_mw"], ["wind_onshore_mw"]),
-    "solar": ("Solar", "wind_solar_forecast", ["solar_mw"], ["solar_mw"]),
 }
-DEFAULT_SOURCES = ["wind", "solar"]
+DEFAULT_SOURCES = ["solar", "wind"]
 
 # Modelled stand-in for each source beyond what ENTSO-E publishes:
 # column in ecmwf_data.db's mw_hourly.  A source with no entry here simply
@@ -110,7 +116,11 @@ ARGS = argparse.Namespace(db=None, ice_db=None, ecmwf_db=None)
 
 
 def entsoe_path() -> Path | None:
-    return Path(ARGS.db) if ARGS.db else find_db("entsoe_data.db", [])
+    if ARGS.db:
+        return Path(ARGS.db)
+    if _ENTSOE_DB is not None and _ENTSOE_DB.exists():
+        return _ENTSOE_DB
+    return find_db("entsoe_data.db", [])
 
 
 def ecmwf_path() -> Path | None:
@@ -470,29 +480,99 @@ def temp_run_daily(zone: str, model: str, run: str) -> pd.Series | None:
     return cached(("temp_run", zone, model, run), p, q)
 
 
-def revision_runs(zone: str, today: date):
-    """(model, current run, reference run) for the Delta column, or None.
+COMPARE_DAYS = 14   # how far back the "Compare with" picker lists runs
 
-    Current = the run the table shows (ecmwf_pick).  Reference = the same
-    model's 00z run of the day before today.  Delta = current - reference
+
+def compare_options(zone: str, today: date):
+    """(dropdown options, default value) for the "Compare with" picker.
+
+    Every stored weather run of the last COMPARE_DAYS days except the
+    current one, newest first.  Value = "model|run_time".  Default =
+    yesterday's 00z run of the current model.
+    """
+    p = ecmwf_path()
+    pick = ecmwf_pick(zone)
+    if not p or not pick or "mw_hourly" not in tables(p):
+        return [], None
+    since = (today - timedelta(days=COMPARE_DAYS)).isoformat()
+
+    def q():
+        with connect(p) as c:
+            return c.execute(
+                "SELECT DISTINCT model, run_time FROM mw_hourly WHERE "
+                "zone = ? AND run_time >= ? ORDER BY run_time DESC, model",
+                (zone, since)).fetchall()
+
+    runs = [r for r in cached(("runs", zone, since), p, q) if tuple(r) != pick]
+    opts = [{"label": f"{m.upper()} {pd.Timestamp(rt):%a %d.%m %H}z",
+             "value": f"{m}|{rt}"} for m, rt in runs]
+    want = f"{pick[0]}|{today - timedelta(days=1):%Y-%m-%d}T00:00:00+00:00"
+    vals = [o["value"] for o in opts]
+    default = want if want in vals else (vals[0] if vals else None)
+    return opts, default
+
+
+def revision_runs(zone: str, today: date, cmp_value: str | None):
+    """(current model, current run, compare model, compare run) or None.
+
+    Current = the run the table shows (ecmwf_pick).  Compare = the run picked
+    in "Compare with" (default yesterday's 00z).  Delta = current - compare
     for the same target hour.
     """
     pick = ecmwf_pick(zone)
     if not pick:
         return None
-    model, cur = pick
-    ref = f"{today - timedelta(days=1):%Y-%m-%d}T00:00:00+00:00"
-    p = ecmwf_path()
+    opts, default = compare_options(zone, today)
+    vals = [o["value"] for o in opts]
+    v = cmp_value if cmp_value in vals else default
+    if not v:
+        return None
+    rmodel, rrun = v.split("|", 1)
+    return pick[0], pick[1], rmodel, rrun
+
+
+def load_runs_available(zones: list[str]) -> set:
+    """(weather_model, weather_run) pairs with a load curve for ALL zones."""
+    p = entsoe_path()
+    if not p or "load_forecast_model_runs" not in tables(p):
+        return set()
 
     def q():
+        qm = ",".join("?" * len(zones))
         with connect(p) as c:
-            return c.execute(
-                "SELECT 1 FROM mw_hourly WHERE zone = ? AND model = ? AND "
-                "run_time = ? LIMIT 1", (zone, model, ref)).fetchone()
+            return {(m, r) for m, r, n in c.execute(
+                "SELECT weather_model, weather_run, COUNT(DISTINCT zone) FROM "
+                f"load_forecast_model_runs WHERE zone IN ({qm}) "
+                "GROUP BY weather_model, weather_run", zones).fetchall()
+                if n == len(zones)}
 
-    if not cached(("ref_exists", zone, model, ref), p, q):
-        return None
-    return model, cur, ref
+    return cached(("load_runs", tuple(zones)), p, q)
+
+
+def load_run_series(zones: list[str], wmodel: str, wrun: str, start: date,
+                    end: date, idx: pd.DatetimeIndex):
+    """Modelled load (zones summed) for one weather run, local hourly."""
+    p = entsoe_path()
+    lo = (start - timedelta(days=2)).isoformat()
+    hi = (end + timedelta(days=2)).isoformat()
+
+    def q():
+        qm = ",".join("?" * len(zones))
+        with connect(p) as c:
+            df = pd.read_sql_query(
+                "SELECT zone, timestamp, forecast_mw FROM "
+                f"load_forecast_model_runs WHERE zone IN ({qm}) AND "
+                "weather_model = ? AND weather_run = ? AND timestamp >= ? "
+                "AND timestamp < ?", c, params=[*zones, wmodel, wrun, lo, hi])
+        if df.empty:
+            return None
+        df["t"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(TZ)
+        w = df.pivot_table(index="t", columns="zone", values="forecast_mw")
+        w = w.reindex(columns=zones)
+        return w.sum(axis=1, min_count=len(zones)).where(w.notna().all(axis=1))
+
+    out = cached(("load_run", tuple(zones), wmodel, wrun, lo, hi), p, q)
+    return None if out is None else out.reindex(idx)
 
 
 def model_zones() -> set:
@@ -715,7 +795,7 @@ def per_hour(series: pd.Series) -> pd.DataFrame:
 
 def build_table(code: str, n: int, srcs: list[str], mode: str,
                 eff: float, today: date | None = None,
-                use_model: bool = True):
+                use_model: bool = True, cmp_value: str | None = None):
     cc = countries()[code]
     today = today or datetime.now(tz=pd.Timestamp.now(tz=TZ).tz).date()
     past = [today - timedelta(days=i) for i in range(n - 1, -1, -1)]
@@ -780,36 +860,66 @@ def build_table(code: str, n: int, srcs: list[str], mode: str,
         return df[d] if d in df.columns else pd.Series(float("nan"),
                                                        index=range(24))
 
-    # Delta = forecast revision: current run minus yesterday's 00z run, same
-    # target hour.  Only wind/solar have stored run history (mw_hourly keeps
-    # every run); load forecasts (ENTSO-E and the load model) are overwritten
-    # each run, so load revision is 0 until a history is kept.
-    rev_runs = revision_runs(cc["ws"], today)
+    # Delta = forecast revision: current run minus the "Compare with" run
+    # (default yesterday's 00z), same target hour.  Wind/solar from
+    # mw_hourly (every run kept); load from load_forecast_model_runs (the
+    # load model applied to every weather run).
+    rev_runs = revision_runs(cc["ws"], today, cmp_value)
     rev = {}
+    load_note = ""
     if rev_runs:
-        rmodel, rcur, rref = rev_runs
+        cmodel, ccur, rmodel, rref = rev_runs
         idx = hf.index
-        now = ecmwf_run_mw(cc["ws"], rmodel, rcur, past[0], fwd[-1], idx)
+        now = ecmwf_run_mw(cc["ws"], cmodel, ccur, past[0], fwd[-1], idx)
         old = ecmwf_run_mw(cc["ws"], rmodel, rref, past[0], fwd[-1], idx)
         if now is not None and old is not None:
             for key, mcol in MODEL_SOURCES.items():
                 rev[key] = now[mcol] - old[mcol]
+        # Load: current = newest load curve of the current model at or
+        # before the current weather run (the load model may lag a run).
+        avail = load_runs_available(cc["load"])
+        lcur = max((r for m, r in avail if m == cmodel and r <= ccur),
+                   default=None)
+        if "load_forecast_model_runs" not in tables(entsoe_path()):
+            load_note = (" Load revision missing: no load_forecast_model_runs "
+                         'yet - run "Update load forecast.bat" once.')
+        elif not avail:
+            load_note = (" Load revision missing: the load model has no curve "
+                         f"for {', '.join(cc['load'])} (no weather/ERA5 for "
+                         "this country, or not run for it yet).")
+        elif lcur is None or (rmodel, rref) not in avail:
+            load_note = (" Load revision missing for this pair of runs (load "
+                         "model not run on them).")
+        else:
+            ln = load_run_series(cc["load"], cmodel, lcur, past[0], fwd[-1],
+                                 idx)
+            lo_ = load_run_series(cc["load"], rmodel, rref, past[0], fwd[-1],
+                                  idx)
+            if ln is not None and lo_ is not None:
+                rev["load"] = ln - lo_
+                load_note = (f" Load: modelled load on {cmodel.upper()} "
+                             f"{pd.Timestamp(lcur):%d.%m %H}z vs "
+                             f"{rmodel.upper()} {pd.Timestamp(rref):%d.%m %H}z "
+                             "(temperature-driven change).")
     if rev:
-        bal_rev = pd.Series(0.0, index=hf.index)
+        need = [k for k in srcs if k in rev] + (["load"] if "load" in rev
+                                                 else [])
+        bal_rev = rev["load"].copy() if "load" in rev else pd.Series(
+            0.0, index=hf.index)
         for key in srcs:
             if key in rev:
                 bal_rev = bal_rev - rev[key]
-        bal_rev = bal_rev.where(pd.concat(
-            [rev[k].notna() for k in rev], axis=1).all(axis=1))
+        if need:
+            bal_rev = bal_rev.where(pd.concat(
+                [rev[k].notna() for k in need], axis=1).all(axis=1))
         delta = per_hour(bal_rev)
         notes.append(
-            f"Delta = current forecast minus yesterday's 00z run for the same "
-            f"hour: ECMWF {rmodel.upper()} {pd.Timestamp(rcur):%d.%m %H}z vs "
-            f"{pd.Timestamp(rref):%d.%m %H}z. Wind/solar revision only - load forecasts are "
-            "overwritten each run, so their revision is not stored yet.")
+            f"Delta = current forecast minus the compare run, same hour: "
+            f"weather ECMWF {cmodel.upper()} {pd.Timestamp(ccur):%d.%m %H}z vs "
+            f"{rmodel.upper()} {pd.Timestamp(rref):%d.%m %H}z." + load_note)
     else:
         delta = pd.DataFrame(index=range(24))
-        notes.append("Delta empty: no ECMWF run from yesterday 00z stored for "
+        notes.append("Delta empty: no compare run stored for "
                      f"{NAMES.get(code, code)}.")
 
     table = pd.DataFrame(index=range(24))
@@ -846,7 +956,7 @@ def build_table(code: str, n: int, srcs: list[str], mode: str,
             r[cid(d, "b")] = None if tv[d] is None else f"{tv[d]:.1f}"
         if rev_runs:
             tn = temp_run_daily(cc["ws"], rev_runs[0], rev_runs[1])
-            to = temp_run_daily(cc["ws"], rev_runs[0], rev_runs[2])
+            to = temp_run_daily(cc["ws"], rev_runs[2], rev_runs[3])
             if tn is not None and to is not None:
                 for d in fwd:
                     a, b = tn.get(d), to.get(d)
@@ -859,7 +969,7 @@ def build_table(code: str, n: int, srcs: list[str], mode: str,
         notes.append(f"No temperature for {NAMES.get(code, code)} - "
                      "ecmwf_data.db covers AT, BE, CH, DE, DK, FI, FR, GB, "
                      "NL, NO, PL, SE.")
-    records.append(r)
+    temp_record = r   # appended last: temperature row always at the bottom
 
     # Daily average Load / Wind / Solar (MW), always all sources whatever is
     # ticked.  Text in the Balance column (heat map and MW format ignore
@@ -868,8 +978,8 @@ def build_table(code: str, n: int, srcs: list[str], mode: str,
               else hourly_frame(cc, list(SOURCES), past[0] - timedelta(days=1),
                                 fwd[-1], use_model))
     avg_days = [past[0] - timedelta(days=1)] + past + fwd
-    for key, label in [("load", "Load MW")] + [(k, f"{v[0]} MW")
-                                              for k, v in SOURCES.items()]:
+    for key, label in [(k, f"{v[0]} MW") for k, v in SOURCES.items()] + [
+            ("load", "Load MW")]:
         ser = hf_all[key]
         g = ser.groupby(ser.index.date)
         daily = g.mean().where(g.count() >= 20)
@@ -887,6 +997,7 @@ def build_table(code: str, n: int, srcs: list[str], mode: str,
                 r[cid(d, "d")] = (None if v is None or pd.isna(v)
                                   else f"{v:+,.0f}")
         records.append(r)
+    records.append(temp_record)
 
     # Notes on data coverage
     have = [d for d in fwd if d in bal.columns and bal[d].notna().any()]
@@ -1060,6 +1171,11 @@ def layout():
                           "value": "on"}],
                 value=["on"], inputStyle={"marginRight": "4px"})],
                      style={"display": "flex", "alignItems": "center"}),
+            html.Div([html.Span("Delta vs", style=label_style),
+                      dcc.Dropdown(id="cmp", options=[], value=None,
+                                   clearable=False,
+                                   style={"width": "190px"})],
+                     style={"display": "flex", "alignItems": "center"}),
             html.Div([html.Span("Past column", style=label_style),
                       dcc.RadioItems(id="mode",
                                      options=[{"label": "Price", "value": "price"},
@@ -1099,10 +1215,10 @@ def layout():
                                      "textAlign": "center",
                                      "fontWeight": "600"}],
         )),
-        html.Div("Delta = forecast revision: current forecast minus yesterday's 00z run, same date and hour (green = up, red = down). "
+        html.Div("Delta = forecast revision: current forecast minus the run picked in Delta vs (default yesterday 00z), same date and hour - load, wind and solar (green = up, red = down). "
                  "Balance heat map: green = high, red = low, one scale for all days. "
                  "Base = mean of 24 h, Peak = 08-20 h, Off-peak = the other 12 h. "
-                 "Temp, Load, Wind, Solar = daily averages, always all sources (Delta column: revision vs yesterday 00z). "
+                 "Temp, Load, Wind, Solar = daily averages, always all sources (Delta column: revision vs the compare run). "
                  "Italic and (model) = modelled, not published by a TSO.",
                  style={"color": "#666", "fontSize": "12px",
                         "marginTop": "8px"}),
@@ -1119,13 +1235,23 @@ def show_eff(mode):
             "alignItems": "center"}
 
 
+@app.callback(Output("cmp", "options"), Output("cmp", "value"),
+              Input("country", "value"))
+def cmp_options(code):
+    """Runs to compare with, for the chosen country; default = yesterday 00z."""
+    cc = countries().get(code)
+    if not cc:
+        return [], None
+    return compare_options(cc["ws"], pd.Timestamp.now(tz=TZ).date())
+
+
 @app.callback(
     Output("table", "columns"), Output("table", "data"),
     Output("table", "style_data_conditional"), Output("notes", "children"),
     Input("country", "value"), Input("days", "value"),
     Input("srcs", "value"), Input("mode", "value"), Input("eff", "value"),
-    Input("model", "value"))
-def update(code, n, srcs, mode, eff, model):
+    Input("model", "value"), Input("cmp", "value"))
+def update(code, n, srcs, mode, eff, model, cmp_value=None):
     if not entsoe_path():
         return [], [], [], [html.Li("entsoe_data.db not found.")]
     if not code:
@@ -1134,7 +1260,7 @@ def update(code, n, srcs, mode, eff, model):
     srcs = [s for s in SOURCES if s in (srcs or [])]
     today = pd.Timestamp.now(tz=TZ).date()
     cols, data, notes, past, fwd, model_days = build_table(
-        code, int(n), srcs, mode, eff, today, bool(model))
+        code, int(n), srcs, mode, eff, today, bool(model), cmp_value)
     return (cols, data, styles(past, fwd, today, data, model_days),
             [html.Li(t) for t in notes])
 

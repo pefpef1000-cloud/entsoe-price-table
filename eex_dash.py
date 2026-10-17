@@ -27,7 +27,9 @@ First time only:
 Four tabs:
     Forward curve   settlement by delivery period on one trade date,
                     with an earlier date overlaid to show how it moved
-    Area spreads    one delivery period across markets, plus A-B spread
+    Area spreads    six A-B spread charts (own pair, product, tenor and
+                    delivery each; default Base Cal front year) with KPIs,
+                    then one delivery period across individual markets
     Correlation     correlation of daily % changes, all power markets + TTF,
                     API2/API4 and EUA for one tenor, N trading days (+/-)
     Production costs  gas and coal plant cost (fuel + carbon) per country and
@@ -59,7 +61,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, ctx, dash_table, dcc, html, no_update
+from dash import MATCH, Dash, Input, Output, State, ctx, dash_table, dcc, html, no_update
 
 # ---------------------------------------------------------------------
 # Where the database is
@@ -115,6 +117,7 @@ GAS_EUA = {
 # ---------------------------------------------------------------------
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
 MAX_SERIES = 6
+ATR_DAYS = 10   # default ATR window (Peter, 2026-10-17); the user can change it
 INK = {"text": "#1f2328", "muted": "#6b6a64", "grid": "#e8e7e1", "axis": "#c3c2b7",
        "bg": "#f6f5f1", "card": "#ffffff", "up": "#1a7f37", "down": "#c4314b"}
 
@@ -458,6 +461,8 @@ h1 {{ font-size:22px; margin:0; }}
 .card {{ background:{INK['card']}; border:1px solid {INK['grid']}; border-radius:8px;
         padding:10px 12px; margin-bottom:12px; }}
 .row2 {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
+.row3 {{ display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; }}
+@media (max-width:1100px) {{ .row3 {{ grid-template-columns:1fr; }} }}
 @media (max-width:900px) {{ .row2 {{ grid-template-columns:1fr; }} }}
 .kpis {{ display:flex; flex-wrap:wrap; gap:10px; margin:6px 0 12px; }}
 .kpi {{ background:{INK['card']}; border:1px solid {INK['grid']}; border-radius:8px;
@@ -495,6 +500,24 @@ h1 {{ font-size:22px; margin:0; }}
 #panel-spark .kpi-delta {{ font-size:11px; }}
 #panel-spark .note {{ font-size:12px; margin:3px 0; }}
 #panel-spark .btn {{ padding:5px 10px; font-size:12px; }}
+/* Area spreads tab: 6 spread cards, 2 per row */
+.spread-grid {{ display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; margin-top:8px; }}
+@media (max-width:900px) {{ .spread-grid {{ grid-template-columns:1fr; }} }}
+.spread-grid .card {{ margin-bottom:0; }}
+.spread-grid .controls {{ gap:6px; margin:2px 0 6px; flex-wrap:nowrap; }}
+.spread-grid .ctl {{ min-width:0; flex:1 1 0; }}
+.spread-grid .ctl label {{ font-size:11px; margin-bottom:2px; }}
+.spread-grid .Select-control, .spread-grid .dash-dropdown {{ font-size:13px; }}
+.spread-grid .kpis {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(104px, 1fr));
+                      gap:6px; margin:4px 0 6px; }}
+.spread-grid .kpi {{ min-width:0; padding:4px 8px; }}
+.spread-grid .kpi-label {{ font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.spread-grid .kpi-value {{ font-size:16px; }}
+.spread-grid .kpi-delta {{ font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.spread-grid .note {{ font-size:12px; }}
+h3.sec {{ font-size:15px; margin:22px 0 0; }}
+.spread-grid.three {{ grid-template-columns:repeat(3, minmax(0, 1fr)); }}
+@media (max-width:1250px) {{ .spread-grid.three {{ grid-template-columns:1fr; }} }}
 details summary {{ cursor:pointer; color:{INK['muted']}; font-size:13px; margin:6px 0; }}
 """
 
@@ -520,17 +543,78 @@ def curve_tab():
     ])
 
 
-def spread_tab():
+# Default pairs for the six spread charts (Peter, 2026-10-17).
+SPREAD_PAIRS = [("DE", "FR"), ("DE", "IT"), ("FR", "ES"),
+                ("DE", "DK1"), ("IT", "FR"), ("DE", "NL")]
+# Order of markets in the pair dropdowns; anything else follows A-Z.
+MARKET_PREF = ["DE", "FR", "NL", "BE", "AT", "CH", "IT", "ES", "DK1", "DK2",
+               "SE1", "SE2", "SE3", "SE4", "NO1", "NO2", "NO3", "NO4", "NO5",
+               "FI", "Nordic SYS", "PL", "CZ", "SK", "HU", "RO", "GB"]
+
+
+# Three Area spreads tabs, same layout, different default tenor (Peter, 2026-10-17):
+# (tab id, id prefix, default tenor, tab label). Default delivery = front contract.
+SPREAD_TABS = [("spread", "", "Year", "Area spreads Cal"),
+               ("spreadm", "m-", "Month", "Area spreads Month"),
+               ("spreadq", "q-", "Quarter", "Area spreads Quarter")]
+
+
+def pair_card(P, tenor, i, left, right):
+    def pdd(kind, value=None):
+        return dcc.Dropdown(id={"type": P + kind, "index": i}, value=value, clearable=False,
+                            options=opts([value]) if value else [])
     return html.Div([
         html.Div([
-            ctl("Product", dd("s-product")), ctl("Maturity", dd("s-maturity")),
-            ctl("Delivery period", dd("s-delivery")),
-            ctl(f"Markets (up to {MAX_SERIES})", dd("s-markets", multi=True), wide=True),
+            ctl("Area", pdd("ps-left", left)), ctl("minus", pdd("ps-right", right)),
+            ctl("Product", pdd("ps-product", "Base")), ctl("Tenor", pdd("ps-tenor", tenor)),
+            ctl("Delivery", pdd("ps-delivery")),
         ], className="controls"),
+        html.Div(id={"type": P + "ps-body", "index": i}),
+    ], className="card")
+
+
+# Time spreads tab (Peter, 2026-10-17): one country, three cards -
+# front vs next month, quarter and year. Spread = near - far.
+TS_TENORS = ["Month", "Quarter", "Year"]
+# One row of three cards per country; default countries (Peter, 2026-10-17).
+TS_ROWS = ["DE", "FR", "IT", "HU"]
+
+
+def ts_card(R, i, tenor):
+    def pdd(kind, value=None):
+        return dcc.Dropdown(id={"type": R + kind, "index": i}, value=value, clearable=False,
+                            options=opts([value]) if value else [])
+    return html.Div([
+        html.Div([ctl("Tenor", pdd("-tenor", tenor)), ctl("Near", pdd("-near")),
+                  ctl("minus", pdd("-far"))], className="controls"),
+        html.Div(id={"type": R + "-body", "index": i}),
+    ], className="card")
+
+
+def time_spread_tab():
+    rows = []
+    for r, _ in enumerate(TS_ROWS):
+        R = f"ts{r}"
+        rows += [
+            html.Div([ctl("Country", dd(R + "-market")), ctl("Product", dd(R + "-product"))],
+                     className="controls", style={"marginTop": 22 if r else 12}),
+            html.Div([ts_card(R, i, t) for i, t in enumerate(TS_TENORS)],
+                     className="spread-grid three"),
+        ]
+    return html.Div(rows)
+
+
+def spread_tab(P="", tenor="Year"):
+    return html.Div([
+        html.Div([pair_card(P, tenor, i, l, r) for i, (l, r) in enumerate(SPREAD_PAIRS)],
+                 className="spread-grid"),
+        html.H3("Individual markets", className="sec"),
         html.Div([
-            ctl("Spread", dd("s-left")), ctl("minus", dd("s-right")),
+            ctl("Product", dd(P + "s-product")), ctl("Maturity", dd(P + "s-maturity")),
+            ctl("Delivery period", dd(P + "s-delivery")),
+            ctl(f"Markets (up to {MAX_SERIES})", dd(P + "s-markets", multi=True), wide=True),
         ], className="controls"),
-        html.Div(id="s-body"),
+        html.Div(id=P + "s-body"),
     ])
 
 
@@ -631,10 +715,36 @@ def history_tab():
             ctl("Chart", dcc.RadioItems(
                 id="h-style", options=["Line", "Candles"], value="Line", inline=True,
                 className="seg", persistence=True, persistence_type="local")),
+            html.Div([html.Label("ATR days"),
+                      dcc.Input(id="h-atr", type="number", value=ATR_DAYS, min=2, max=250, step=1,
+                                debounce=True, persistence=True, persistence_type="local",
+                                style={"height": 36, "width": 80, "padding": "0 6px",
+                                       "boxSizing": "border-box", "borderRadius": 6,
+                                       "border": f"1px solid {INK['axis']}", "fontSize": 14,
+                                       "fontFamily": "inherit"})],
+                     className="ctl", style={"minWidth": 0}),
             html.Div([html.Button("Download CSV", id="h-csv-btn", className="btn"),
                       dcc.Download(id="h-csv")], className="ctl"),
         ], className="controls"),
         html.Div(id="h-body"),
+    ])
+
+
+TOP_N = 50
+
+
+def top_tab():
+    return html.Div([
+        html.Div([
+            ctl("Trade date", dcc.DatePickerSingle(id="t-date", display_format="DD MMM YYYY",
+                                                   first_day_of_week=1)),
+            ctl("Group", dd("t-group")),
+            ctl("Maturity", dd("t-maturity")),
+            ctl("Contracts in delivery", dcc.RadioItems(
+                id="t-delivering", options=["Hide", "Show"], value="Hide", inline=True,
+                className="seg", persistence=True, persistence_type="local")),
+        ], className="controls"),
+        html.Div(id="t-body"),
     ])
 
 
@@ -670,18 +780,23 @@ def full_layout():
             dcc.Tab(label=label, value=value, style=TAB_STYLE, selected_style=TAB_SELECTED)
             for value, label in TABS]),
         html.Div(curve_tab(), id="panel-curve", style={"display": "none"}),
-        html.Div(spread_tab(), id="panel-spread", style={"display": "none"}),
+        *[html.Div(spread_tab(P, ten), id=f"panel-{key}", style={"display": "none"})
+          for key, P, ten, _ in SPREAD_TABS],
+        html.Div(time_spread_tab(), id="panel-tspread", style={"display": "none"}),
         html.Div(spark_tab(), id="panel-spark", style={"display": "none"}),
         html.Div(corr_tab(), id="panel-corr", style={"display": "none"}),
         html.Div(history_tab(), id="panel-history"),
+        html.Div(top_tab(), id="panel-top", style={"display": "none"}),
         html.Div(runs_tab(), id="panel-runs", style={"display": "none"}),
         html.Div("Source: EEX. For information only - systematic republication "
                  "needs EEX's permission.", className="foot"),
     ], className="wrap")
 
 
-TABS = [("curve", "Forward curve"), ("spread", "Area spreads"), ("spark", "Production costs"),
-        ("corr", "Correlation"), ("history", "Price history"), ("runs", "Data & runs")]
+TABS = [("curve", "Forward curve"), *[(key, lab) for key, _, _, lab in SPREAD_TABS], ("tspread", "Time spreads"),
+        ("spark", "Production costs"),
+        ("corr", "Correlation"), ("history", "Price history"), ("top", f"Top {TOP_N}"),
+        ("runs", "Data & runs")]
 
 TAB_STYLE = {"padding": "7px 12px", "fontSize": 14, "color": INK["muted"],
              "backgroundColor": INK["bg"], "border": "none",
@@ -859,111 +974,348 @@ def forward_curve(market, product, maturity, as_of, compare, tab):
 # ---------------------------------------------------------------------
 # 2. Area spreads
 # ---------------------------------------------------------------------
-@app.callback(
-    Output("s-product", "options"), Output("s-product", "value"),
-    Output("s-maturity", "options"), Output("s-maturity", "value"),
-    Output("s-delivery", "options"), Output("s-delivery", "value"),
-    Output("s-markets", "options"), Output("s-markets", "value"),
-    Output("s-left", "options"), Output("s-left", "value"),
-    Output("s-right", "options"), Output("s-right", "value"),
-    Output("s-body", "children"),
-    Input("s-product", "value"), Input("s-maturity", "value"),
-    Input("s-delivery", "value"), Input("s-markets", "value"),
-    Input("s-left", "value"), Input("s-right", "value"), Input("tabs", "value"),
-)
-def area_spreads(product, maturity, dkey, picked, left, right, tab):
-    if tab != "spread":
-        return [no_update] * 13
-    d = load()
-    s = d["settled"][d["settled"]["group"] == "Power"]
-    products = [p for p in ("Base", "Peak") if p in set(s["product"])]
-    product = keep(product, products, "Base")
-    f = s[s["product"] == product]
-    maturities = [m for m in MATURITY_ORDER if m in set(f["maturity_type"])]
-    maturity = keep(maturity, maturities, "Year")
-    f = f[f["maturity_type"] == maturity]
+def ordinal(n: int) -> str:
+    """1st, 2nd, 3rd, 4th, 11th, 22nd ..."""
+    suf = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suf}"
 
-    dels = f.drop_duplicates("dkey").sort_values("dkey")
-    del_opts = [{"label": l, "value": k} for k, l in zip(dels["dkey"], dels["dlabel"])]
-    # Default: the front delivery that has the most markets quoting it.
-    if dkey not in set(dels["dkey"]):
-        counts = f.groupby("dkey")["market"].nunique()
-        dkey = counts.idxmax() if not counts.empty else None
-    f = f[f["dkey"] == dkey]
 
-    available = sorted(f["market"].unique())
-    mk_opts = opts(available)
-    picked = [m for m in (picked or []) if m in available]
-    if not picked and ctx.triggered_id != "s-markets":
-        picked = [m for m in ("DE", "FR", "DK1", "SE3", "NO2", "NL") if m in available][:4] \
-            or available[:4]
-    warn = []
-    if len(picked) > MAX_SERIES:
-        warn.append(html.Div(f"Showing the first {MAX_SERIES} of {len(picked)} markets — beyond six "
-                             "the colours stop being reliably distinguishable.", className="warn"))
-        picked = picked[:MAX_SERIES]
-    # Only compare like with like: same currency and unit as the first pick.
-    if picked:
-        unit0 = f[f["market"] == picked[0]]["unit"].iloc[0]
-        other = [m for m in picked if f[f["market"] == m]["unit"].iloc[0] != unit0]
-        if other:
-            warn.append(html.Div(f"Left out {', '.join(other)}: priced in a different "
-                                 f"currency/unit than {unit0}. No FX conversion here.",
-                                 className="warn"))
-            picked = [m for m in picked if m not in other]
+def leg_series(f: pd.DataFrame) -> pd.Series:
+    """Settlement by trade date for one market/product/delivery."""
+    return f.groupby("trade_date")["settlement_price"].mean()
 
-    left = keep(left, picked, picked[0] if picked else None)
-    right = keep(right, picked, picked[1] if len(picked) > 1 else None)
-    lr_opts = opts(picked)
-    label = dels.set_index("dkey")["dlabel"].get(dkey, "")
-    out = [opts(products), product, opts(maturities), maturity, del_opts, dkey,
-           mk_opts, picked, lr_opts, left, lr_opts, right]
 
-    if not picked:
-        return out + [warn + [graph(empty_fig("Pick at least one market."))]]
+def register_spread_tab(key, P, TENOR):
+    """Callbacks for one Area spreads tab (ids prefixed with P)."""
+    @app.callback(
+        Output({"type": P + "ps-left", "index": MATCH}, "options"),
+        Output({"type": P + "ps-left", "index": MATCH}, "value"),
+        Output({"type": P + "ps-right", "index": MATCH}, "options"),
+        Output({"type": P + "ps-right", "index": MATCH}, "value"),
+        Output({"type": P + "ps-product", "index": MATCH}, "options"),
+        Output({"type": P + "ps-product", "index": MATCH}, "value"),
+        Output({"type": P + "ps-tenor", "index": MATCH}, "options"),
+        Output({"type": P + "ps-tenor", "index": MATCH}, "value"),
+        Output({"type": P + "ps-delivery", "index": MATCH}, "options"),
+        Output({"type": P + "ps-delivery", "index": MATCH}, "value"),
+        Output({"type": P + "ps-body", "index": MATCH}, "children"),
+        Input({"type": P + "ps-left", "index": MATCH}, "value"),
+        Input({"type": P + "ps-right", "index": MATCH}, "value"),
+        Input({"type": P + "ps-product", "index": MATCH}, "value"),
+        Input({"type": P + "ps-tenor", "index": MATCH}, "value"),
+        Input({"type": P + "ps-delivery", "index": MATCH}, "value"),
+        Input("tabs", "value"),
+    )
+    def pair_spread(left, right, product, tenor, dkey, tab):
+        if tab != key:
+            return [no_update] * 11
+        d = load()
+        s = d["settled"][d["settled"]["group"] == "Power"]
+        have = set(s["market"])
+        mk = [m for m in MARKET_PREF if m in have] + sorted(have - set(MARKET_PREF))
+        # Each card falls back to its own default pair, never to the first markets.
+        idx = ctx.outputs_list[0]["id"]["index"]
+        dl, dr = SPREAD_PAIRS[idx] if idx < len(SPREAD_PAIRS) else (None, None)
+        left = keep(left, mk, dl)
+        right = keep(right, [m for m in mk if m != left] or mk, dr)
+        a, b = s[s["market"] == left], s[s["market"] == right]
+        products = [p for p in ("Base", "Peak") if p in set(a["product"]) and p in set(b["product"])]
+        product = keep(product, products, "Base")
+        a, b = a[a["product"] == product], b[b["product"] == product]
+        tenors = [m for m in ("Year", "Quarter", "Month", "Week")
+                  if m in set(a["maturity_type"]) and m in set(b["maturity_type"])]
+        tenor = keep(tenor, tenors, TENOR)
+        a, b = a[a["maturity_type"] == tenor], b[b["maturity_type"] == tenor]
+        common = sorted(set(a["dkey"]) & set(b["dkey"]))
+        both = a[a["dkey"].isin(common)]
+        labels = both.drop_duplicates("dkey").set_index("dkey")["dlabel"]
+        del_opts = [{"label": labels[k], "value": k} for k in common]
+        trig = ctx.triggered_id
+        trig = trig.get("type") if isinstance(trig, dict) else trig
+        # Default / tenor change: the front delivery (Year -> next Cal, today Cal-27).
+        if trig == P + "ps-tenor" or dkey not in common:
+            dkey = front_delivery(both)
+        out = [opts(mk), left, opts(mk), right, opts(products), product,
+               opts(tenors), tenor, del_opts, dkey]
 
-    g = f[f["market"].isin(picked)].sort_values("trade_date")
-    unit = g["unit"].iloc[0]
-    fig = fig_base(f"{product} {label} settlement by market — {unit}", unit, 360)
-    xs, ys, cs = [], [], []
-    for i, m in enumerate(picked):
-        r = g[g["market"] == m]
-        if r.empty:
-            continue
-        fig.add_trace(go.Scatter(x=pd.to_datetime(r["trade_date"]), y=r["settlement_price"],
-                                 name=m, mode="lines+markers",
-                                 line=dict(color=SERIES[i], width=2), marker=dict(size=6),
-                                 hovertemplate="%{y:.2f}"))
-        xs.append(pd.to_datetime(r["trade_date"].iloc[-1])); ys.append(r["settlement_price"].iloc[-1])
-        cs.append(SERIES[i])
-    end_labels(fig, xs, ys, [m for m in picked if not g[g["market"] == m].empty], cs)
+        if left == right:
+            return out + [note("Pick two different areas.")]
+        if dkey is None:
+            return out + [note(f"No {product} {tenor.lower()} delivery quoted for both {left} and {right}.")]
+        a, b = a[a["dkey"] == dkey], b[b["dkey"] == dkey]
+        ua, ub = a["unit"].iloc[0], b["unit"].iloc[0]
+        if ua != ub:
+            return out + [html.Div(f"{left} is in {ua}, {right} in {ub}. No FX conversion here.",
+                                   className="warn")]
+        unit = ua
+        w = pd.concat([leg_series(a).rename("L"), leg_series(b).rename("R")], axis=1,
+                      join="inner").sort_index()
+        label = labels.get(dkey, "")
+        if w.empty:
+            return out + [note(f"{left} and {right} {label} never settled on the same day.")]
+        w["spread"] = w["L"] - w["R"]
+        sp = w["spread"]
+        n = len(sp)
+        last = sp.iloc[-1]
+        d1 = last - sp.iloc[-2] if n > 1 else None
+        d5 = last - sp.iloc[-6] if n > 5 else None
+        mean, sd = sp.mean(), sp.std()
+        z = (last - mean) / sd if n > 2 and sd > 0 else None
+        pct = (sp <= last).mean() * 100
+        vol = sp.diff().std() if n > 2 else None
+        corr = w["L"].diff().corr(w["R"].diff()) if n > 3 else None
+        lL, lR = w["L"].iloc[-1], w["R"].iloc[-1]
+        dL = lL - w["L"].iloc[-2] if n > 1 else None
+        dR = lR - w["R"].iloc[-2] if n > 1 else None
+        rel = last / lR * 100 if lR else None
+        day = w.index[-1]
 
-    body = warn + [html.Div(graph(fig), className="card")]
-    wide = g.pivot_table(index="trade_date", columns="market", values="settlement_price").reset_index()
-    if left and right and left != right and left in wide and right in wide:
-        wide["spread"] = wide[left] - wide[right]
-        sp = wide.dropna(subset=["spread"])
-        sfig = fig_base(f"{left} − {right}, {product} {label} — {unit}", unit, 260)
-        x = pd.to_datetime(sp["trade_date"])
-        sfig.add_trace(go.Scatter(x=x, y=sp["spread"], name=f"{left} − {right}",
-                                  mode="lines+markers", fill="tozeroy",
-                                  fillcolor="rgba(42,120,214,0.15)",
-                                  line=dict(color=SERIES[0], width=2), marker=dict(size=6),
-                                  hovertemplate="%{y:+.2f}"))
-        sfig.add_hline(y=0, line=dict(color=INK["axis"], width=1))
-        sfig.update_layout(showlegend=False)
-        if not sp.empty:
-            body.append(html.Div([
-                kpi(f"Latest spread · {sp['trade_date'].iloc[-1]}", fmt(sp["spread"].iloc[-1], sign=True), unit),
-                kpi("Average", fmt(sp["spread"].mean(), sign=True), unit),
-                kpi("Range", f"{fmt(sp['spread'].min(), sign=True)} … {fmt(sp['spread'].max(), sign=True)}", unit),
-            ], className="kpis"))
-        body.append(html.Div(graph(sfig), className="card"))
-    else:
-        body.append(note("Pick two different markets to see a spread."))
-    body.append(html.Details([html.Summary(f"Table — {label} by market"),
-                              table(wide.sort_values("trade_date", ascending=False))]))
-    return out + [body]
+        def sgn(v, dec=2):
+            return fmt(v, dec, sign=True)
+        tiles = [
+            kpi(f"Spread · {day[5:]}", sgn(last), unit),
+            kpi("1 day", sgn(d1), "change", d1),
+            kpi("1 week", sgn(d5), "5 trading days", d5),
+            kpi(f"Average · {n} d", sgn(mean), f"latest {sgn(last - mean)}", last - mean),
+            kpi("Min", sgn(sp.min()), f"on {sp.idxmin()[5:]}"),
+            kpi("Max", sgn(sp.max()), f"on {sp.idxmax()[5:]}"),
+            kpi("Z-score", fmt(z, 1, sign=True), f"{ordinal(round(pct))} percentile"),
+            kpi("Daily vol", fmt(vol), "sd of 1-day change"),
+            kpi("Leg correlation", fmt(corr), "1-day changes"),
+            kpi(f"{left} {label}", fmt(lL), f"{sgn(dL)} d/d", dL),
+            kpi(f"{right} {label}", fmt(lR), f"{sgn(dR)} d/d", dR),
+            kpi(f"Spread % of {right}", (f"{rel:+.1f} %" if rel is not None else "—"), "relative"),
+        ]
+        fig = fig_base(f"{left} − {right} · {product} {label} — {unit}", unit, 250)
+        x = pd.to_datetime(w.index)
+        fig.add_trace(go.Scatter(x=x, y=sp, name=f"{left} − {right}", mode="lines+markers",
+                                 line=dict(color=SERIES[0], width=2), marker=dict(size=4),
+                                 hovertemplate="%{y:+.2f}"))
+        # Dynamic y scale: no fill to zero; zero line only when the spread crosses it.
+        if sp.min() < 0 < sp.max():
+            fig.add_hline(y=0, line=dict(color=INK["axis"], width=1))
+        pad = max((sp.max() - sp.min()) * 0.08, 0.5)
+        fig.update_yaxes(range=[sp.min() - pad, sp.max() + pad], autorange=False)
+        fig.add_hline(y=mean, line=dict(color=INK["muted"], width=1, dash="dot"),
+                      annotation_text=f"avg {mean:+.2f}", annotation_position="top left",
+                      annotation_font=dict(size=11, color=INK["muted"]))
+        fig.update_layout(showlegend=False, margin=dict(l=50, r=20, t=40, b=30))
+        tbl = w.reset_index().rename(columns={"index": "trade_date", "L": left, "R": right,
+                                              "spread": f"{left} − {right}"})
+        tbl = tbl.rename(columns={tbl.columns[0]: "trade_date"}).sort_values("trade_date", ascending=False)
+        return out + [[html.Div(tiles, className="kpis"), graph(fig),
+                       html.Details([html.Summary("Table"), table(tbl, page_size=10)])]]
+
+
+    @app.callback(
+        Output(P + "s-product", "options"), Output(P + "s-product", "value"),
+        Output(P + "s-maturity", "options"), Output(P + "s-maturity", "value"),
+        Output(P + "s-delivery", "options"), Output(P + "s-delivery", "value"),
+        Output(P + "s-markets", "options"), Output(P + "s-markets", "value"),
+        Output(P + "s-body", "children"),
+        Input(P + "s-product", "value"), Input(P + "s-maturity", "value"),
+        Input(P + "s-delivery", "value"), Input(P + "s-markets", "value"), Input("tabs", "value"),
+    )
+    def area_spreads(product, maturity, dkey, picked, tab):
+        if tab != key:
+            return [no_update] * 9
+        d = load()
+        s = d["settled"][d["settled"]["group"] == "Power"]
+        products = [p for p in ("Base", "Peak") if p in set(s["product"])]
+        product = keep(product, products, "Base")
+        f = s[s["product"] == product]
+        maturities = [m for m in MATURITY_ORDER if m in set(f["maturity_type"])]
+        maturity = keep(maturity, maturities, TENOR)
+        f = f[f["maturity_type"] == maturity]
+
+        dels = f.drop_duplicates("dkey").sort_values("dkey")
+        del_opts = [{"label": l, "value": k} for k, l in zip(dels["dkey"], dels["dlabel"])]
+        if dkey not in set(dels["dkey"]) or ctx.triggered_id == P + "s-maturity":
+            dkey = front_delivery(f)
+        f = f[f["dkey"] == dkey]
+
+        available = sorted(f["market"].unique())
+        mk_opts = opts(available)
+        picked = [m for m in (picked or []) if m in available]
+        if not picked and ctx.triggered_id != P + "s-markets":
+            picked = [m for m in ("DE", "FR", "DK1", "IT", "ES", "NL") if m in available] \
+                or available[:4]
+        warn = []
+        if len(picked) > MAX_SERIES:
+            warn.append(html.Div(f"Showing the first {MAX_SERIES} of {len(picked)} markets — beyond six "
+                                 "the colours stop being reliably distinguishable.", className="warn"))
+            picked = picked[:MAX_SERIES]
+        if picked:
+            unit0 = f[f["market"] == picked[0]]["unit"].iloc[0]
+            other = [m for m in picked if f[f["market"] == m]["unit"].iloc[0] != unit0]
+            if other:
+                warn.append(html.Div(f"Left out {', '.join(other)}: priced in a different "
+                                     f"currency/unit than {unit0}. No FX conversion here.",
+                                     className="warn"))
+                picked = [m for m in picked if m not in other]
+        label = dels.set_index("dkey")["dlabel"].get(dkey, "")
+        out = [opts(products), product, opts(maturities), maturity, del_opts, dkey, mk_opts, picked]
+        if not picked:
+            return out + [warn + [graph(empty_fig("Pick at least one market."))]]
+
+        g = f[f["market"].isin(picked)].sort_values("trade_date")
+        unit = g["unit"].iloc[0]
+        fig = fig_base(f"{product} {label} settlement by market — {unit}", unit, 360)
+        xs, ys, cs = [], [], []
+        for i, m in enumerate(picked):
+            r = g[g["market"] == m]
+            if r.empty:
+                continue
+            fig.add_trace(go.Scatter(x=pd.to_datetime(r["trade_date"]), y=r["settlement_price"],
+                                     name=m, mode="lines+markers",
+                                     line=dict(color=SERIES[i], width=2), marker=dict(size=6),
+                                     hovertemplate="%{y:.2f}"))
+            xs.append(pd.to_datetime(r["trade_date"].iloc[-1])); ys.append(r["settlement_price"].iloc[-1])
+            cs.append(SERIES[i])
+        end_labels(fig, xs, ys, [m for m in picked if not g[g["market"] == m].empty], cs)
+        wide = g.pivot_table(index="trade_date", columns="market", values="settlement_price").reset_index()
+        return out + [warn + [html.Div(graph(fig), className="card"),
+                              html.Details([html.Summary(f"Table — {label} by market"),
+                                            table(wide.sort_values("trade_date", ascending=False))])]]
+
+
+for _key, _P, _ten, _ in SPREAD_TABS:
+    register_spread_tab(_key, _P, _ten)
+
+
+def spread_view(w: pd.DataFrame, lname: str, rname: str, title: str, unit: str):
+    """KPI tiles + chart + table for a spread. w: index trade_date,
+    columns L and R (the two legs). Same tiles as the Area spreads cards."""
+    w = w.copy()
+    w["spread"] = w["L"] - w["R"]
+    sp = w["spread"]
+    n = len(sp)
+    last = sp.iloc[-1]
+    d1 = last - sp.iloc[-2] if n > 1 else None
+    d5 = last - sp.iloc[-6] if n > 5 else None
+    mean, sd = sp.mean(), sp.std()
+    z = (last - mean) / sd if n > 2 and sd > 0 else None
+    pct = (sp <= last).mean() * 100
+    vol = sp.diff().std() if n > 2 else None
+    corr = w["L"].diff().corr(w["R"].diff()) if n > 3 else None
+    lL, lR = w["L"].iloc[-1], w["R"].iloc[-1]
+    dL = lL - w["L"].iloc[-2] if n > 1 else None
+    dR = lR - w["R"].iloc[-2] if n > 1 else None
+    rel = last / lR * 100 if lR else None
+    day = w.index[-1]
+
+    def sgn(v, dec=2):
+        return fmt(v, dec, sign=True)
+    tiles = [
+        kpi(f"Spread · {day[5:]}", sgn(last), unit),
+        kpi("1 day", sgn(d1), "change", d1),
+        kpi("1 week", sgn(d5), "5 trading days", d5),
+        kpi(f"Average · {n} d", sgn(mean), f"latest {sgn(last - mean)}", last - mean),
+        kpi("Min", sgn(sp.min()), f"on {sp.idxmin()[5:]}"),
+        kpi("Max", sgn(sp.max()), f"on {sp.idxmax()[5:]}"),
+        kpi("Z-score", fmt(z, 1, sign=True), f"{ordinal(round(pct))} percentile"),
+        kpi("Daily vol", fmt(vol), "sd of 1-day change"),
+        kpi("Leg correlation", fmt(corr), "1-day changes"),
+        kpi(lname, fmt(lL), f"{sgn(dL)} d/d", dL),
+        kpi(rname, fmt(lR), f"{sgn(dR)} d/d", dR),
+        kpi(f"Spread % of {rname}", (f"{rel:+.1f} %" if rel is not None else "—"), "relative"),
+    ]
+    fig = fig_base(title + f" — {unit}", unit, 250)
+    fig.add_trace(go.Scatter(x=pd.to_datetime(w.index), y=sp, name=title, mode="lines+markers",
+                             line=dict(color=SERIES[0], width=2), marker=dict(size=4),
+                             hovertemplate="%{y:+.2f}"))
+    if sp.min() < 0 < sp.max():
+        fig.add_hline(y=0, line=dict(color=INK["axis"], width=1))
+    pad = max((sp.max() - sp.min()) * 0.08, 0.5)
+    fig.update_yaxes(range=[sp.min() - pad, sp.max() + pad], autorange=False)
+    fig.add_hline(y=mean, line=dict(color=INK["muted"], width=1, dash="dot"),
+                  annotation_text=f"avg {mean:+.2f}", annotation_position="top left",
+                  annotation_font=dict(size=11, color=INK["muted"]))
+    fig.update_layout(showlegend=False, margin=dict(l=50, r=20, t=40, b=30))
+    tbl = w.reset_index()
+    tbl.columns = ["trade_date", lname, rname, f"{lname} − {rname}"]
+    return [html.Div(tiles, className="kpis"), graph(fig),
+            html.Details([html.Summary("Table"),
+                          table(tbl.sort_values("trade_date", ascending=False), page_size=10)])]
+
+
+def register_ts_row(r, DEF):
+    """Callbacks for one Time spreads row (ids prefixed ts<r>)."""
+    R = f"ts{r}"
+
+    @app.callback(
+        Output(R + "-market", "options"), Output(R + "-market", "value"),
+        Output(R + "-product", "options"), Output(R + "-product", "value"),
+        Input(R + "-market", "value"), Input(R + "-product", "value"), Input("tabs", "value"),
+    )
+    def ts_controls(market, product, tab):
+        if tab != "tspread":
+            return [no_update] * 4
+        d = load()
+        s = d["settled"]
+        m_opts = market_options(d)
+        market = keep(market, [o["value"] for o in m_opts], DEF)
+        f = s[s["market"] == market]
+        products = ([p for p in ("Base", "Peak") if p in set(f["product"])]
+                    + sorted(p for p in f["product"].unique() if p not in ("Base", "Peak")))
+        product = keep(product, products, "Base")
+        return m_opts, market, opts(products), product
+
+
+    @app.callback(
+        Output({"type": R + "-tenor", "index": MATCH}, "options"),
+        Output({"type": R + "-tenor", "index": MATCH}, "value"),
+        Output({"type": R + "-near", "index": MATCH}, "options"),
+        Output({"type": R + "-near", "index": MATCH}, "value"),
+        Output({"type": R + "-far", "index": MATCH}, "options"),
+        Output({"type": R + "-far", "index": MATCH}, "value"),
+        Output({"type": R + "-body", "index": MATCH}, "children"),
+        Input({"type": R + "-tenor", "index": MATCH}, "value"),
+        Input({"type": R + "-near", "index": MATCH}, "value"),
+        Input({"type": R + "-far", "index": MATCH}, "value"),
+        Input(R + "-market", "value"), Input(R + "-product", "value"), Input("tabs", "value"),
+    )
+    def time_spread(tenor, near, far, market, product, tab):
+        if tab != "tspread":
+            return [no_update] * 7
+        d = load()
+        s = d["settled"]
+        market, product = market or DEF, product or "Base"
+        f = s[(s["market"] == market) & (s["product"] == product)]
+        idx = ctx.outputs_list[0]["id"]["index"]
+        tenors = [m for m in MATURITY_ORDER if m in set(f["maturity_type"]) and m not in ("Day", "Weekend")]
+        tenor = keep(tenor, tenors, TS_TENORS[idx] if idx < len(TS_TENORS) else "Month")
+        f = f[f["maturity_type"] == tenor]
+        allk = sorted(f["dkey"].unique())
+        labels = f.drop_duplicates("dkey").set_index("dkey")["dlabel"]
+        dopts = [{"label": labels[k], "value": k} for k in allk]
+        latest = f["trade_date"].max() if not f.empty else ""
+        quoted = sorted(f[f["trade_date"] == latest]["dkey"].unique())
+        ahead = [k for k in quoted if k > latest] or quoted
+        trig = ctx.triggered_id
+        trig = trig.get("type") if isinstance(trig, dict) else trig
+        # Default / country, product or tenor change: front vs next.
+        reset = trig in (R + "-tenor", R + "-market", R + "-product") or near not in allk
+        if reset:
+            near = ahead[0] if ahead else None
+        later = [k for k in ahead if near and k > near] or [k for k in allk if near and k > near]
+        if reset or far not in allk or (near and far <= near):
+            far = later[0] if later else None
+        out = [opts(tenors), tenor, dopts, near, dopts, far]
+        if not near or not far:
+            return out + [note(f"{market} {product}: need two {tenor.lower()} deliveries.")]
+        a, b = f[f["dkey"] == near], f[f["dkey"] == far]
+        w = pd.concat([leg_series(a).rename("L"), leg_series(b).rename("R")], axis=1,
+                      join="inner").sort_index()
+        if w.empty:
+            return out + [note(f"{labels[near]} and {labels[far]} never settled on the same day.")]
+        return out + [spread_view(w, labels[near], labels[far],
+                                  f"{market} {product} {labels[near]} − {labels[far]}",
+                                  a["unit"].iloc[0])]
+
+
+for _r, _m in enumerate(TS_ROWS):
+    register_ts_row(_r, _m)
 
 
 # ---------------------------------------------------------------------
@@ -1803,6 +2155,46 @@ def load_ohlc(short_code: str, delivery: str) -> pd.DataFrame:
             .sort_values("trade_date").reset_index(drop=True))
 
 
+def delivery_hours(dkey: str, maturity: str, product: str) -> int | None:
+    """Hours in the delivery period (Europe/Berlin clock, so DST days are
+    23/25 h). Peak = Mon-Fri 08-20. None if the period or product shape
+    isn't known (EUA, blocks, ...)."""
+    add = {"Year": pd.DateOffset(years=1), "Quarter": pd.DateOffset(months=3),
+           "Month": pd.DateOffset(months=1), "Week": pd.DateOffset(days=7),
+           "Weekend": pd.DateOffset(days=2), "Day": pd.DateOffset(days=1)}.get(maturity)
+    if add is None or product not in ("Base", "Peak"):
+        return None
+    start = pd.Timestamp(dkey)
+    idx = pd.date_range(start.tz_localize("Europe/Berlin"),
+                        (start + add).tz_localize("Europe/Berlin"), freq="h", inclusive="left")
+    if product == "Peak":
+        idx = idx[(idx.weekday < 5) & (idx.hour >= 8) & (idx.hour < 20)]
+    return len(idx) or None
+
+
+def atr_frame(full: pd.DataFrame, ohlc: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Average True Range over n trading days, one row per trade date.
+    Day's high/low = traded high/low (trade feed), widened to include the
+    settlement; close = settlement (else last trade). True range = the
+    bigger of high-low, |high - previous close|, |low - previous close|.
+    Days without a trade use the settlement alone (TR = gap to yesterday).
+    Simple n-day average of TR."""
+    st = full.groupby("trade_date")["settlement_price"].mean().rename("settle")
+    o = ohlc.set_index("trade_date")[["high", "low", "last"]] if not ohlc.empty else \
+        pd.DataFrame(columns=["high", "low", "last"])
+    df = pd.concat([st, o], axis=1).sort_index()
+    df["close"] = df["settle"].fillna(df["last"])
+    df = df.dropna(subset=["close"])
+    hi = df[["high", "settle", "close"]].max(axis=1)
+    lo = df[["low", "settle", "close"]].min(axis=1)
+    prev = df["close"].shift()
+    df["tr"] = (pd.concat([hi, prev], axis=1).max(axis=1)
+                - pd.concat([lo, prev], axis=1).min(axis=1))
+    df["atr"] = df["tr"].rolling(n, min_periods=n).mean()
+    df.index.name = "trade_date"
+    return df.reset_index()
+
+
 def in_range(df, start, end):
     return df[(df["trade_date"] >= str(start)[:10]) & (df["trade_date"] <= str(end)[:10])]
 
@@ -1824,9 +2216,9 @@ def with_ohlc(settle: pd.DataFrame, ohlc: pd.DataFrame) -> pd.DataFrame:
     Input("h-market", "value"), Input("h-product", "value"),
     Input("h-maturity", "value"), Input("h-delivery", "value"),
     Input("h-dates", "start_date"), Input("h-dates", "end_date"), Input("tabs", "value"),
-    Input("h-style", "value"),
+    Input("h-style", "value"), Input("h-atr", "value"),
 )
-def price_history(market, product, maturity, dkey, start, end, tab, style):
+def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n):
     if tab != "history":
         return [no_update] * 13
     d = load()
@@ -1879,20 +2271,61 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
 
     code, unit, uom, label = ref["short_code"], ref["unit"], ref["uom"], ref["dlabel"]
 
+    try:
+        n_atr = int(atr_n) if atr_n else ATR_DAYS
+    except (TypeError, ValueError):
+        n_atr = ATR_DAYS
+    n_atr = max(2, min(250, n_atr))
+    af = atr_frame(full, ohlc_all, n_atr)
+    a_in = in_range(af, start, end)
+    hours = delivery_hours(dkey, maturity, product) if uom in ("MWh", "MWh/D") else None
+
+    # Volume per trade date: EEX's reported volume, else the trade-feed total
+    # (they match - checked on DEBY Cal-27, 2026-10-09). Shown in MW
+    # (volume / hours in the delivery period) where the shape is known.
+    vol = h.set_index("trade_date")["volume"]
+    if candles and not o.empty:
+        vol = o.set_index("trade_date")["tick_volume"].combine_first(vol)
+        vol.update(h.set_index("trade_date")["volume"].dropna())
+    vol = vol.sort_index()
+    vol_unit = "MW" if hours else uom
+    vol_mw = vol / hours if hours else vol
+
     tiles = []
     if not h.empty:
         last = h.iloc[-1]
         before = full[full["trade_date"] < last["trade_date"]]
-        chg = last["settlement_price"] - before["settlement_price"].iloc[-1] if not before.empty else None
-        move = last["settlement_price"] - h["settlement_price"].iloc[0]
+        px = last["settlement_price"]
+        chg = px - before["settlement_price"].iloc[-1] if not before.empty else None
+        upto = full[full["trade_date"] <= last["trade_date"]]["settlement_price"]
+        wk = px - upto.iloc[-6] if len(upto) > 5 else None
+        move = px - h["settlement_price"].iloc[0]
+        hi_, lo_ = h["settlement_price"].max(), h["settlement_price"].min()
+        pos = (px - lo_) / (hi_ - lo_) * 100 if hi_ > lo_ else None
+        rets = upto.where(upto > 0).pct_change().dropna()
+        dvol = upto.diff().std() if len(upto) > 2 else None
+        ann = rets.std() * np.sqrt(252) * 100 if len(rets) > 2 else None
+        atr_now = af[af["trade_date"] <= last["trade_date"]]["atr"].dropna()
+        atr_now = atr_now.iloc[-1] if not atr_now.empty else None
+        oi_prev = before["gross_open_interest"].dropna()
+        oi_chg = (last["gross_open_interest"] - oi_prev.iloc[-1]
+                  if not oi_prev.empty and pd.notna(last["gross_open_interest"]) else None)
+        v_last = vol_mw.get(last["trade_date"])
+        v_avg = vol_mw[vol_mw.index <= last["trade_date"]].tail(n_atr).mean()
         tiles += [
-            kpi(f"Settlement · {last['trade_date']}", fmt(last["settlement_price"]),
-                f"{fmt(chg, sign=True)} day-on-day" if chg is not None else unit, chg),
-            kpi("Move over range", fmt(move, sign=True), unit, move),
-            kpi("High / low settle", f"{fmt(h['settlement_price'].max())} / "
-                f"{fmt(h['settlement_price'].min())}", unit),
-            kpi(f"Volume · {last['trade_date']}", fmt(last["volume"], 0), uom),
-            kpi("Open interest", fmt(last["gross_open_interest"], 0), "lots (gross)"),
+            kpi(f"Settlement · {last['trade_date'][5:]}", fmt(px),
+                f"{fmt(chg, sign=True)} d/d" if chg is not None else unit, chg),
+            kpi("1 week", fmt(wk, sign=True), "5 trading days", wk),
+            kpi("Move over range", fmt(move, sign=True), "first → last shown", move),
+            kpi("High / low settle", f"{fmt(hi_)} / {fmt(lo_)}", "in range"),
+            kpi("Position in range", (f"{pos:.0f} %" if pos is not None else "—"),
+                "0 = low, 100 = high"),
+            kpi(f"ATR {n_atr} d", fmt(atr_now),
+                (f"{atr_now / px * 100:.1f} % of price" if atr_now and px else "not enough days")),
+            kpi("Daily vol", fmt(dvol), (f"{ann:.0f} % annualised" if ann is not None else "sd of 1-day change")),
+            kpi(f"Volume · {last['trade_date'][5:]}", fmt(v_last, 0), f"{vol_unit} · avg {n_atr} d {fmt(v_avg, 0)}"),
+            kpi("Open interest", fmt(last["gross_open_interest"], 0),
+                f"{fmt(oi_chg, 0, sign=True)} d/d" if oi_chg is not None else "lots (gross)", oi_chg),
         ]
     if candles and not o.empty:
         lo_row = o.iloc[-1]
@@ -1948,22 +2381,38 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
                                 marker=dict(size=6), hovertemplate="%{y:.2f}"))
         pf.update_layout(showlegend=False)
 
-    # Volume and open interest on their own charts - never a twin axis. In
-    # candle mode volume comes from the trade feed (same total as EEX's
-    # traded volume) so it covers the same days as the candles.
-    vf = fig_base(f"Traded volume — {uom}", uom, 230)
-    if candles and not o.empty:
-        # EEX's reported volume where we have it, the trade-feed total for
-        # older days (they match - checked on DEBY Cal-27, 2026-10-09).
-        vol = (o.set_index("trade_date")["tick_volume"]
-               .combine_first(h.set_index("trade_date")["volume"]))
-        vol.update(h.set_index("trade_date")["volume"].dropna())
-        vf.add_trace(go.Bar(x=pd.to_datetime(vol.index), y=vol.values, marker_color=SERIES[1],
-                            name="Volume", hovertemplate="%{y:,.0f}"))
-    else:
-        vf.add_trace(go.Bar(x=x, y=h["volume"], marker_color=SERIES[1], name="Volume",
-                            hovertemplate="%{y:,.0f}"))
+    # ATR band: close ± ATR, on the price chart (legend click hides it).
+    band = a_in.dropna(subset=["atr"])
+    if not band.empty:
+        bx = pd.to_datetime(band["trade_date"])
+        pf.add_trace(go.Scatter(x=bx, y=band["close"] + band["atr"], mode="lines",
+                                line=dict(width=0), hoverinfo="skip", showlegend=False,
+                                legendgroup="atr", name="+ATR"))
+        pf.add_trace(go.Scatter(x=bx, y=band["close"] - band["atr"], mode="lines",
+                                line=dict(width=0), fill="tonexty",
+                                fillcolor="rgba(235,104,52,0.14)", legendgroup="atr",
+                                name=f"Close ± ATR {n_atr} d", hoverinfo="skip"))
+        pf.update_layout(showlegend=True)
+
+    # Volume in MW per trade date (bars), its own chart.
+    vf = fig_base(f"Traded volume — {vol_unit} per day"
+                  + (f" (MWh ÷ {hours:,} h)" if hours else ""), vol_unit, 230)
+    vv = vol_mw[(vol_mw.index >= str(start)[:10]) & (vol_mw.index <= str(end)[:10])]
+    vf.add_trace(go.Bar(x=pd.to_datetime(vv.index), y=vv.values, marker_color=SERIES[1],
+                        name="Volume", hovertemplate="%{y:,.0f} " + vol_unit))
     vf.update_layout(showlegend=False)
+
+    tf = fig_base(f"ATR {n_atr} d — {unit}", unit, 230)
+    if not band.empty:
+        tf.add_trace(go.Scatter(x=bx, y=band["atr"], mode="lines", name=f"ATR {n_atr} d",
+                                line=dict(color=SERIES[3], width=2), hovertemplate="%{y:.2f}"))
+        tf.add_trace(go.Bar(x=pd.to_datetime(a_in["trade_date"]), y=a_in["tr"],
+                            name="True range (day)", marker_color="rgba(237,161,0,0.25)",
+                            hovertemplate="%{y:.2f}"))
+    else:
+        tf = empty_fig(f"Need {n_atr} trading days for ATR {n_atr}.", 230)
+    tf.update_layout(showlegend=True)
+
     of = fig_base("Gross open interest — lots", "lots", 230)
     of.add_trace(go.Scatter(x=x, y=h["gross_open_interest"], mode="lines+markers",
                             line=dict(color=SERIES[2], width=2), marker=dict(size=6),
@@ -1973,7 +2422,7 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
     # Same x window on all three charts, weekends squeezed out.
     shown = list(x) + (list(xo) if candles else [])
     span = [min(shown) - pd.Timedelta(hours=18), max(shown) + pd.Timedelta(hours=18)]
-    for fig in (pf, vf, of):
+    for fig in (pf, vf, of, tf):
         fig.update_xaxes(range=span, rangebreaks=[dict(bounds=["sat", "mon"])])
 
     cols = ["trade_date", "short_code", "dlabel", "settlement_price", "unit", "volume",
@@ -1984,9 +2433,10 @@ def price_history(market, product, maturity, dkey, start, end, tab, style):
     body = notes + [
         kpis,
         html.Div(graph(pf), className="card"),
-        (html.Div(graph(vf), className="card") if h.empty else
-         html.Div([html.Div(graph(vf), className="card"), html.Div(graph(of), className="card")],
-                  className="row2")),
+        (html.Div([html.Div(graph(vf), className="card"), html.Div(graph(tf), className="card")],
+                  className="row2") if h.empty else
+         html.Div([html.Div(graph(vf), className="card"), html.Div(graph(tf), className="card"),
+                   html.Div(graph(of), className="card")], className="row3")),
         html.Details([html.Summary(f"Table — {code} {label}, every stored trading day"),
                       table(tbl.sort_values("trade_date", ascending=False))]),
     ]
@@ -2032,6 +2482,209 @@ def download_csv(_, market, product, maturity, dkey, start, end):
     # utf-8-sig so Excel opens it with the right encoding.
     return dcc.send_data_frame(out.to_csv,
                                f"eex_{code}_{dkey}.csv", index=False, encoding="utf-8-sig")
+
+
+# ---------------------------------------------------------------------
+# Top 50 (Peter, 2026-10-17): on one trade date, the 50 contracts with the
+# highest traded volume, the biggest change in open interest and the
+# biggest open interest - all in LOTS (contracts), not MWh.
+# ---------------------------------------------------------------------
+EUA_LOT_T = 1000.0          # one EEX EUA future = 1,000 allowances
+
+
+def lot_sizes() -> dict:
+    """MWh (or t) per lot for every contract+delivery.
+
+    EEX reports open interest twice: in lots (grossOpenInt) and in MWh
+    (grossOpenIntSz), so their ratio IS the lot size - 1 MW x the hours of
+    the delivery period (720 for a 30-day base month, 8,760 for Cal-27,
+    168/169 for a week). Traded volume only comes in MWh, so lots traded =
+    volume / lot size. Cached with the database file."""
+    key = ("lots", str(DB_PATH), DB_PATH.stat().st_mtime)
+    if _cache.get("lots_key") == key:
+        return _cache["lots"]
+    with closing(sqlite3.connect(f"{DB_PATH.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+        rows = conn.execute(
+            "SELECT short_code, delivery, MAX(gross_open_interest_size * 1.0 / gross_open_interest) "
+            "FROM eex_market_prices WHERE gross_open_interest > 0 "
+            "AND gross_open_interest_size > 0 GROUP BY short_code, delivery").fetchall()
+    sizes = {(c, str(d)): v for c, d, v in rows if v}
+    _cache["lots_key"], _cache["lots"] = key, sizes
+    return sizes
+
+
+def top_frame(day: str) -> pd.DataFrame:
+    """Every contract quoted on `day`, with lots traded, open interest and
+    the change in open interest since that contract's previous trade date."""
+    p = load()["prices"]
+    upto = p[p["trade_date"] <= day].sort_values("trade_date")
+    last2 = upto.groupby(["short_code", "delivery"], sort=False).tail(2)
+    prev = (last2[last2["trade_date"] < day]
+            .groupby(["short_code", "delivery"])["gross_open_interest"].last()
+            .rename("oi_prev"))
+    f = p[p["trade_date"] == day].join(prev, on=["short_code", "delivery"])
+    if f.empty:
+        return f
+    sizes = lot_sizes()
+
+    def lot(r):
+        if r.uom == "tCO2":
+            return EUA_LOT_T
+        v = sizes.get((r.short_code, r.delivery))
+        if v:
+            return v
+        return delivery_hours(r.dkey, r.maturity_type, r.product)   # 1 MW x hours
+
+    f = f.copy()
+    f["lot"] = [lot(r) for r in f.itertuples(index=False)]
+    f["lots"] = (f["volume"] / f["lot"]).round()
+    f["oi"] = f["gross_open_interest"]
+    f["d_oi"] = f["oi"] - f["oi_prev"]
+    f["contract"] = f["market"] + " " + f["product"] + " " + f["dlabel"]
+    return f
+
+
+def top_table(df: pd.DataFrame, cols: list, key: str):
+    from dash.dash_table.Format import Format, Group, Scheme, Sign
+    num = Format(group=Group.yes, precision=0, scheme=Scheme.fixed)
+    signed = Format(group=Group.yes, precision=0, scheme=Scheme.fixed, sign=Sign.positive)
+    price = Format(precision=2, scheme=Scheme.fixed)
+    spec = {"#": ("#", None), "contract": ("Contract", None), "short_code": ("Code", None),
+            "lots": ("Lots", num), "d_oi": ("Δ OI", signed),
+            "oi": ("OI", num), "settlement_price": ("Settle", price),
+            "unit": ("Unit", None)}
+    widths = {"#": "34px", "contract": "175px", "lots": "70px", "d_oi": "72px",
+              "oi": "80px", "settlement_price": "62px"}
+    columns = []
+    for c in cols:
+        name, f = spec[c]
+        col = {"name": name, "id": c}
+        if f is not None:
+            col.update(type="numeric", format=f)
+        columns.append(col)
+    return dash_table.DataTable(
+        id=f"t-tab-{key}",
+        data=df[cols].to_dict("records"), columns=columns, cell_selectable=False,
+        sort_action="native", page_action="none",
+        fixed_rows={"headers": True}, style_table={"height": "620px", "overflowY": "auto"},
+        style_cell={"fontFamily": "inherit", "fontSize": 12.5, "padding": "3px 6px",
+                    "textAlign": "right", "border": f"1px solid {INK['grid']}",
+                    "whiteSpace": "nowrap"},
+        style_cell_conditional=[
+            *[{"if": {"column_id": c}, "width": w, "minWidth": w, "maxWidth": w}
+              for c, w in widths.items() if c in cols],
+            {"if": {"column_id": "#"}, "color": INK["muted"]},
+            {"if": {"column_id": ["contract", "short_code", "unit"]}, "textAlign": "left",
+             "overflow": "hidden", "textOverflow": "ellipsis"},
+            {"if": {"column_id": key}, "fontWeight": 600},
+        ],
+        style_data_conditional=[
+            {"if": {"filter_query": "{d_oi} > 0", "column_id": "d_oi"}, "color": INK["up"]},
+            {"if": {"filter_query": "{d_oi} < 0", "column_id": "d_oi"}, "color": INK["down"]},
+            {"if": {"filter_query": "{d_oi} = 0", "column_id": "d_oi"}, "color": INK["muted"]},
+        ],
+        tooltip_data=[{"contract": f"{r['contract']} ({r['short_code']})"}
+                      for r in df.to_dict("records")],
+        tooltip_delay=300, tooltip_duration=None,
+        style_header={"fontWeight": 600, "backgroundColor": INK["bg"]},
+    )
+
+
+@app.callback(
+    Output("t-date", "min_date_allowed"), Output("t-date", "max_date_allowed"),
+    Output("t-date", "disabled_days"), Output("t-date", "date"),
+    Output("t-group", "options"), Output("t-group", "value"),
+    Output("t-maturity", "options"), Output("t-maturity", "value"),
+    Output("t-body", "children"),
+    Input("t-date", "date"), Input("t-group", "value"), Input("t-maturity", "value"),
+    Input("t-delivering", "value"), Input("tabs", "value"),
+)
+def top_contracts(day, group, maturity, delivering, tab):
+    if tab != "top":
+        return [no_update] * 9
+    p = load()["prices"]
+    traded = sorted(p.loc[p["volume"] > 0, "trade_date"].unique())
+    if not traded:
+        return [None, None, [], None, [], None, [], None, note("No traded volume stored yet.")]
+    all_days = set(p["trade_date"].unique())
+    lo, hi = traded[0], traded[-1]
+    # Default: the last trading day with volume (Peter: "default last trading day").
+    day = str(day)[:10] if day else hi
+    if day not in all_days:
+        day = hi
+    span = pd.date_range(p["trade_date"].min(), p["trade_date"].max(), freq="D")
+    disabled = [d.strftime("%Y-%m-%d") for d in span if d.strftime("%Y-%m-%d") not in all_days]
+
+    f = top_frame(day)
+    # A contract whose delivery has started (Oct-26 on 16 Oct) no longer
+    # trades and EEX freezes its open interest - hidden by default so the
+    # lists show what is actually tradable.
+    hidden = 0
+    if delivering != "Show":
+        live = f["dkey"] > day
+        hidden = int((~live).sum())
+        f = f[live]
+    groups = ["All"] + [g for g in ("Power", "Gas", "Carbon", "Other") if g in set(f["group"])]
+    group = keep(group, groups, "All")
+    if group != "All":
+        f = f[f["group"] == group]
+    mats = ["All"] + [m for m in MATURITY_ORDER if m in set(f["maturity_type"])]
+    maturity = keep(maturity, mats, "All")
+    if maturity != "All":
+        f = f[f["maturity_type"] == maturity]
+    out = [p["trade_date"].min(), p["trade_date"].max(), disabled, day,
+           opts(groups), group, opts(mats), maturity]
+    if f.empty:
+        return out + [note(f"Nothing quoted on {day} for that selection.")]
+
+    def ranked(col, by_abs=False):
+        g = f[f[col].notna() & (f[col] != 0)]
+        order = g[col].abs() if by_abs else g[col]
+        g = g.loc[order.sort_values(ascending=False).index].head(TOP_N).copy()
+        g.insert(0, "#", range(1, len(g) + 1))
+        return g
+
+    vol, doi, oi = ranked("lots"), ranked("d_oi", by_abs=True), ranked("oi")
+    prev_day = max((d for d in all_days if d < day), default=None)
+    up, down = f.loc[f["d_oi"] > 0, "d_oi"].sum(), f.loc[f["d_oi"] < 0, "d_oi"].sum()
+    tiles = html.Div([
+        kpi(f"Lots traded · {day}", fmt(f["lots"].sum(), 0),
+            f"{int((f['lots'] > 0).sum())} contracts traded"),
+        kpi("Open interest", fmt(f["oi"].sum(), 0), "lots, all contracts shown"),
+        kpi("OI change", fmt(up + down, 0, sign=True),
+            f"+{up:,.0f} / {down:,.0f} vs {prev_day or 'previous day'}", up + down),
+        kpi("Top contract", vol["contract"].iloc[0] if not vol.empty else "—",
+            f"{vol['lots'].iloc[0]:,.0f} lots" if not vol.empty else None),
+    ], className="kpis")
+
+    def card(title, sub, df, cols, key):
+        return html.Div([html.Div(title, style={"fontWeight": 600, "fontSize": 15}),
+                         html.Div(sub, className="note", style={"margin": "2px 0 8px"}),
+                         top_table(df, cols, key) if not df.empty else note("Nothing to rank.")],
+                        className="card")
+
+    body = [
+        tiles,
+        html.Div([
+            card(f"Top {TOP_N} by lots traded", f"Volume on {day} in lots (contracts).",
+                 vol, ["#", "contract", "lots", "d_oi", "settlement_price"], "lots"),
+            card(f"Top {TOP_N} by change in open interest",
+                 f"Biggest move up or down since each contract's previous trade date "
+                 f"({prev_day or '—'}), in lots.",
+                 doi, ["#", "contract", "d_oi", "oi", "lots"], "d_oi"),
+            card(f"Top {TOP_N} by open interest", f"Open interest on {day} in lots.",
+                 oi, ["#", "contract", "oi", "d_oi", "lots"], "oi"),
+        ], className="row3"),
+        note("Lots = contracts. EEX publishes traded volume in MWh, so lots = MWh ÷ lot size; "
+             "the lot size (1 MW × hours of the delivery period, e.g. 720 for a 30-day month, "
+             "8,760 for Cal-27) is EEX's own open interest in MWh ÷ open interest in lots. "
+             "EUA: 1,000 t per lot. Lots of different products are not the same size - a Cal "
+             "lot is 12× a month lot. Δ OI = change since the contract's previous trade date. "
+             + (f"{hidden} contracts already in delivery are hidden (their open interest is "
+                "frozen by EEX). " if hidden else "")
+             + "Click a column header to re-sort; hover a contract for its EEX code."),
+    ]
+    return out + [body]
 
 
 # ---------------------------------------------------------------------

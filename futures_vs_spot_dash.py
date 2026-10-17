@@ -56,10 +56,25 @@ from dash import Dash, Input, Output, State, dash_table, dcc, html
 HERE = Path(__file__).resolve().parent
 EEX_NAME = "eex_market_data.db"
 SPOT_NAME = "entsoe_data.db"
+
+
+def _entsoe_db_default():
+    """entsoe_data.db wherever it lives (see entsoe_scraper/entsoe_db.py)."""
+    import sys
+    folder = str(HERE.parent / "entsoe_scraper")
+    if folder not in sys.path:
+        sys.path.append(folder)
+    try:
+        from entsoe_db import entsoe_db_path
+        return entsoe_db_path()
+    except ImportError:
+        return HERE.parent / "entsoe_scraper" / "entsoe_data.db"
+
+
 EEX_CANDIDATES = [HERE / EEX_NAME, HERE / "Claude outputs" / EEX_NAME,
                   HERE.parent / "eex_scraper" / EEX_NAME, HERE.parent / EEX_NAME,
                   Path.cwd() / EEX_NAME]
-SPOT_CANDIDATES = [HERE.parent / "entsoe_scraper" / SPOT_NAME, HERE / SPOT_NAME,
+SPOT_CANDIDATES = [_entsoe_db_default(), HERE.parent / "entsoe_scraper" / SPOT_NAME, HERE / SPOT_NAME,
                    HERE.parent / SPOT_NAME, Path.cwd() / SPOT_NAME]
 
 

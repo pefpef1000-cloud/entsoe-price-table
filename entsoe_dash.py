@@ -57,7 +57,12 @@ from dash.dash_table.Format import Format, Group, Scheme
 
 DEFAULT_PORT = 8056
 DB_NAME = "entsoe_data.db"
-DB_PATH = Path(__file__).resolve().parent / DB_NAME   # main() replaces it with --db
+try:  # where the database lives (entsoe_db_location.txt), see entsoe_db.py
+    from entsoe_db import entsoe_db_path as _edp
+    _ENTSOE_DB = _edp()
+except ImportError:
+    _ENTSOE_DB = None
+DB_PATH = _ENTSOE_DB or Path(__file__).resolve().parent / DB_NAME   # main() replaces it with --db
 NONE_OPTION = "None"  # shown in zone pickers 2-5; means "not selected"
 NO_DB_TEXT = None     # the online app sets its own "no data yet" text here
 

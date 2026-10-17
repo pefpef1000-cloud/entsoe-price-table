@@ -73,6 +73,11 @@ APP_TITLE = "Day-ahead prices"
 TABS = [("table", "Hourly price table"), ("charts", "Day-ahead charts")]
 
 DB_NAME = "entsoe_data.db"
+try:  # where the database lives (entsoe_db_location.txt), see entsoe_db.py
+    from entsoe_db import entsoe_db_path as _edp
+    _ENTSOE_DB = _edp()
+except ImportError:
+    _ENTSOE_DB = None
 DEFAULT_PORT = 8051
 
 PEAK_START_HOUR = 8   # inclusive
@@ -121,6 +126,7 @@ def find_db(cli_path=None):
         return Path(cli_path).expanduser().resolve()
     here = Path(__file__).resolve().parent
     candidates = [
+        *([_ENTSOE_DB] if _ENTSOE_DB else []),
         here / DB_NAME,
         here / "Claude outputs" / DB_NAME,
         here.parent / DB_NAME,

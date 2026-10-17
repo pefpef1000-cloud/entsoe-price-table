@@ -45,10 +45,11 @@ PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
 FONT = "Segoe UI, -apple-system, Helvetica, Arial, sans-serif"
 INK, MUTED, GRID, BG, CARD = "#1f2328", "#59636e", "#e6e8eb", "#f6f7f9", "#ffffff"
 
+# Order = display order everywhere (Peter 2026-10-16: solar first, temperature always last).
 VARS = {
-    "temp_c": {"label": "Temperature", "unit": "°C", "fmt": ".1f"},
-    "wind100_ms": {"label": "Wind 100 m", "unit": "m/s", "fmt": ".1f"},
     "solar_wm2": {"label": "Solar radiation", "unit": "W/m²", "fmt": ".0f"},
+    "wind100_ms": {"label": "Wind 100 m", "unit": "m/s", "fmt": ".1f"},
+    "temp_c": {"label": "Temperature", "unit": "°C", "fmt": ".1f"},
 }
 MW_META = {
     "wind100_ms": {"label": "Wind power", "unit": "MW", "fmt": ",.0f"},
@@ -65,6 +66,8 @@ EC_COLS = {"temp_c": ("temp_c", "temp_p10", "temp_p90"),
 CMP_PREV, CMP_WEEK, CMP_XMODEL = "prev", "week", "xmodel"
 CMP_P00, CMP_P12 = "prev00", "prev12"  # last earlier 00z / 12z run
 MODELS = {"ifs": "ECMWF", "gfs": "GFS"}
+ENS_MODELS = {"ecmwf": "ECMWF ENS", "gefs": "GEFS"}
+ENS_DET = {"ecmwf": "ifs", "gefs": "gfs"}
 
 
 # A run is identified by a key "model|ISO time", e.g. "gfs|2026-10-14T12:00:00+00:00".
@@ -379,8 +382,20 @@ def ec_fetch_for(ts, fetches):
     return max(ok) if ok else None
 
 
+DAY_MIN_SPAN = pd.Timedelta(hours=18)   # a run must cover >= 18 h of a day to give a daily average
+
+
 def daily(df, var):
-    return df.groupby(["run_time", "zone", "day"])[var].mean().reset_index()
+    """Daily mean per run/zone/day - only days the run covers (nearly) fully.
+
+    The first and last day of a run are partial (e.g. a 12z run ends at 12 UTC); their mean
+    is not a daily average and made "change vs compare" show almost the full value on the
+    last day (2026-10-16). 18 h span also passes 3-hourly data (00..21 h).
+    """
+    g = df.groupby(["run_time", "zone", "day"])
+    out = g[var].mean().reset_index()
+    span = (g["valid_time"].max() - g["valid_time"].min()).reset_index(drop=True)
+    return out[(span >= DAY_MIN_SPAN).to_numpy()].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------- figures & helpers
@@ -395,6 +410,15 @@ def base_fig(title, unit, height=260):
         yaxis=dict(gridcolor=GRID, zerolinecolor=GRID),
     )
     return fig
+
+
+def as_var(d, col, var):
+    """Column `col` renamed to `var`. A frame that already has a `var` column
+    (ensemble statistics next to the plain value) would otherwise end up with
+    two columns of that name, which plotly refuses (DuplicateError)."""
+    if col == var:
+        return d
+    return d.drop(columns=[var], errors="ignore").rename(columns={col: var})
 
 
 def add_series(fig, d, var, name, colour, dash=None, width=2, m=None, x="valid_time", label_shift=0):
@@ -560,7 +584,7 @@ NOTE = {"color": MUTED, "fontSize": "12px", "margin": "4px 0 8px"}
 
 # ---------------------------------------------------------------- layout
 TABS = [("forecast", "Forecast"), ("runs", "Run changes"), ("countries", "Countries"),
-        ("ecgfs", "EC vs GFS"), ("ec46", "EC46 (46 days)"), ("seasonal", "Seasonal"), ("quality", "Model quality")]
+        ("ecgfs", "EC vs GFS"), ("ens", "Ensembles"), ("ec46", "EC46 (46 days)"), ("seasonal", "Seasonal"), ("quality", "Model quality")]
 
 
 def model_options(df):
@@ -607,8 +631,22 @@ def serve_layout():
                 bits.append(f"{MODELS[m]}: latest {rk_ts(rs[0]):%a %d %b %Hz}, {len(rs)} runs")
         head = " · ".join(bits) + " · Danish local time"
     return html.Div([
-        html.H2("Weather forecasts", style={"margin": "0 0 2px 0"}),
-        html.Div(head, style={"color": MUTED, "marginBottom": "12px"}),
+        # Title left, update button + status top right (moved here 2026-10-16)
+        html.Div([
+            html.Div([html.H2("Weather forecasts", style={"margin": "0 0 2px 0"}),
+                      html.Div(head, style={"color": MUTED})]),
+            html.Div([
+                html.Button("Check for new data", id="upd-btn", n_clicks=0,
+                            style={"padding": "6px 14px", "borderRadius": "6px", "border": f"1px solid {PALETTE[0]}",
+                                   "background": CARD, "color": PALETTE[0], "fontWeight": 600, "cursor": "pointer",
+                                   "whiteSpace": "nowrap"}),
+                html.Span(id="upd-status", style={"color": MUTED, "fontSize": "13px", "marginLeft": "12px",
+                                                  "maxWidth": "420px"}),
+                dcc.Interval(id="upd-poll", interval=3000, disabled=True),
+                dcc.Store(id="upd-done"),
+            ], style={"display": "flex", "alignItems": "center", "marginLeft": "auto"}),
+        ], style={"display": "flex", "alignItems": "flex-start", "gap": "16px", "marginBottom": "12px",
+                  "flexWrap": "wrap"}),
         html.Div([
             html.Div([html.Label("Country"), dcc.Dropdown(
                 id="zone", options=zone_opts, value="DE" if "DE" in zones else (zones[0] if zones else None),
@@ -634,39 +672,42 @@ def serve_layout():
             inputStyle={"marginRight": "4px"}, labelStyle={"marginRight": "14px"})],
             style={"display": "flex", "alignItems": "center", "marginBottom": "4px"}),
         html.Div(id="cmp-note", style={"color": MUTED, "fontSize": "13px", "marginBottom": "6px"}),
-        html.Div([
-            html.Button("Check for new data", id="upd-btn", n_clicks=0,
-                        style={"padding": "6px 14px", "borderRadius": "6px", "border": f"1px solid {PALETTE[0]}",
-                               "background": CARD, "color": PALETTE[0], "fontWeight": 600, "cursor": "pointer"}),
-            html.Span(id="upd-status", style={"color": MUTED, "fontSize": "13px", "marginLeft": "12px"}),
-            dcc.Interval(id="upd-poll", interval=3000, disabled=True),
-            dcc.Store(id="upd-done"),
-        ], style={"display": "flex", "alignItems": "center", "marginBottom": "10px", "flexWrap": "wrap"}),
-        html.Div(id="showing", style={"display": "flex", "alignItems": "center", "gap": "8px",
-                                      "flexWrap": "wrap", "marginBottom": "10px"}),
-        html.Div(id="kpis", style={"display": "flex", "gap": "10px", "flexWrap": "wrap", "marginBottom": "12px"}),
         dcc.Tabs(id="tab", value="forecast", children=[dcc.Tab(label=l, value=v) for v, l in TABS]),
         html.Div(id="panel-forecast", children=[
             html.Div(id="f-help", style=NOTE),
             html.Div(id="f-note", style=NOTE),
-            dcc.Graph(id="g-temp", config={"displaylogo": False}),
-            dcc.Graph(id="g-wind", config={"displaylogo": False}),
             dcc.Graph(id="g-solar", config={"displaylogo": False}),
+            dcc.Graph(id="g-wind", config={"displaylogo": False}),
+            dcc.Graph(id="g-temp", config={"displaylogo": False}),
+            # Same three charts for the other model (GFS when ECMWF is picked), on the same
+            # run times as picked above (added 2026-10-16).
+            html.H3(id="f2-head", style={"margin": "18px 0 2px", "fontSize": "18px"}),
+            html.Div(id="f2-note", style=NOTE),
+            dcc.Graph(id="g2-solar", config={"displaylogo": False}),
+            dcc.Graph(id="g2-wind", config={"displaylogo": False}),
+            dcc.Graph(id="g2-temp", config={"displaylogo": False}),
         ]),
         html.Div(id="panel-runs", children=[
-            html.Div(radio("runs-var", "wind100_ms"), style={"margin": "10px 0"}),
-            dcc.Graph(id="g-runs", config={"displaylogo": False}),
-            html.H4("Daily average by run", style={"margin": "12px 0 6px"}),
+            # Solar, wind, temperature charts (2026-10-16: "make the 3 usual graphs instead of just 1");
+            # the variable picker below now only chooses the table.
+            dcc.Graph(id="g-runs-solar", config={"displaylogo": False}),
+            dcc.Graph(id="g-runs-wind", config={"displaylogo": False}),
+            dcc.Graph(id="g-runs-temp", config={"displaylogo": False}),
+            html.Div([html.Span("Table:", style={"fontWeight": 600, "marginRight": "10px"}),
+                      radio("runs-var", "solar_wm2")],
+                     style={"display": "flex", "alignItems": "center", "margin": "12px 0 0"}),
+            html.H4("Daily average by run", style={"margin": "8px 0 6px"}),
             dash_table.DataTable(id="t-runs", **TABLE_STYLE),
         ]),
+        # Solar, wind, temperature tables (2026-10-16: "same for countries the 3 usual tabels")
         html.Div(id="panel-countries", children=[
-            html.Div([radio("c-var", "wind100_ms")],
-                     style={"display": "flex", "gap": "30px", "margin": "10px 0", "flexWrap": "wrap"}),
-            html.Div(id="c-note", style=NOTE),
-            dash_table.DataTable(id="t-countries", **TABLE_STYLE),
+            *[x for v in ("solar", "wind", "temp") for x in (
+                html.H4(id=f"c-title-{v}", style={"margin": "14px 0 2px"}),
+                html.Div(id=f"c-note-{v}", style=NOTE),
+                dash_table.DataTable(id=f"t-countries-{v}", **TABLE_STYLE))],
         ]),
         html.Div(id="panel-ecgfs", children=[
-            html.Div(radio("x-var", "wind100_ms"), style={"margin": "10px 0"}),
+            html.Div(radio("x-var", "solar_wm2"), style={"margin": "10px 0"}),
             html.Div(id="x-note", style=NOTE),
             html.Div(id="x-kpis", style={"display": "flex", "gap": "10px", "flexWrap": "wrap", "marginBottom": "8px"}),
             dcc.Graph(id="g-x", config={"displaylogo": False}),
@@ -674,7 +715,7 @@ def serve_layout():
             dash_table.DataTable(id="t-x", **TABLE_STYLE),
         ]),
         html.Div(id="panel-seasonal", children=[
-            html.Div([radio("s-var", "wind100_ms"),
+            html.Div([radio("s-var", "solar_wm2"),
                       dcc.RadioItems(id="s-model", value="seas5", inline=True,
                                      options=[{"label": "Table: SEAS5 (ECMWF)", "value": "seas5"},
                                               {"label": "Table: CFSv2 (NOAA)", "value": "cfs"}],
@@ -694,12 +735,36 @@ def serve_layout():
             html.Div(id="q-acc-note", style=NOTE),
             dash_table.DataTable(id="t-qacc", **TABLE_STYLE),
         ]),
+        html.Div(id="panel-ens", children=[
+            html.Div([
+                html.Div([html.Label("Ensemble"), dcc.Dropdown(
+                    id="n-model", value="ecmwf", clearable=False,
+                    options=[{"label": v, "value": k} for k, v in ENS_MODELS.items()])], style={"width": "190px"}),
+                html.Div([html.Label("Run"), dcc.Dropdown(id="n-run", clearable=False)], style={"width": "280px"}),
+                html.Div([html.Label("Compare with"), dcc.Dropdown(
+                    id="n-cmp", value=CMP_PREV, clearable=False,  # static shortcuts so the value is valid at start
+                    options=[{"label": "Previous run", "value": CMP_PREV}, {"label": "Previous 00z run", "value": CMP_P00},
+                             {"label": "Previous 12z run", "value": CMP_P12}, {"label": "1 day earlier", "value": "day"},
+                             {"label": "Nothing", "value": "none"}])],
+                         style={"width": "330px"}),
+                html.Div(radio("n-var", "solar_wm2"), style={"paddingTop": "24px"}),
+            ], style={"display": "flex", "gap": "16px", "margin": "10px 0", "flexWrap": "wrap"}),
+            html.Div(id="n-showing", style={"display": "flex", "alignItems": "center", "gap": "8px",
+                                            "flexWrap": "wrap", "margin": "4px 0 8px"}),
+            html.Div(id="n-note", style=NOTE),
+            dcc.Graph(id="g-ens", config={"displaylogo": False}),
+            html.H4(id="n-t1-title", style={"margin": "12px 0 6px"}),
+            dash_table.DataTable(id="t-ens", **TABLE_STYLE),
+            html.H4(id="n-t2-title", style={"margin": "16px 0 6px"}),
+            dash_table.DataTable(id="t-ens-c", **TABLE_STYLE),
+        ]),
         html.Div(id="panel-ec46", children=[
             html.Div([
                 html.Div([html.Label("EC46 run"), dcc.Dropdown(id="e-run", clearable=False)], style={"width": "220px"}),
-                html.Div([html.Label("Compare with"), dcc.Dropdown(id="e-cmp", value=CMP_PREV, clearable=False)],
+                html.Div([html.Label("Compare with"), dcc.Dropdown(id="e-cmp", value=CMP_PREV, clearable=False, options=[
+                    {"label": "Previous EC46 run", "value": CMP_PREV}, {"label": "1 week earlier", "value": CMP_WEEK}])],
                          style={"width": "240px"}),
-                html.Div(radio("e-var", "wind100_ms"), style={"paddingTop": "24px"}),
+                html.Div(radio("e-var", "solar_wm2"), style={"paddingTop": "24px"}),
             ], style={"display": "flex", "gap": "16px", "margin": "10px 0", "flexWrap": "wrap"}),
             html.Div(id="e-note", style=NOTE),
             dcc.Graph(id="g-ec46", config={"displaylogo": False}),
@@ -832,69 +897,28 @@ def cmp_opts(run, _stamp):
     return cmp_options(df, run if (not df.empty and run in set(df["run_time"].unique())) else None)
 
 
-@app.callback(Output("cmp-note", "children"), Output("showing", "children"),
+@app.callback(Output("cmp-note", "children"),
               Input("run", "value"), Input("cmp", "value"))
 def cmp_note(run, cmp):
     df, rt, ct, why = _context(run, cmp)
     if rt is None:
-        return "", []
-    banner = showing_banner(df, rt, ct)
+        return ""
     if ct is None:
-        return why, banner
+        return why
     days = (rk_ts(rt) - rk_ts(ct)) / pd.Timedelta(days=1)
     when = f"{days:.1f} days older" if days > 0.01 else ("same run time" if abs(days) <= 0.01 else
                                                            f"{-days:.1f} days newer")
-    return f"Comparing {run_label(rt)} with {run_label(ct)} ({when}).", banner
+    return f"Comparing {run_label(rt)} with {run_label(ct)} ({when})."
 
 
-@app.callback(Output("kpis", "children"), Input("zone", "value"), Input("run", "value"),
-              Input("cmp", "value"), Input("units", "value"))
-def kpis(zone, run, cmp, units):
-    df, rt, ct, _ = _context(run, cmp)
-    if df is None or not zone:
-        return []
-    base = df[(df.zone == zone) & (df.run_time == rt)]
-    now = pd.Timestamp.now(tz=TZ)
-    start = max(now, base["valid_time"].min()) if not base.empty else now
-
-    def avg(d, var, hours):
-        w = d[(d.valid_time > start) & (d.valid_time <= start + pd.Timedelta(hours=hours))]
-        return w[var].mean() if not w.empty else float("nan")
-
-    out = []
-    for var, hours, lab in [("temp_c", 24, "Temp next 24 h"), ("wind100_ms", 24, "Wind next 24 h"),
-                            ("solar_wm2", 24, "Solar next 24 h"), ("temp_c", 168, "Temp next 7 days"),
-                            ("wind100_ms", 168, "Wind next 7 days")]:
-        m = meta(var, units)
-        src = data(units, var, [rt, ct])
-        src = src[src.zone == zone] if not src.empty else src
-        v = avg(src[src.run_time == rt], var, hours) if not src.empty else float("nan")
-        sub = ""
-        if ct is not None and not src.empty:
-            p = avg(src[src.run_time == ct], var, hours)
-            if pd.notna(v) and pd.notna(p):
-                sub = f"{v - p:+{m['fmt']}} vs {run_label(ct)}"
-        if m["unit"] == "MW":
-            lab = lab.replace("Wind", "Wind power").replace("Solar", "Solar power")
-        out.append(tile(lab, "–" if pd.isna(v) else f"{v:{m['fmt']}} {m['unit']}", sub))
-    return out
-
-
-@app.callback(Output("g-temp", "figure"), Output("g-wind", "figure"), Output("g-solar", "figure"),
-              Output("f-note", "children"), Output("f-help", "children"),
-              Input("zone", "value"), Input("run", "value"), Input("cmp", "value"),
-              Input("units", "value"), Input("view", "value"), Input("tab", "value"))
-def forecast(zone, run, cmp, units, view, tab):
-    if tab != "forecast":
-        raise PreventUpdate
-    df, rt, ct, why = _context(run, cmp)
-    diff = view == "diff"
+def forecast_figs(df, zone, rt, ct, units, diff):
+    """Solar, wind, temperature charts for run rt (thick) vs ct (dashed)."""
     figs = []
     for var in VARS:
         m = meta(var, units)
         runs_txt = "" if rt is None else (f" · {run_label(rt)}" + (f" vs {run_label(ct)}" if ct else ""))
         fig = base_fig((("Change in " + m["label"].lower()) if diff else m["label"]) + runs_txt, m["unit"])
-        if df is not None and zone:
+        if df is not None and zone and rt is not None:
             d = data(units, var, [rt, ct])
             d = d[d.zone == zone] if not d.empty else d
             if diff:
@@ -911,6 +935,36 @@ def forecast(zone, run, cmp, units, view, tab):
                 if fig.data and not cur.empty:
                     add_normal(fig, zone, var, units, cur.valid_time.min(), cur.valid_time.max())
         figs.append(finish_fig(fig, zone, m, diff=diff))
+    return figs
+
+
+def match_run(df, model, key):
+    """Run of `model` at the same run time as `key`, else the newest one before it (max 12 h)."""
+    if key is None:
+        return None, ""
+    t = rk_ts(key)
+    cands = [r for r in runs(df, model) if rk_ts(r) <= t]
+    if not cands:
+        return None, f"no {MODELS.get(model, model)} run at or before {t:%a %d %b %Hz}"
+    best = max(cands, key=rk_ts)
+    if t - rk_ts(best) > pd.Timedelta(hours=12):
+        return None, f"no {MODELS.get(model, model)} run within 12 h before {t:%a %d %b %Hz}"
+    note = "" if rk_ts(best) == t else f"{run_label(best)} used for {t:%a %d %b %Hz} (no run at that time)"
+    return best, note
+
+
+@app.callback(Output("g-solar", "figure"), Output("g-wind", "figure"), Output("g-temp", "figure"),
+              Output("f-note", "children"), Output("f-help", "children"),
+              Output("f2-head", "children"), Output("f2-note", "children"),
+              Output("g2-solar", "figure"), Output("g2-wind", "figure"), Output("g2-temp", "figure"),
+              Input("zone", "value"), Input("run", "value"), Input("cmp", "value"),
+              Input("units", "value"), Input("view", "value"), Input("tab", "value"))
+def forecast(zone, run, cmp, units, view, tab):
+    if tab != "forecast":
+        raise PreventUpdate
+    df, rt, ct, why = _context(run, cmp)
+    diff = view == "diff"
+    figs = forecast_figs(df, zone, rt, ct, units, diff)
     if diff:
         help_ = (why if ct is None else
                  f"Run {run_label(rt)} minus {run_label(ct)}, on the hours both cover. Orange = higher, "
@@ -919,25 +973,35 @@ def forecast(zone, run, cmp, units, view, tab):
     else:
         help_ = ("Selected run = thick line; compare run = dashed. Dotted line = now. "
                  "Grey dotted = normal (ERA5 1996-2025; wind/solar only in MW).")
-    return (*figs, mw_note(zone, rk_model(rt)) if (units == "mw" and rt) else "", help_)
+    # Second block: the other model on the same run times (GFS under ECMWF, ECMWF under GFS).
+    other = None
+    if rt is not None:
+        other = next((m for m in MODELS if m != rk_model(rt)), None)
+    if other is None:
+        head, note2, figs2 = "", "", forecast_figs(None, zone, None, None, units, diff)
+    else:
+        rt2, n1 = match_run(df, other, rt)
+        ct2, n2 = match_run(df, other, ct) if ct is not None else (None, "")
+        head = f"{MODELS[other]} - same run times as above"
+        bits = [b for b in (n1, n2) if b]
+        if rt2 is not None:
+            bits.insert(0, f"{run_label(rt2)}" + (f" vs {run_label(ct2)}" if ct2 else "") + ".")
+        if units == "mw" and rt2 is not None:
+            bits.append(mw_note(zone, other))
+        note2 = " ".join(bits)
+        figs2 = forecast_figs(df, zone, rt2, ct2, units, diff)
+    return (*figs, mw_note(zone, rk_model(rt)) if (units == "mw" and rt) else "", help_,
+            head, note2, *figs2)
 
 
-@app.callback(Output("g-runs", "figure"), Output("t-runs", "data"), Output("t-runs", "columns"),
-              Output("t-runs", "style_data_conditional"),
-              Input("zone", "value"), Input("run", "value"), Input("cmp", "value"),
-              Input("runs-var", "value"), Input("units", "value"), Input("view", "value"), Input("tab", "value"))
-def run_changes(zone, run, cmp, var, units, view, tab):
-    if tab != "runs":
-        raise PreventUpdate
+def runs_fig(df, zone, rt, ct, var, units, diff):
+    """One run-changes chart (last 6 runs of the model up to rt, compare run included)."""
     m = meta(var, units)
-    digits = 0 if m["unit"] == "MW" else 1
-    df, rt, ct, _ = _context(run, cmp)
-    diff = view == "diff" and ct is not None
     title = (f"Change in {m['label'].lower()} vs {run_label(ct)}" if diff else m["label"]) + \
         f" - runs up to {run_label(rt) if rt is not None else ''}, {zone}"
     fig = base_fig(title, m["unit"], height=420)
     if df is None or not zone:
-        return finish_fig(fig, zone, m), [], [], []
+        return finish_fig(fig, zone, m), pd.DataFrame(), []
     show = [r for r in runs(df, rk_model(rt)) if rk_ts(r) <= rk_ts(rt)][:6]
     if ct is not None and ct not in show:
         show = show[:5] + [ct]  # always include the compare run
@@ -955,8 +1019,31 @@ def run_changes(zone, run, cmp, var, units, view, tab):
     if diff and fig.data:
         fig.add_hline(y=0, line=dict(color=MUTED, width=1))
     finish_fig(fig, zone, m, diff=diff)
+    return fig, d, show
+
+
+@app.callback(Output("g-runs-solar", "figure"), Output("g-runs-wind", "figure"),
+              Output("g-runs-temp", "figure"),
+              Output("t-runs", "data"), Output("t-runs", "columns"),
+              Output("t-runs", "style_data_conditional"),
+              Input("zone", "value"), Input("run", "value"), Input("cmp", "value"),
+              Input("runs-var", "value"), Input("units", "value"), Input("view", "value"), Input("tab", "value"))
+def run_changes(zone, run, cmp, var, units, view, tab):
+    if tab != "runs":
+        raise PreventUpdate
+    m = meta(var, units)
+    digits = 0 if m["unit"] == "MW" else 1
+    df, rt, ct, _ = _context(run, cmp)
+    diff = view == "diff" and ct is not None
+    figs, d, show = [], pd.DataFrame(), []
+    for v in VARS:   # solar, wind, temperature
+        fig_v, d_v, show_v = runs_fig(df, zone, rt, ct, v, units, diff)
+        figs.append(fig_v)
+        if v == var:
+            d, show = d_v, show_v
     if d.empty:
-        return fig, [], [], []
+        return (*figs, [], [], [])
+
     wide = daily(d, var).pivot(index="day", columns="run_time", values=var).sort_index()
     if diff and ct in wide.columns:
         wide = wide.sub(wide[ct], axis=0).drop(columns=[ct]).dropna(how="all")
@@ -975,40 +1062,55 @@ def run_changes(zone, run, cmp, var, units, view, tab):
             cid = run_label(c)
             style += [{"if": {"column_id": cid, "filter_query": f"{{{cid}}} > 0"}, "backgroundColor": "rgba(235,104,52,0.18)"},
                       {"if": {"column_id": cid, "filter_query": f"{{{cid}}} < 0"}, "backgroundColor": "rgba(42,120,214,0.18)"}]
-    return fig, rows, cols, style
+    return (*figs, rows, cols, style)
 
 
-@app.callback(Output("t-countries", "data"), Output("t-countries", "columns"),
-              Output("t-countries", "style_data_conditional"), Output("c-note", "children"),
-              Input("run", "value"), Input("cmp", "value"), Input("c-var", "value"),
-              Input("view", "value"), Input("units", "value"), Input("tab", "value"))
-def countries(run, cmp, var, mode, units, tab):
-    if tab != "countries":
-        raise PreventUpdate
-    df, rt, ct, why = _context(run, cmp)
-    if df is None:
-        return [], [], [], ""
+C_VARS = {"solar": "solar_wm2", "wind": "wind100_ms", "temp": "temp_c"}   # display order
+
+
+def country_table(df, rt, ct, why, var, mode, units):
+    """Countries x days table for one variable -> rows, cols, style, title, note."""
     m = meta(var, units)
+    title = f"{m['label']} ({m['unit']})"
+    if df is None:
+        return [], [], [], title, ""
     digits = 0 if m["unit"] == "MW" else 1
     d = data(units, var, [rt, ct])
     if d.empty:
-        return [], [], [], "No MW data yet - run ecmwf_mw.py." if units == "mw" else ""
+        return [], [], [], title, ("No MW data yet - run ecmwf_mw.py." if units == "mw" else "")
     cur = daily(d[d.run_time == rt], var).pivot(index="zone", columns="day", values=var)
     note = f"Daily average {m['label'].lower()} ({m['unit']}), run {run_label(rt)}."
     diverging = False
     if mode == "diff":
         if ct is None:
-            return [], [], [], why
+            return [], [], [], title, why
         prev = daily(d[d.run_time == ct], var).pivot(index="zone", columns="day", values=var)
         cur = (cur - prev).dropna(axis=1, how="all")
+        title = f"Change in {m['label'].lower()} ({m['unit']})"
         note = (f"Change in daily average {m['label'].lower()} ({m['unit']}): run {run_label(rt)} minus "
                 f"{run_label(ct)}. Orange = higher, blue = lower. Only days both runs cover.")
         diverging = True
     if cur.dropna(how="all").empty:
-        return [], [], [], f"No {m['label'].lower()} values for {run_label(rt)}" + (
+        return [], [], [], title, f"No {m['label'].lower()} values for {run_label(rt)}" + (
             " - no MW model for this model yet (runs ecmwf_mw.py tonight)." if units == "mw" else ".")
     rows, cols, style = heat_table(cur, lambda c: pd.Timestamp(c).strftime("%a %d"), digits, diverging)
-    return rows, cols, style, note
+    return rows, cols, style, title, note
+
+
+@app.callback([o for v in C_VARS for o in (
+                  Output(f"t-countries-{v}", "data"), Output(f"t-countries-{v}", "columns"),
+                  Output(f"t-countries-{v}", "style_data_conditional"),
+                  Output(f"c-title-{v}", "children"), Output(f"c-note-{v}", "children"))],
+              Input("run", "value"), Input("cmp", "value"),
+              Input("view", "value"), Input("units", "value"), Input("tab", "value"))
+def countries(run, cmp, mode, units, tab):
+    if tab != "countries":
+        raise PreventUpdate
+    df, rt, ct, why = _context(run, cmp)
+    out = []
+    for v, var in C_VARS.items():
+        out += list(country_table(df, rt, ct, why, var, mode, units))
+    return out
 
 
 def ec_gfs_pair(df, run):
@@ -1195,7 +1297,22 @@ def seasonal(zone, run, var, tmodel, units, view, tab):
     return fig, rows, cols, style, " ".join(notes), title
 
 
-ENTSOE_DB = HERE.parent / "entsoe_scraper" / "entsoe_data.db"
+
+
+def _entsoe_db_default():
+    """entsoe_data.db wherever it lives (see entsoe_scraper/entsoe_db.py)."""
+    import sys
+    folder = str(HERE.parent / "entsoe_scraper")
+    if folder not in sys.path:
+        sys.path.append(folder)
+    try:
+        from entsoe_db import entsoe_db_path
+        return entsoe_db_path()
+    except ImportError:
+        return HERE.parent / "entsoe_scraper" / "entsoe_data.db"
+
+
+ENTSOE_DB = _entsoe_db_default()
 ACC_DAYS = 14
 
 
@@ -1477,6 +1594,281 @@ def ec46(zone, erun, cmp, var, mode, units, tab):
         out.append(drow)
         out_style.append({"if": {"row_index": len(out) - 1}, "fontStyle": "italic", "color": MUTED})
     return fig, out, cols, out_style, note
+
+
+# ---------------------------------------------------------------- ensembles (ens_scraper.py)
+ENS_COL = {("temp_c", "weather"): "temp_c", ("temp_c", "mw"): "temp_c",
+           ("wind100_ms", "weather"): "wind_ms", ("wind100_ms", "mw"): "wind_mw",
+           ("solar_wm2", "weather"): "solar_wm2", ("solar_wm2", "mw"): "solar_mw"}
+
+
+def ens_label(model, ts) -> str:
+    return f"{ENS_MODELS.get(model, model)} {pd.Timestamp(ts):%a %d %b %Hz}"
+
+
+def _ens_cache():
+    load()
+    c = _cache.setdefault("ens", {})
+    if c.get("key") != _cache.get("key"):
+        c.clear()
+        c["key"] = _cache.get("key")
+    return c
+
+
+def ens_runs(model) -> list:
+    """Stored ensemble run times (UTC Timestamps) for one model, newest first."""
+    c = _ens_cache()
+    if "runs" not in c:
+        conn = _connect()
+        try:
+            has = conn.execute("SELECT 1 FROM sqlite_master WHERE name='ens_fetch_log'").fetchone()
+            r = pd.read_sql_query("SELECT model, run_time, zones, status FROM ens_fetch_log WHERE zones > 0",
+                                  conn) if has else pd.DataFrame(columns=["model", "run_time", "zones", "status"])
+        finally:
+            conn.close()
+        r["run_time"] = pd.to_datetime(r["run_time"], utc=True)
+        c["runs"] = r
+    r = c["runs"]
+    return sorted(r[r.model == model].run_time, reverse=True)
+
+
+def ens_hourly(model, ts) -> pd.DataFrame:
+    c = _ens_cache()
+    k = ("h", model, pd.Timestamp(ts).isoformat())
+    if k not in c:
+        conn = _connect()
+        try:
+            d = pd.read_sql_query("SELECT * FROM ens_hourly WHERE model=? AND run_time=?", conn,
+                                  params=[model, pd.Timestamp(ts).isoformat()])
+        finally:
+            conn.close()
+        d["valid_time"] = pd.to_datetime(d["time_utc"], utc=True).dt.tz_convert(TZ)
+        c[k] = d
+    return c[k]
+
+
+def ens_daily(model, ts) -> pd.DataFrame:
+    """Daily statistics across members (exact: from the per-member daily means)."""
+    c = _ens_cache()
+    k = ("d", model, pd.Timestamp(ts).isoformat())
+    if k not in c:
+        conn = _connect()
+        try:
+            d = pd.read_sql_query("SELECT * FROM ens_member_daily WHERE model=? AND run_time=?", conn,
+                                  params=[model, pd.Timestamp(ts).isoformat()])
+        finally:
+            conn.close()
+        out = []
+        for q in ("temp_c", "wind_ms", "solar_wm2", "wind_mw", "solar_mw"):
+            g = d.groupby(["zone", "day"])[q]
+            out.append(pd.DataFrame({q: g.mean(), q + "_p10": g.quantile(0.1), q + "_p90": g.quantile(0.9),
+                                     q + "_min": g.min(), q + "_max": g.max()}))
+        res = pd.concat(out, axis=1).reset_index() if out and not d.empty else pd.DataFrame()
+        if not res.empty:
+            res["day"] = pd.to_datetime(res["day"])
+        c[k] = res
+    return c[k]
+
+
+def ens_resolve(cmp, ts, all_runs):
+    older = [r for r in all_runs if r < ts]
+    if cmp in (CMP_PREV, None):
+        return older[0] if older else None
+    if cmp in (CMP_P00, CMP_P12):
+        h = 0 if cmp == CMP_P00 else 12
+        hit = [r for r in older if r.hour == h]
+        return hit[0] if hit else None
+    if cmp == "day":
+        hit = [r for r in older if abs(r - (ts - pd.Timedelta(days=1))) <= pd.Timedelta(hours=3)]
+        return hit[0] if hit else None
+    if cmp == "none":
+        return None
+    try:
+        t = pd.Timestamp(cmp)
+        return t if t in older or t in all_runs and t != ts else None
+    except Exception:
+        return None
+
+
+@app.callback(Output("n-run", "options"), Output("n-run", "value"), Output("n-cmp", "options"),
+              Input("tab", "value"), Input("n-model", "value"), Input("n-run", "value"), Input("upd-done", "data"))
+def ens_options(tab, model, cur, _done):
+    if tab != "ens":
+        raise PreventUpdate
+    rs = ens_runs(model)
+    opts = [{"label": ens_label(model, r), "value": r.isoformat()} for r in rs]
+    vals = [o["value"] for o in opts]
+    sel = cur if (cur in vals and ctx.triggered_id not in ("n-model", "upd-done")) else (vals[0] if vals else None)
+    ts = pd.Timestamp(sel) if sel else None
+
+    def lab(text, kind):
+        if ts is None:
+            return text
+        c = ens_resolve(kind, ts, rs)
+        return f"{text} ({c:%a %d %b %Hz})" if c is not None else f"{text} (none stored)"
+    cmp_opts = ([{"label": lab("Previous run", CMP_PREV), "value": CMP_PREV},
+                 {"label": lab("Previous 00z run", CMP_P00), "value": CMP_P00},
+                 {"label": lab("Previous 12z run", CMP_P12), "value": CMP_P12},
+                 {"label": lab("1 day earlier", "day"), "value": "day"},
+                 {"label": "Nothing", "value": "none"}] + opts)
+    return opts, sel, cmp_opts
+
+
+def _ens_day_table(dd, cd, zone, col, digits):
+    """Selected country: rows Mean/P10/P90/Min/Max (+ change rows) x days."""
+    a = dd[dd.zone == zone].set_index("day").sort_index()
+    if a.empty or col not in a:
+        return [], [], []
+    days = list(a.index)
+    ids = {d: "c" + pd.Timestamp(d).strftime("%Y%m%d") for d in days}
+    cols = [{"name": "", "id": "stat"}] + [{"name": pd.Timestamp(d).strftime("%a %d"), "id": ids[d],
+                                            "type": "numeric"} for d in days]
+    rows, style = [], [{"if": {"column_id": "stat"}, "textAlign": "left", "fontWeight": 600}]
+    stats = [("Mean", ""), ("P10 (low case)", "_p10"), ("P90 (high case)", "_p90"), ("Min", "_min"), ("Max", "_max")]
+    for name, suf in stats:
+        rows.append({"stat": name, **{ids[d]: (None if pd.isna(a.loc[d, col + suf]) else
+                                               round(float(a.loc[d, col + suf]), digits)) for d in days}})
+    if cd is not None and not cd.empty:
+        b = cd[cd.zone == zone].set_index("day")
+        for name, suf in stats[:3]:
+            r = {"stat": f"Δ {name.split(' ')[0]} vs compare"}
+            for d in days:
+                v = (a.loc[d, col + suf] - b.loc[d, col + suf]) if d in b.index else float("nan")
+                r[ids[d]] = None if pd.isna(v) else round(float(v), digits)
+                if pd.notna(v) and v != 0:
+                    style.append({"if": {"row_index": len(rows), "column_id": ids[d]},
+                                  "backgroundColor": "rgba(235,104,52,0.18)" if v > 0 else "rgba(42,120,214,0.18)"})
+            style.append({"if": {"row_index": len(rows)}, "fontStyle": "italic", "color": MUTED})
+            rows.append(r)
+    spread = (a[col + "_p90"] - a[col + "_p10"])
+    hi = float(spread.max()) if spread.notna().any() else 1
+    for d in days:  # shade the P10/P90 rows by the spread: darker = more uncertain
+        v = spread.get(d)
+        if pd.notna(v) and hi > 0:
+            for ri in (1, 2):
+                style.append({"if": {"row_index": ri, "column_id": ids[d]},
+                              "backgroundColor": f"rgba(42,120,214,{0.05 + 0.4 * v / hi:.2f})"})
+    return rows, cols, style
+
+
+@app.callback(Output("g-ens", "figure"), Output("t-ens", "data"), Output("t-ens", "columns"),
+              Output("t-ens", "style_data_conditional"), Output("t-ens-c", "data"), Output("t-ens-c", "columns"),
+              Output("t-ens-c", "style_data_conditional"), Output("n-note", "children"),
+              Output("n-showing", "children"), Output("n-t1-title", "children"), Output("n-t2-title", "children"),
+              Input("zone", "value"), Input("n-model", "value"), Input("n-run", "value"), Input("n-cmp", "value"),
+              Input("n-var", "value"), Input("units", "value"), Input("view", "value"), Input("tab", "value"))
+def ensembles(zone, model, run, cmp, var, units, view, tab):
+    if tab != "ens":
+        raise PreventUpdate
+    m = meta(var, units)
+    is_mw = m["unit"] == "MW"
+    digits = 0 if is_mw else 1
+    col = ENS_COL[(var, "mw" if is_mw else "weather")]
+    diff = view == "diff"
+    name = ENS_MODELS.get(model, model)
+    fig = base_fig(f"{name} {m['label'].lower()}, {zone}", m["unit"], height=440)
+    empty = (finish_fig(fig, zone, m), [], [], [], [], [], [])
+    rs = ens_runs(model)
+    if not rs or not run:
+        return (*empty, f"No {name} runs stored yet - run ens_scraper.py (or Check for new data).", [], "", "")
+    ts = pd.Timestamp(run)
+    cts = ens_resolve(cmp, ts, rs)
+    h = ens_hourly(model, ts)
+    hz = h[h.zone == zone].sort_values("valid_time")
+    hc = ens_hourly(model, cts) if cts is not None else None
+    hcz = hc[hc.zone == zone].sort_values("valid_time") if hc is not None else None
+    nmem = int(hz["members"].max()) if not hz.empty else 0
+
+    # deterministic run of the same model and run time (or the latest before)
+    df = load()
+    det_model = ENS_DET[model]
+    det_runs = [r for r in runs(df, det_model) if rk_ts(r) <= ts] if not df.empty else []
+    det = det_runs[0] if det_runs else None
+
+    banner = [html.Span("Showing", style={"fontSize": "13px", "color": MUTED, "fontWeight": 600}),
+              pill(ens_label(model, ts), PALETTE[0])]
+    if cts is not None:
+        banner += [html.Span("compared with", style={"fontSize": "13px", "color": MUTED}),
+                   pill(ens_label(model, cts), PALETTE[1], solid=False)]
+    if det is not None:
+        banner += [html.Span("· line:", style={"fontSize": "13px", "color": MUTED}),
+                   html.Span(run_label(det), style={"fontSize": "13px", "fontWeight": 600})]
+    if rs[0] != ts:
+        banner.append(html.Span(f"(not the newest {name} run - newest is {rs[0]:%a %d %b %Hz})",
+                                style={"fontSize": "13px", "color": "#b45309"}))
+
+    title = f"{name} {m['label'].lower()}, {zone} · {ens_label(model, ts)}"
+    if diff:
+        title = f"{name} change in {m['label'].lower()}, {zone} · {ens_label(model, ts)} minus " + \
+            (ens_label(model, cts) if cts is not None else "(nothing to compare)")
+    fig = base_fig(title, m["unit"], height=440)
+    if hz.empty or hz[col].isna().all():
+        msg = f"No {m['label'].lower()} for {zone} in this run" + (
+            " - no MW fit for this country." if is_mw else ".")
+        return (finish_fig(fig, zone, m), [], [], [], [], [], [], msg, banner, "", "")
+
+    x = hz["valid_time"]
+    if diff:
+        if hcz is not None and not hcz.empty:
+            j = hz[["valid_time", col, col + "_p10", col + "_p90"]].merge(
+                hcz[["valid_time", col, col + "_p10", col + "_p90"]], on="valid_time", suffixes=("", "_c"))
+            for c_ in (col, col + "_p10", col + "_p90"):
+                j[c_] = j[c_] - j[c_ + "_c"]
+            add_diff(fig, j, col, m, "Change in mean")
+            for suf, nm, dash in (("_p10", "P10", "dot"), ("_p90", "P90", "dash")):
+                fig.add_trace(go.Scatter(x=j["valid_time"], y=j[col + suf], mode="lines", name=f"Change {nm}",
+                                         line=dict(color=MUTED, width=1, dash=dash),
+                                         hovertemplate=f"Change {nm}: %{{y:+{m['fmt']}}} {m['unit']}<extra></extra>"))
+    else:
+        for lo, hi, alpha, nm in ((col + "_min", col + "_max", 0.10, "Min-max"),
+                                  (col + "_p10", col + "_p90", 0.25, "P10-P90")):
+            fig.add_trace(go.Scatter(x=x, y=hz[hi], mode="lines", line=dict(width=0), hoverinfo="skip",
+                                     showlegend=False))
+            fig.add_trace(go.Scatter(x=x, y=hz[lo], mode="lines", line=dict(width=0), fill="tonexty",
+                                     fillcolor=f"rgba(42,120,214,{alpha})", name=nm,
+                                     customdata=hz[hi],
+                                     hovertemplate=f"{nm}: %{{y:{m['fmt']}}} - %{{customdata:{m['fmt']}}} "
+                                                   f"{m['unit']}<extra></extra>"))
+        if hcz is not None and not hcz.empty:
+            add_series(fig, as_var(hcz, col, var), var, f"Mean {cts:%d %b %Hz}", PALETTE[1],
+                       dash="dash", width=1.8, m=m, label_shift=-10)
+        if det is not None:
+            dd_ = data(units, var, [det])
+            dd_ = dd_[dd_.zone == zone] if not dd_.empty else dd_
+            if not dd_.empty:
+                add_series(fig, dd_[dd_.valid_time <= x.max()], var, run_label(det), INK, dash="dot",
+                           width=1.4, m=m, label_shift=22)
+        add_series(fig, as_var(hz, col, var), var, f"Mean {ts:%d %b %Hz}", PALETTE[0], width=2.6, m=m,
+                   label_shift=8 if hcz is not None else 0)
+        if units == "mw" or var == "temp_c":
+            add_normal(fig, zone, var, units, x.min(), x.max())
+    finish_fig(fig, zone, m, diff=diff)
+
+    # tables
+    dd = ens_daily(model, ts)
+    cd = ens_daily(model, cts) if cts is not None else None
+    rows1, cols1, sty1 = _ens_day_table(dd, cd, zone, col, digits) if not dd.empty else ([], [], [])
+    t1 = (f"{zone}: daily averages across the {nmem} members ({m['unit']}) - "
+          f"P10/P90 shaded darker where the members disagree more")
+    rows2, cols2, sty2, t2 = [], [], [], ""
+    if not dd.empty and col in dd:
+        wide = dd.pivot(index="zone", columns="day", values=col)
+        lab = lambda c: pd.Timestamp(c).strftime("%a %d")
+        if diff:
+            if cd is not None and not cd.empty:
+                wide = (wide - cd.pivot(index="zone", columns="day", values=col)).dropna(axis=1, how="all")
+                rows2, cols2, sty2 = heat_table(wide, lab, digits, True)
+                t2 = f"All countries: change in daily ensemble mean vs {ens_label(model, cts)} ({m['unit']})"
+        else:
+            rows2, cols2, sty2 = heat_table(wide, lab, digits, False)
+            t2 = f"All countries: daily ensemble mean ({m['unit']})"
+    note = (f"Blue band dark = 80 % of members (P10-P90), light = all members (min-max); thick blue = ensemble "
+            f"mean; dotted black = the deterministic {MODELS[det_model]} run; orange dashed = compare run's mean. "
+            f"{nmem} members, hourly. Weather is the average of 3 land points per country, scaled to the "
+            f"{MODELS[det_model]} level; MW per member with the {MODELS[det_model]} MW fit.")
+    if cmp not in ("none",) and cts is None:
+        note += " Nothing stored to compare with yet."
+    return fig, rows1, cols1, sty1, rows2, cols2, sty2, note, banner, t1, t2
 
 
 # ---------------------------------------------------------------- main

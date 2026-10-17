@@ -60,6 +60,11 @@ except Exception:  # noqa: BLE001 - e.g. entsoe-py not installed for this Python
 
 DEFAULT_PORT = 8052
 DB_NAME = "entsoe_data.db"
+try:  # where the database lives (entsoe_db_location.txt), see entsoe_db.py
+    from entsoe_db import entsoe_db_path as _edp
+    _ENTSOE_DB = _edp()
+except ImportError:
+    _ENTSOE_DB = None
 
 
 # =====================================================================
@@ -72,6 +77,7 @@ def find_db(cli_path=None):
         return Path(cli_path).expanduser().resolve()
     here = Path(__file__).resolve().parent
     candidates = [
+        *([_ENTSOE_DB] if _ENTSOE_DB else []),
         here / DB_NAME,
         here / "Claude outputs" / DB_NAME,
         here.parent / DB_NAME,
