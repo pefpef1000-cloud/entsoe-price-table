@@ -900,19 +900,23 @@ def load_auction_calendar(first_day: str) -> pd.DataFrame:
     auction slot: same close time, open time, tenor and delivery period ->
     one row, with all its corridors. Columns: closes, opens (CET
     Timestamps), horizon_name, delivery, corridors (list), cancelled (list
-    of the corridors JAO marked cancelled). The Auction calendar tab
-    (Peter, 2026-10-13: "make a new tab with the auction calendar")."""
+    of the corridors JAO marked cancelled), prices / price_notes (lists in
+    the same order as corridors - _auction_price_details(); None / "no
+    result yet" until JAO publishes the result). The Auction calendar tab
+    (Peter, 2026-10-13: "make a new tab with the auction calendar"; prices
+    2026-10-18: "add the auction price after status")."""
     frag, params = _horizon_exclusion()
     since = pd.Timestamp(first_day, tz="CET").tz_convert("UTC")
     conn = _connect()
     df = pd.read_sql_query(
-        f"""SELECT corridor_code, horizon_name, cancelled, bid_gate_opening,
+        f"""SELECT identification, corridor_code, horizon_name, cancelled, bid_gate_opening,
                    bid_gate_closure, market_period_start, market_period_stop
             FROM auctions
             WHERE {frag} AND bid_gate_closure >= ?""",
         conn, params=params + (since.strftime("%Y-%m-%dT%H:%M"),))
     conn.close()
-    cols = ["closes", "opens", "horizon_name", "delivery", "corridors", "cancelled"]
+    cols = ["closes", "opens", "horizon_name", "delivery", "corridors", "cancelled",
+            "prices", "price_notes"]
     if df.empty:
         return pd.DataFrame(columns=cols)
     df["closes"] = pd.to_datetime(df["bid_gate_closure"], utc=True).dt.tz_convert("CET")
@@ -924,9 +928,13 @@ def load_auction_calendar(first_day: str) -> pd.DataFrame:
     df["dstart"] = start
     df = df.sort_values("corridor_code")
     df["cancel_code"] = df["corridor_code"].where(df["cancelled"].fillna(0).astype(int) == 1)
+    details = _auction_price_details(tuple(df["identification"]))
+    df["price"] = [details[i][0] for i in df["identification"]]
+    df["price_note"] = [details[i][1] for i in df["identification"]]
     out = (df.groupby(["closes", "opens", "horizon_name", "delivery", "dstart"], dropna=False)
              .agg(corridors=("corridor_code", list),
-                  cancelled=("cancel_code", lambda s: [c for c in s if isinstance(c, str)]))
+                  cancelled=("cancel_code", lambda s: [c for c in s if isinstance(c, str)]),
+                  prices=("price", list), price_notes=("price_note", list))
              .reset_index())
     rank = {t: i for i, t in enumerate(TENOR_ORDER)}
     out["_t"] = out["horizon_name"].map(rank).fillna(len(rank))
@@ -1232,6 +1240,31 @@ def num(value, decimals):
     return f"{value:.{decimals}f}" if pd.notna(value) else "-"
 
 
+def _calendar_price_cell(r, now: pd.Timestamp) -> str:
+    """Auction calendar, price column (Peter, 2026-10-18: "add the auction
+    price after status"): each corridor's clearing price, "AT-DE 1.32 ·
+    DE-AT 24.39", once JAO has published the result. Empty while the slot
+    is upcoming / open; "result pending" once closed but not published;
+    cancelled corridors left out. A bundle (CEEXD) shows its border prices."""
+    if now < r.closes:
+        return ""
+    esc = html_escape
+    parts = []
+    for code, price, note in zip(r.corridors, r.prices, r.price_notes):
+        if code in r.cancelled:
+            continue
+        peak = " peak" if "peak" in (note or "") else ""
+        if price is not None and not pd.isna(price):
+            parts.append(f'<span class="code pc">{esc(code)}</span> {price:.2f}{peak}')
+        elif note and not note.startswith("no result"):
+            parts.append(f'<span class="code pc">{esc(code)}</span> {esc(note)}')
+    if parts:
+        return " · ".join(parts)
+    if all(c in r.cancelled for c in r.corridors):
+        return ""
+    return '<span class="cnt">result pending</span>'
+
+
 def render_calendar_html(cal: pd.DataFrame, now: pd.Timestamp) -> str:
     """The Auction calendar as one HTML table (one text, not one Dash
     component per cell - see the dashboard standard), painted by CAL_PAINT_JS.
@@ -1242,7 +1275,8 @@ def render_calendar_html(cal: pd.DataFrame, now: pd.Timestamp) -> str:
     esc = html_escape
     today = now.normalize()
     out = ['<table class="cal"><thead><tr><th>Closes</th><th>Opens</th><th>Tenor</th>'
-           '<th>Delivery</th><th>Corridors</th><th>Status</th></tr></thead><tbody>']
+           '<th>Delivery</th><th>Corridors</th><th>Status</th>'
+           '<th>Auction price (EUR/MW)</th></tr></thead><tbody>']
     anchored = False
     for day, rows in cal.groupby(cal["closes"].dt.normalize(), sort=True):
         cls = ["day"]
@@ -1256,7 +1290,7 @@ def render_calendar_html(cal: pd.DataFrame, now: pd.Timestamp) -> str:
         label = f"{day:%A} {day.day} {_MONTH_ABBR[day.month - 1]} {day.year}"
         if day == today:
             label += " - today"
-        out.append(f'<tr class="{" ".join(cls)}"{anchor}><th colspan="6">{esc(label)}</th></tr>')
+        out.append(f'<tr class="{" ".join(cls)}"{anchor}><th colspan="7">{esc(label)}</th></tr>')
         for r in rows.itertuples():
             live = [c for c in r.corridors if c not in r.cancelled]
             if not live:
@@ -1278,7 +1312,8 @@ def render_calendar_html(cal: pd.DataFrame, now: pd.Timestamp) -> str:
                 f'<td><span class="tdot" style="background:{color}"></span>{esc(r.horizon_name)}</td>'
                 f"<td>{esc(r.delivery)}</td>"
                 f'<td class="corr">{corr} <span class="cnt">({len(r.corridors)})</span></td>'
-                f"<td>{status}</td></tr>")
+                f"<td>{status}</td>"
+                f'<td class="price">{_calendar_price_cell(r, now)}</td></tr>')
     out.append("</tbody></table>")
     return "".join(out)
 
@@ -1483,6 +1518,8 @@ table.cal tr.day.today th {{ color:{INK['accent']}; }}
 table.cal tr.past td, table.cal tr.day.past th {{ color:{INK['muted']}; opacity:.75; }}
 table.cal td {{ white-space:nowrap; }}
 table.cal td.corr {{ white-space:normal; max-width:560px; }}
+table.cal td.price {{ white-space:normal; max-width:420px; font-variant-numeric:tabular-nums; }}
+table.cal .pc {{ color:{INK['muted']}; }}
 table.cal .code {{ white-space:nowrap; }}
 .tdot {{ display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }}
 .st {{ display:inline-block; padding:1px 8px; border-radius:9px; font-size:12px; white-space:nowrap; }}
