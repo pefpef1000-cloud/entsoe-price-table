@@ -17,6 +17,11 @@ load (Base, Peak, Off-peak). One row per delivery period:
     Spot - futures   positive = spot came out ABOVE the futures price
                      (a buyer of the future gained)
 
+"Spread vs" (added 2026-10-18): pick a second country B and every number
+becomes the spread A - B: futures spread before delivery vs the spread the
+two day-ahead markets actually delivered (long A / short B gained when the
+spot spread came out above the futures spread).
+
 Load hours (CET/CEST):
     Peak       08:00-20:00 Mon-Fri (EEX peak). Weekend and ES "Mon-Sun" peak
                products: 08:00-20:00 every day.
@@ -450,6 +455,50 @@ def build(market: str, maturity: str, load: str, today: date | None = None):
     return out, zone, notes
 
 
+def build_spread(market: str, other: str, maturity: str, load: str, today: date | None = None):
+    """Same rows as build(), but every price is the spread market - other.
+    Only delivery periods both markets have. Extra columns: each leg's spot."""
+    a, zone_a, notes_a = build(market, maturity, load, today)
+    b, zone_b, notes_b = build(other, maturity, load, today)
+    notes = [f"{market}: {n}" for n in notes_a] + [f"{other}: {n}" for n in notes_b]
+    if a.empty or b.empty:
+        return pd.DataFrame(), (zone_a, zone_b), notes
+    m = a.merge(b, on="start", suffixes=("", "_b"))
+    if m.empty:
+        notes.append(f"{market} and {other} have no {maturity.lower()} delivery in common yet.")
+        return pd.DataFrame(), (zone_a, zone_b), notes
+
+    def sub(x, y):
+        return num(x - y) if pd.notna(x) and pd.notna(y) else None
+
+    rows = []
+    for r in m.to_dict("records"):
+        fut_t = sub(r["Last traded"], r["Last traded_b"])
+        fut_s = sub(r["Last settle"], r["Last settle_b"])
+        spot = sub(r["Spot outcome"], r["Spot outcome_b"])
+        a_day, b_day = r["Last trade day"], r["Last trade day_b"]
+        s_a, s_b = r["Status"], r["Status_b"]
+        rows.append({
+            "start": r["start"], "Delivery": r["Delivery"],
+            "Status": s_a if s_a == s_b else f"{market}: {s_a} | {other}: {s_b}",
+            "Last trade day": a_day if a_day == b_day else f"{a_day} / {b_day}",
+            "Trades": None,
+            "Last traded": fut_t,
+            "Settle day": r["Settle day"] if r["Settle day"] == r["Settle day_b"]
+                          else f"{r['Settle day']} / {r['Settle day_b']}",
+            "Last settle": fut_s,
+            "Spot A": r["Spot outcome"], "Spot B": r["Spot outcome_b"],
+            "Spot outcome": spot,
+            "Spot − last traded": sub(spot, fut_t) if spot is not None and fut_t is not None else None,
+            "Spot − last settle": sub(spot, fut_s) if spot is not None and fut_s is not None else None,
+            "EEX final settle": sub(r["EEX final settle"], r["EEX final settle_b"]),
+            "complete": bool(r["complete"] and r["complete_b"]),
+            "currency": r["currency"] if r["currency"] == r["currency_b"] else "mixed",
+        })
+    out = pd.DataFrame(rows).sort_values("start", ascending=False)
+    return out, (zone_a, zone_b), notes
+
+
 def num(v):
     return None if v is None or pd.isna(v) else round(float(v), 2)
 
@@ -482,6 +531,8 @@ def full_layout():
         html.Div([
             ctl("Country", dcc.Dropdown(id="market", clearable=False, persistence=True,
                                         persistence_type="local", style={"width": 230})),
+            ctl("Spread vs", dcc.Dropdown(id="other", clearable=False, persistence=True,
+                                          persistence_type="local", style={"width": 230})),
             ctl("Period", seg("maturity", [{"label": l, "value": v} for v, l in PERIODS], "Week")),
             ctl("Load", seg("load", LOADS, "Base")),
             ctl("Compare spot with", seg("basis", ["Last traded", "Last settle"], "Last traded")),
@@ -514,8 +565,9 @@ app.validation_layout = full_layout()
 # Callbacks
 # ---------------------------------------------------------------------
 @app.callback(Output("market", "options"), Output("market", "value"),
-              Input("market", "id"), State("market", "value"))
-def markets(_, current):
+              Output("other", "options"), Output("other", "value"),
+              Input("market", "id"), State("market", "value"), State("other", "value"))
+def markets(_, current, other):
     con = load_contracts()
     have = set(con["market"])
     with_spot = sorted(m for m in have if SPOT_ZONE.get(m))
@@ -524,7 +576,11 @@ def markets(_, current):
     opts = [{"label": m + (f"  (spot {SPOT_ZONE[m]})" if SPOT_ZONE.get(m) else "  (no spot)"),
              "value": m} for m in order]
     value = current if current in order else (order[0] if order else None)
-    return opts, value
+    # Spread vs: "none" = plain futures vs spot for one country.
+    other_opts = [{"label": "— none (one country) —", "value": "none"}] + \
+        [{"label": o["label"], "value": o["value"]} for o in opts]
+    other = other if other in ["none"] + order else "none"
+    return opts, value, other_opts, other
 
 
 def kpi(caption, value, sub=None):
@@ -542,16 +598,30 @@ def f2(v, sign=False):
 
 @app.callback(Output("body", "children"),
               Input("market", "value"), Input("maturity", "value"),
-              Input("load", "value"), Input("basis", "value"))
-def render(market, maturity, load, basis):
+              Input("load", "value"), Input("basis", "value"), Input("other", "value"))
+def render(market, maturity, load, basis, other):
     if not market:
         return html.Div("No power futures in the database yet.", className="warn")
-    df, zone, notes = build(market, maturity, load)
+    spread = bool(other) and other not in ("none", market)
+    if spread:
+        df, zones, notes = build_spread(market, other, maturity, load)
+        zone = f"{zones[0] or 'none'} − {zones[1] or 'none'}"
+        if None in zones:
+            zone = None
+        name = f"{market} − {other}"
+    else:
+        df, zone, notes = build(market, maturity, load)
+        name = market
     period_name = dict(PERIODS)[maturity]
     kids = [html.Div(n, className="warn") for n in notes]
+    if spread:
+        kids.append(html.Div(f"Spread {market} − {other}: every price below is {market} minus "
+                             f"{other}. Spot − futures > 0 = the delivered spread came out above "
+                             f"the futures spread (long {market} / short {other} gained).",
+                             className="note"))
     if df.empty:
         kids.append(html.Div(
-            f"No {period_name.lower()} for {market} {load.lower()} has a pre-delivery price yet. "
+            f"No {period_name.lower()} for {name} {load.lower()} has a pre-delivery price yet. "
             "Settlements only go back to Aug 2026; older periods appear as the nightly "
             "trade-feed backfill (eex_ohlc_scraper.py) works back towards 2020.",
             className="warn"))
@@ -571,10 +641,11 @@ def render(market, maturity, load, basis):
         kids.append(html.Div([
             kpi("Delivered periods compared", f"{len(done)}",
                 f"{done['Delivery'].iloc[-1]} to {done['Delivery'].iloc[0]}"),
-            kpi(f"Average spot − {basis.lower()}", f2(d.mean(), True), "€/MWh"),
+            kpi(f"Average spot spread − futures spread ({basis.lower()})" if spread
+                else f"Average spot − {basis.lower()}", f2(d.mean(), True), "€/MWh"),
             kpi("Average miss (absolute)", f2(d.abs().mean()), "€/MWh"),
             kpi("Spot above futures", f"{int((d > 0).sum())} of {len(d)}",
-                "buyer of the future gained"),
+                f"long {market} / short {other} gained" if spread else "buyer of the future gained"),
             kpi("Largest miss", f2(d.loc[d.abs().idxmax()], True),
                 done.loc[d.abs().idxmax(), "Delivery"]),
         ], className="kpis"))
@@ -585,17 +656,24 @@ def render(market, maturity, load, basis):
     # Chart: futures price vs spot outcome per delivery, oldest left.
     c = df.iloc[::-1]
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=c["Delivery"], y=c[fut_col], name=f"{fut_col} (before delivery)",
+    what = "spread" if spread else ""
+    fig.add_trace(go.Scatter(x=c["Delivery"], y=c[fut_col],
+                             name=f"Futures {what} ({fut_col.lower()}, before delivery)" if spread
+                             else f"{fut_col} (before delivery)",
                              mode="lines+markers", line=dict(color=SERIES[0], width=2)))
-    fig.add_trace(go.Scatter(x=c["Delivery"], y=c["Spot outcome"], name="Spot outcome",
+    fig.add_trace(go.Scatter(x=c["Delivery"], y=c["Spot outcome"],
+                             name="Spot spread (delivered)" if spread else "Spot outcome",
                              mode="lines+markers", line=dict(color=SERIES[1], width=2)))
+    if spread:
+        fig.add_hline(y=0, line=dict(color=INK["axis"], width=1))
     fig.update_layout(
         height=340, margin=dict(l=60, r=20, t=70, b=40),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Segoe UI, Inter, Arial, sans-serif", size=12, color=INK["muted"]),
         legend=dict(orientation="h", x=0, y=1.0, yanchor="bottom"),
         hovermode="x unified",
-        title=dict(text=f"{market} {load} {period_name.lower()}: futures vs spot (€/MWh)",
+        title=dict(text=(f"{name} {load} {period_name.lower()}: futures spread vs spot spread (€/MWh)"
+                         if spread else f"{market} {load} {period_name.lower()}: futures vs spot (€/MWh)"),
                    x=0, y=0.97, yanchor="top", font=dict(size=14, color=INK["text"])))
     fig.update_yaxes(gridcolor=INK["grid"], zeroline=False)
     fig.update_xaxes(type="category", showgrid=False)
@@ -606,10 +684,22 @@ def render(market, maturity, load, basis):
     cols = ["Delivery", "Status", "Last trade day", "Trades", "Last traded", "Settle day",
             "Last settle", "Spot outcome", "Spot − last traded", "Spot − last settle",
             "EEX final settle"]
-    if load == "Off-peak":
+    if load == "Off-peak" or spread:
         cols.remove("Trades")
+    if spread:
+        cols[cols.index("Spot outcome"):cols.index("Spot outcome")] = ["Spot A", "Spot B"]
     numeric = {"Trades", "Last traded", "Last settle", "Spot outcome", "Spot − last traded",
-               "Spot − last settle", "EEX final settle"}
+               "Spot − last settle", "EEX final settle", "Spot A", "Spot B"}
+    # Column titles; in spread mode the same ids carry spreads.
+    title_of = {c_: c_ for c_ in cols}
+    if spread:
+        title_of.update({"Last traded": f"Futures spread (last traded)",
+                         "Last settle": "Futures spread (last settle)",
+                         "Spot A": f"Spot {market}", "Spot B": f"Spot {other}",
+                         "Spot outcome": "Spot spread",
+                         "Spot − last traded": "Spot spread − futures (traded)",
+                         "Spot − last settle": "Spot spread − futures (settle)",
+                         "EEX final settle": "EEX final settle spread"})
     styles = []
     for col in ("Spot − last traded", "Spot − last settle"):
         styles += [
@@ -621,7 +711,7 @@ def render(market, maturity, load, basis):
                    "backgroundColor": "#fbfaf6", "fontStyle": "italic"})
     kids.append(html.Div(dash_table.DataTable(
         data=df[cols].to_dict("records"),
-        columns=[{"name": c_, "id": c_, "type": "numeric" if c_ in numeric else "text",
+        columns=[{"name": title_of[c_], "id": c_, "type": "numeric" if c_ in numeric else "text",
                   **({"format": {"specifier": ",.2f"}} if c_ in numeric - {"Trades"} else {})}
                  for c_ in cols],
         sort_action="native", page_size=25,
@@ -644,7 +734,9 @@ def render(market, maturity, load, basis):
             html.P("Last traded = last trade price (EEX trade feed) on the last day the contract "
                    "traded before delivery started. Last settle = EEX settlement on the last "
                    "trading day before delivery."),
-            html.P(f"Spot outcome = average day-ahead price ({zone or 'none'}, ENTSO-E) over the "
+            html.P((f"Spread mode: each price is {market} minus {other}, per delivery period both "
+                    "have. " if spread else "") +
+                   f"Spot outcome = average day-ahead price ({zone or 'none'}, ENTSO-E) over the "
                    "delivery hours. Peak = 08-20 Mon-Fri CET; weekend peak = 08-20 Sat-Sun. "
                    "Spot − futures > 0 means spot came out above the futures price." + off),
             html.P("EEX final settle = last settlement EEX published on or after the last "

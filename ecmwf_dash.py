@@ -68,6 +68,8 @@ CMP_P00, CMP_P12 = "prev00", "prev12"  # last earlier 00z / 12z run
 MODELS = {"ifs": "ECMWF", "gfs": "GFS"}
 ENS_MODELS = {"ecmwf": "ECMWF ENS", "gefs": "GEFS"}
 ENS_DET = {"ecmwf": "ifs", "gefs": "gfs"}
+ENS_BANNER = {"display": "flex", "alignItems": "center", "gap": "8px", "flexWrap": "wrap", "margin": "4px 0 4px"}
+GRAPH_VARS = [("solar", "solar_wm2"), ("wind", "wind100_ms"), ("temp", "temp_c")]  # display order (solar, wind, temp)
 
 
 # A run is identified by a key "model|ISO time", e.g. "gfs|2026-10-14T12:00:00+00:00".
@@ -707,10 +709,14 @@ def serve_layout():
                 dash_table.DataTable(id=f"t-countries-{v}", **TABLE_STYLE))],
         ]),
         html.Div(id="panel-ecgfs", children=[
-            html.Div(radio("x-var", "solar_wm2"), style={"margin": "10px 0"}),
-            html.Div(id="x-note", style=NOTE),
+            html.Div(id="x-note", style={**NOTE, "marginTop": "10px"}),
+            dcc.Graph(id="g-x-solar", config={"displaylogo": False}),
+            dcc.Graph(id="g-x-wind", config={"displaylogo": False}),
+            dcc.Graph(id="g-x-temp", config={"displaylogo": False}),
+            html.Div([html.Span("Tiles + table:", style={"fontWeight": 600, "marginRight": "10px"}),
+                      radio("x-var", "solar_wm2")],
+                     style={"display": "flex", "alignItems": "center", "margin": "16px 0 8px"}),
             html.Div(id="x-kpis", style={"display": "flex", "gap": "10px", "flexWrap": "wrap", "marginBottom": "8px"}),
-            dcc.Graph(id="g-x", config={"displaylogo": False}),
             html.H4(id="x-table-title", style={"margin": "12px 0 6px"}),
             dash_table.DataTable(id="t-x", **TABLE_STYLE),
         ]),
@@ -737,22 +743,33 @@ def serve_layout():
         ]),
         html.Div(id="panel-ens", children=[
             html.Div([
-                html.Div([html.Label("Ensemble"), dcc.Dropdown(
-                    id="n-model", value="ecmwf", clearable=False,
-                    options=[{"label": v, "value": k} for k, v in ENS_MODELS.items()])], style={"width": "190px"}),
-                html.Div([html.Label("Run"), dcc.Dropdown(id="n-run", clearable=False)], style={"width": "280px"}),
+                html.Div([html.Label("ECMWF ENS run"), dcc.Dropdown(id="n-run", clearable=False)],
+                         style={"width": "260px"}),
+                html.Div([html.Label("GEFS run"), dcc.Dropdown(id="n-run-g", clearable=False)],
+                         style={"width": "230px"}),
                 html.Div([html.Label("Compare with"), dcc.Dropdown(
                     id="n-cmp", value=CMP_PREV, clearable=False,  # static shortcuts so the value is valid at start
                     options=[{"label": "Previous run", "value": CMP_PREV}, {"label": "Previous 00z run", "value": CMP_P00},
                              {"label": "Previous 12z run", "value": CMP_P12}, {"label": "1 day earlier", "value": "day"},
                              {"label": "Nothing", "value": "none"}])],
-                         style={"width": "330px"}),
-                html.Div(radio("n-var", "solar_wm2"), style={"paddingTop": "24px"}),
+                         style={"width": "200px"}),
             ], style={"display": "flex", "gap": "16px", "margin": "10px 0", "flexWrap": "wrap"}),
-            html.Div(id="n-showing", style={"display": "flex", "alignItems": "center", "gap": "8px",
-                                            "flexWrap": "wrap", "margin": "4px 0 8px"}),
             html.Div(id="n-note", style=NOTE),
-            dcc.Graph(id="g-ens", config={"displaylogo": False}),
+            html.Div(id="n-showing", style=ENS_BANNER),
+            dcc.Graph(id="g-ens-e-solar", config={"displaylogo": False}),
+            dcc.Graph(id="g-ens-e-wind", config={"displaylogo": False}),
+            dcc.Graph(id="g-ens-e-temp", config={"displaylogo": False}),
+            html.Div(id="n-showing-g", style={**ENS_BANNER, "marginTop": "18px"}),
+            dcc.Graph(id="g-ens-g-solar", config={"displaylogo": False}),
+            dcc.Graph(id="g-ens-g-wind", config={"displaylogo": False}),
+            dcc.Graph(id="g-ens-g-temp", config={"displaylogo": False}),
+            html.Div([html.Span("Tables:", style={"fontWeight": 600, "marginRight": "10px"}),
+                      dcc.RadioItems(id="n-model", value="ecmwf", inline=True,
+                                     options=[{"label": v, "value": k} for k, v in ENS_MODELS.items()],
+                                     inputStyle={"marginRight": "4px"}, labelStyle={"marginRight": "14px"}),
+                      html.Span("|", style={"color": GRID, "margin": "0 12px"}),
+                      radio("n-var", "solar_wm2")],
+                     style={"display": "flex", "alignItems": "center", "flexWrap": "wrap", "margin": "16px 0 4px"}),
             html.H4(id="n-t1-title", style={"margin": "12px 0 6px"}),
             dash_table.DataTable(id="t-ens", **TABLE_STYLE),
             html.H4(id="n-t2-title", style={"margin": "16px 0 6px"}),
@@ -764,11 +781,14 @@ def serve_layout():
                 html.Div([html.Label("Compare with"), dcc.Dropdown(id="e-cmp", value=CMP_PREV, clearable=False, options=[
                     {"label": "Previous EC46 run", "value": CMP_PREV}, {"label": "1 week earlier", "value": CMP_WEEK}])],
                          style={"width": "240px"}),
-                html.Div(radio("e-var", "solar_wm2"), style={"paddingTop": "24px"}),
             ], style={"display": "flex", "gap": "16px", "margin": "10px 0", "flexWrap": "wrap"}),
             html.Div(id="e-note", style=NOTE),
-            dcc.Graph(id="g-ec46", config={"displaylogo": False}),
-            html.H4("Weekly averages, all countries", style={"margin": "12px 0 6px"}),
+            dcc.Graph(id="g-ec46-solar", config={"displaylogo": False}),
+            dcc.Graph(id="g-ec46-wind", config={"displaylogo": False}),
+            dcc.Graph(id="g-ec46-temp", config={"displaylogo": False}),
+            html.Div([html.Span("Table:", style={"fontWeight": 600, "marginRight": "10px"}), radio("e-var", "solar_wm2")],
+                     style={"display": "flex", "alignItems": "center", "margin": "16px 0 4px"}),
+            html.H4("Weekly averages, all countries", style={"margin": "8px 0 6px"}),
             dash_table.DataTable(id="t-ec46", **TABLE_STYLE),
         ]),
     ], style={"fontFamily": FONT, "background": BG, "padding": "16px 20px", "minHeight": "100vh", "color": INK})
@@ -1125,38 +1145,85 @@ def ec_gfs_pair(df, run):
     return rk("ifs", c), rk("gfs", c)
 
 
-@app.callback(Output("g-x", "figure"), Output("t-x", "data"), Output("t-x", "columns"),
+def ecgfs_fig(zone, var, units, diff, ri, rg):
+    """One EC vs GFS chart (both lines, or ECMWF minus GFS)."""
+    m = meta(var, units)
+    fig = base_fig((f"ECMWF minus GFS, {m['label'].lower()}" if diff else f"{m['label']}: ECMWF vs GFS")
+                   + f", {zone}" + (f" · both {rk_ts(ri):%a %d %b %Hz}" if ri is not None else ""),
+                   m["unit"], height=320)
+    if ri is None:
+        return finish_fig(fig, zone, m)
+    d = data(units, var, [ri, rg])
+    dz = d[d.zone == zone] if not d.empty else d
+    col = ENS_COL[(var, "mw" if m["unit"] == "MW" else "weather")]
+    ens = {}  # ensemble means of the same run time (or the newest before, within 12 h)
+    for model in ("ecmwf", "gefs"):
+        t = ens_match(model, rk_ts(ri))
+        if t is not None:
+            h = ens_hourly(model, t)
+            h = h[h.zone == zone].sort_values("valid_time")
+            if not h.empty and col in h and h[col].notna().any():
+                ens[model] = (t, as_var(h[["valid_time", col]], col, var))
+    if not dz.empty:
+        if diff:
+            add_diff(fig, diff_series(dz, var, ri, rg, m), var, m, "ECMWF − GFS")
+            if len(ens) == 2:
+                j = ens["ecmwf"][1].merge(ens["gefs"][1], on="valid_time", suffixes=("", "_g"))
+                j[var] = j[var] - j[var + "_g"]
+                fig.add_trace(go.Scatter(x=j["valid_time"], y=j[var], mode="lines", name="ENS means",
+                                         line=dict(color=PALETTE[2], width=1.6, dash="dash"),
+                                         hovertemplate=f"ECMWF ENS − GEFS mean: %{{y:+{m['fmt']}}} {m['unit']}"
+                                                       "<extra></extra>"))
+        else:
+            if "gefs" in ens:
+                add_series(fig, ens["gefs"][1], var, f"GEFS mean {ens['gefs'][0]:%Hz}", PALETTE[1], dash="dot",
+                           width=1.6, m=m, label_shift=-24)
+            if "ecmwf" in ens:
+                add_series(fig, ens["ecmwf"][1], var, f"ECMWF ENS mean {ens['ecmwf'][0]:%Hz}", PALETTE[0],
+                           dash="dot", width=1.6, m=m, label_shift=22)
+            add_series(fig, dz[dz.run_time == rg], var, f"GFS {rk_ts(rg):%Hz}", PALETTE[1], width=2, m=m,
+                       label_shift=-10)
+            add_series(fig, dz[dz.run_time == ri], var, f"ECMWF {rk_ts(ri):%Hz}", PALETTE[0], width=2.5, m=m,
+                       label_shift=8)
+    return finish_fig(fig, zone, m, diff=diff)
+
+
+def ens_match(model, t):
+    """Ensemble run at run time t, else the newest before it (within 12 h), else None."""
+    try:
+        rs = [r for r in ens_runs(model) if r <= t and t - r <= pd.Timedelta(hours=12)]
+    except Exception:
+        return None
+    return rs[0] if rs else None
+
+
+@app.callback(Output("g-x-solar", "figure"), Output("g-x-wind", "figure"), Output("g-x-temp", "figure"),
+              Output("t-x", "data"), Output("t-x", "columns"),
               Output("t-x", "style_data_conditional"), Output("x-note", "children"),
               Output("x-kpis", "children"), Output("x-table-title", "children"),
               Input("zone", "value"), Input("run", "value"), Input("x-var", "value"),
               Input("units", "value"), Input("view", "value"), Input("tab", "value"))
 def ec_vs_gfs(zone, run, var, units, view, tab):
+    """3 charts in the normal order (solar, wind, temperature); tiles + table follow the radio below them."""
     if tab != "ecgfs":
         raise PreventUpdate
     m = meta(var, units)
     digits = 0 if m["unit"] == "MW" else 1
     diff = view == "diff"
-    fig = base_fig((f"ECMWF minus GFS, {m['label'].lower()}" if diff else f"{m['label']}: ECMWF vs GFS")
-                   + f", {zone}", m["unit"], height=420)
     df = load()
+    ri, rg = ec_gfs_pair(df, run) if (not df.empty and run) else (None, None)
+    figs = [ecgfs_fig(zone, v, units, diff, ri, rg) for _, v in GRAPH_VARS]
     if df.empty or not run:
-        return finish_fig(fig, zone, m), [], [], [], "No data.", [], ""
-    ri, rg = ec_gfs_pair(df, run)
+        return (*figs, [], [], [], "No data.", [], "")
     if ri is None:
-        return (finish_fig(fig, zone, m), [], [], [],
+        return (*figs, [], [], [],
                 "No run time that both ECMWF and GFS have (at or before the selected run) - run gfs_scraper.py.",
                 [], "")
-    fig.layout.title.text += f" · both {rk_ts(ri):%a %d %b %Hz}"
     d = data(units, var, [ri, rg])
     if d.empty:
-        return finish_fig(fig, zone, m), [], [], [], "No MW data yet - run ecmwf_mw.py.", [], ""
+        return (*figs, [], [], [], "No MW data yet - run ecmwf_mw.py.", [], "")
     dz = d[d.zone == zone]
-    if diff:
-        add_diff(fig, diff_series(dz, var, ri, rg, m), var, m, "ECMWF − GFS")
-    else:
-        add_series(fig, dz[dz.run_time == rg], var, f"GFS {rk_ts(rg):%Hz}", PALETTE[1], width=2, m=m, label_shift=-10)
-        add_series(fig, dz[dz.run_time == ri], var, f"ECMWF {rk_ts(ri):%Hz}", PALETTE[0], width=2.5, m=m, label_shift=8)
-    finish_fig(fig, zone, m, diff=diff)
+    fig = figs  # returned as (*fig, ...) below
 
     # tiles: next 24 h / 7 days, both models and the gap
     now = pd.Timestamp.now(tz=TZ)
@@ -1184,13 +1251,14 @@ def ec_vs_gfs(zone, run, var, units, view, tab):
             f"'Change vs compare' for ECMWF − GFS.", False
     rows, cols, style = heat_table(wide, lambda c: pd.Timestamp(c).strftime("%a %d"), digits, div)
     note = (f"ECMWF and GFS runs from {rk_ts(ri):%a %d %b %Hz} (the latest run time both have at or before "
-            f"the selected run). ECMWF = blue, GFS = orange.")
+            f"the selected run). ECMWF = blue, GFS = orange; dotted = their ensemble means (ECMWF ENS, GEFS) of "
+            f"the same run time if stored. 'Change vs compare': ECMWF − GFS, green dashed = ECMWF ENS − GEFS mean.")
     for key, name in ((ri, "ECMWF"), (rg, "GFS")):
         if dz[dz.run_time == key][var].notna().sum() == 0:
             note += f" No {name} {m['label'].lower()} values for {zone} in this run."
     if units == "mw":
         note += " " + mw_note(zone, "gfs")
-    return fig, rows, cols, style, note, tiles, title
+    return (*fig, rows, cols, style, note, tiles, title)
 
 
 SEAS_COL = {("temp_c", "weather"): ("temp_c", "temp_anom", "temp_c"),
@@ -1495,22 +1563,60 @@ def ec46_options(tab, _done, cur):
     return opts, (cur if cur in fetches else (fetches[0] if fetches else None)), cmp_opts
 
 
-@app.callback(Output("g-ec46", "figure"), Output("t-ec46", "data"), Output("t-ec46", "columns"),
+def ec46_fig(zone, var, units, mode, main_f, cmp_f):
+    """One EC46 chart (mean + 10-90 % band, or change vs the compare fetch)."""
+    m = meta(var, units)
+    mean_c, p10_c, p90_c = EC_COLS[var]
+    ec = load_ec46(units, var)
+    if mode == "diff":
+        fig = base_fig(f"EC46 change in {m['label'].lower()}, {zone} - {ec46_label(main_f)} minus "
+                       f"{ec46_label(cmp_f) if cmp_f else '(nothing to compare)'}", m["unit"], height=320)
+    else:
+        fig = base_fig(f"EC46 {m['label'].lower()}, {zone} · {ec46_label(main_f)} - ensemble mean with 10-90% range",
+                       m["unit"], height=320)
+    if ec.empty or main_f is None:
+        return finish_fig(fig, zone, m, now_line=False)
+    cur = ec[(ec.fetched_on == main_f) & (ec.zone == zone)].sort_values("day")
+    if mode == "diff":
+        if cmp_f is not None:
+            other = ec[(ec.fetched_on == cmp_f) & (ec.zone == zone)][["day", mean_c]]
+            j = cur[["day", mean_c]].merge(other, on="day", suffixes=("", "_c"))
+            j[mean_c] = j[mean_c] - j[mean_c + "_c"]
+            add_diff(fig, j.dropna(subset=[mean_c]), mean_c, m, "Change", x="day", bars=True)
+    else:
+        if cur[mean_c].notna().any():
+            fig.add_trace(go.Scatter(x=cur["day"], y=cur[p90_c], mode="lines", line=dict(width=0),
+                                     hoverinfo="skip", showlegend=False))
+            fig.add_trace(go.Scatter(x=cur["day"], y=cur[p10_c], mode="lines", line=dict(width=0),
+                                     fill="tonexty", fillcolor="rgba(42,120,214,0.15)",
+                                     hovertemplate=f"10%: %{{y:{m['fmt']}}}<extra></extra>"))
+        if cmp_f is not None:
+            add_series(fig, ec[(ec.fetched_on == cmp_f) & (ec.zone == zone)], mean_c, ec46_label(cmp_f),
+                       PALETTE[1], dash="dash", width=2, m=m, x="day", label_shift=-10)
+        add_series(fig, cur, mean_c, ec46_label(main_f), PALETTE[0], width=2.5, m=m, x="day",
+                   label_shift=8 if cmp_f else 0)
+    return finish_fig(fig, zone, m, now_line=False, diff=mode == "diff")
+
+
+@app.callback(Output("g-ec46-solar", "figure"), Output("g-ec46-wind", "figure"), Output("g-ec46-temp", "figure"),
+              Output("t-ec46", "data"), Output("t-ec46", "columns"),
               Output("t-ec46", "style_data_conditional"), Output("e-note", "children"),
               Input("zone", "value"), Input("e-run", "value"), Input("e-cmp", "value"),
               Input("e-var", "value"), Input("view", "value"), Input("units", "value"), Input("tab", "value"))
 def ec46(zone, erun, cmp, var, mode, units, tab):
+    """3 charts in the normal order (solar, wind, temperature); the table follows the 'Table' choice."""
     if tab != "ec46":
         raise PreventUpdate
     m = meta(var, units)
     is_mw = m["unit"] == "MW"
     digits = 0 if is_mw else 1
     mean_c, p10_c, p90_c = EC_COLS[var]
-    fig = base_fig(f"EC46 {m['label'].lower()}, {zone} - ensemble mean with 10-90% range", m["unit"], height=420)
     ec = load_ec46(units, var)
     if ec.empty:
-        msg = "No EC46 MW yet - run ecmwf_mw.py." if is_mw else "No EC46 data yet - run ec46_scraper.py first."
-        return finish_fig(fig, zone, m), [], [], [], msg
+        ec = load_ec46("weather", "temp_c")  # e.g. no EC46 MW yet: still resolve the fetch dates
+    if ec.empty:
+        figs = [ec46_fig(zone, v, units, mode, None, None) for _, v in GRAPH_VARS]
+        return (*figs, [], [], [], "No EC46 data yet - run ec46_scraper.py first.")
     fetches = sorted(ec["fetched_on"].unique())
     main_f = erun if erun in fetches else fetches[-1]
     older = [f for f in fetches if f < main_f]
@@ -1522,30 +1628,11 @@ def ec46(zone, erun, cmp, var, mode, units, tab):
         cmp_f = min(cand, key=lambda f: abs((pd.Timestamp(f) - pd.Timestamp(target)).days)) if cand else None
     else:
         cmp_f = cmp if (cmp in fetches and cmp != main_f) else None
-
-    cur = ec[(ec.fetched_on == main_f) & (ec.zone == zone)].sort_values("day")
-    if mode == "diff":
-        fig = base_fig(f"EC46 change in {m['label'].lower()}, {zone} - {ec46_label(main_f)} minus "
-                       f"{ec46_label(cmp_f) if cmp_f else '(nothing to compare)'}",
-                       m["unit"], height=420)
-        if cmp_f is not None:
-            other = ec[(ec.fetched_on == cmp_f) & (ec.zone == zone)][["day", mean_c]]
-            j = cur[["day", mean_c]].merge(other, on="day", suffixes=("", "_c"))
-            j[mean_c] = j[mean_c] - j[mean_c + "_c"]
-            add_diff(fig, j.dropna(subset=[mean_c]), mean_c, m, "Change", x="day", bars=True)
-    elif cur[mean_c].notna().any():
-        fig.add_trace(go.Scatter(x=cur["day"], y=cur[p90_c], mode="lines", line=dict(width=0),
-                                 hoverinfo="skip", showlegend=False))
-        fig.add_trace(go.Scatter(x=cur["day"], y=cur[p10_c], mode="lines", line=dict(width=0),
-                                 fill="tonexty", fillcolor="rgba(42,120,214,0.15)",
-                                 hovertemplate=f"10%: %{{y:{m['fmt']}}}<extra></extra>"))
-    if mode != "diff":
-        if cmp_f is not None:
-            add_series(fig, ec[(ec.fetched_on == cmp_f) & (ec.zone == zone)], mean_c, ec46_label(cmp_f),
-                       PALETTE[1], dash="dash", width=2, m=m, x="day", label_shift=-10)
-        add_series(fig, cur, mean_c, ec46_label(main_f), PALETTE[0], width=2.5, m=m, x="day",
-                   label_shift=8 if cmp_f else 0)
-    finish_fig(fig, zone, m, now_line=False, diff=mode == "diff")
+    figs = [ec46_fig(zone, v, units, mode, main_f, cmp_f) for _, v in GRAPH_VARS]
+    ec = load_ec46(units, var)
+    if ec.empty:
+        return (*figs, [], [], [], "No EC46 MW yet - run ecmwf_mw.py.")
+    fig = figs  # the table code below returns "fig" - here: the three charts
 
     def weekly(fetch):
         d = ec[ec.fetched_on == fetch].copy()
@@ -1566,15 +1653,15 @@ def ec46(zone, erun, cmp, var, mode, units, tab):
         note += " MW = daily average power, same model as the hourly MW."
     if mode == "diff":
         if cmp_f is None:
-            return fig, [], [], [], note
+            return (*fig, [], [], [], note)
         wk = (wk - weekly(cmp_f)).dropna(axis=1, how="all")
         rows, cols, style = heat_table(wk, _week_label, digits, True)
-        return fig, rows, cols, style, note
+        return (*fig, rows, cols, style, note)
     # values + a change row under each country
     wk = wk.dropna(how="all").sort_index(axis=1)
     rows, cols, style = heat_table(wk, _week_label, digits, False)
     if cmp_f is None:
-        return fig, rows, cols, style, note
+        return (*fig, rows, cols, style, note)
     dk = (wk - weekly(cmp_f).reindex(index=wk.index, columns=wk.columns))
     ids = [c["id"] for c in cols[1:]]
     out, out_style = [], [s_ for s_ in style if "row_index" not in s_.get("if", {})]
@@ -1593,7 +1680,7 @@ def ec46(zone, erun, cmp, var, mode, units, tab):
                                   "backgroundColor": "rgba(235,104,52,0.18)" if v > 0 else "rgba(42,120,214,0.18)"})
         out.append(drow)
         out_style.append({"if": {"row_index": len(out) - 1}, "fontStyle": "italic", "color": MUTED})
-    return fig, out, cols, out_style, note
+    return (*fig, out, cols, out_style, note)
 
 
 # ---------------------------------------------------------------- ensembles (ens_scraper.py)
@@ -1690,28 +1777,20 @@ def ens_resolve(cmp, ts, all_runs):
         return None
 
 
-@app.callback(Output("n-run", "options"), Output("n-run", "value"), Output("n-cmp", "options"),
-              Input("tab", "value"), Input("n-model", "value"), Input("n-run", "value"), Input("upd-done", "data"))
-def ens_options(tab, model, cur, _done):
+@app.callback(Output("n-run", "options"), Output("n-run", "value"),
+              Output("n-run-g", "options"), Output("n-run-g", "value"),
+              Input("tab", "value"), Input("n-run", "value"), Input("n-run-g", "value"), Input("upd-done", "data"))
+def ens_options(tab, cur_e, cur_g, _done):
     if tab != "ens":
         raise PreventUpdate
-    rs = ens_runs(model)
-    opts = [{"label": ens_label(model, r), "value": r.isoformat()} for r in rs]
-    vals = [o["value"] for o in opts]
-    sel = cur if (cur in vals and ctx.triggered_id not in ("n-model", "upd-done")) else (vals[0] if vals else None)
-    ts = pd.Timestamp(sel) if sel else None
-
-    def lab(text, kind):
-        if ts is None:
-            return text
-        c = ens_resolve(kind, ts, rs)
-        return f"{text} ({c:%a %d %b %Hz})" if c is not None else f"{text} (none stored)"
-    cmp_opts = ([{"label": lab("Previous run", CMP_PREV), "value": CMP_PREV},
-                 {"label": lab("Previous 00z run", CMP_P00), "value": CMP_P00},
-                 {"label": lab("Previous 12z run", CMP_P12), "value": CMP_P12},
-                 {"label": lab("1 day earlier", "day"), "value": "day"},
-                 {"label": "Nothing", "value": "none"}] + opts)
-    return opts, sel, cmp_opts
+    out = []
+    for model, cur in (("ecmwf", cur_e), ("gefs", cur_g)):
+        rs = ens_runs(model)
+        opts = [{"label": ens_label(model, r), "value": r.isoformat()} for r in rs]
+        vals = [o["value"] for o in opts]
+        sel = cur if (cur in vals and ctx.triggered_id != "upd-done") else (vals[0] if vals else None)
+        out += [opts, sel]
+    return out
 
 
 def _ens_day_table(dd, cd, zone, col, digits):
@@ -1751,62 +1830,47 @@ def _ens_day_table(dd, cd, zone, col, digits):
     return rows, cols, style
 
 
-@app.callback(Output("g-ens", "figure"), Output("t-ens", "data"), Output("t-ens", "columns"),
-              Output("t-ens", "style_data_conditional"), Output("t-ens-c", "data"), Output("t-ens-c", "columns"),
-              Output("t-ens-c", "style_data_conditional"), Output("n-note", "children"),
-              Output("n-showing", "children"), Output("n-t1-title", "children"), Output("n-t2-title", "children"),
-              Input("zone", "value"), Input("n-model", "value"), Input("n-run", "value"), Input("n-cmp", "value"),
-              Input("n-var", "value"), Input("units", "value"), Input("view", "value"), Input("tab", "value"))
-def ensembles(zone, model, run, cmp, var, units, view, tab):
-    if tab != "ens":
-        raise PreventUpdate
-    m = meta(var, units)
-    is_mw = m["unit"] == "MW"
-    digits = 0 if is_mw else 1
-    col = ENS_COL[(var, "mw" if is_mw else "weather")]
-    diff = view == "diff"
+def ens_banner(model, ts, cts, det, rs):
     name = ENS_MODELS.get(model, model)
-    fig = base_fig(f"{name} {m['label'].lower()}, {zone}", m["unit"], height=440)
-    empty = (finish_fig(fig, zone, m), [], [], [], [], [], [])
-    rs = ens_runs(model)
-    if not rs or not run:
-        return (*empty, f"No {name} runs stored yet - run ens_scraper.py (or Check for new data).", [], "", "")
-    ts = pd.Timestamp(run)
-    cts = ens_resolve(cmp, ts, rs)
-    h = ens_hourly(model, ts)
-    hz = h[h.zone == zone].sort_values("valid_time")
-    hc = ens_hourly(model, cts) if cts is not None else None
-    hcz = hc[hc.zone == zone].sort_values("valid_time") if hc is not None else None
-    nmem = int(hz["members"].max()) if not hz.empty else 0
-
-    # deterministic run of the same model and run time (or the latest before)
-    df = load()
-    det_model = ENS_DET[model]
-    det_runs = [r for r in runs(df, det_model) if rk_ts(r) <= ts] if not df.empty else []
-    det = det_runs[0] if det_runs else None
-
-    banner = [html.Span("Showing", style={"fontSize": "13px", "color": MUTED, "fontWeight": 600}),
-              pill(ens_label(model, ts), PALETTE[0])]
+    out = [html.Span(name, style={"fontSize": "15px", "fontWeight": 700, "marginRight": "4px"}),
+           pill(ens_label(model, ts), PALETTE[0])]
     if cts is not None:
-        banner += [html.Span("compared with", style={"fontSize": "13px", "color": MUTED}),
-                   pill(ens_label(model, cts), PALETTE[1], solid=False)]
+        out += [html.Span("compared with", style={"fontSize": "13px", "color": MUTED}),
+                pill(ens_label(model, cts), PALETTE[1], solid=False)]
     if det is not None:
-        banner += [html.Span("· line:", style={"fontSize": "13px", "color": MUTED}),
-                   html.Span(run_label(det), style={"fontSize": "13px", "fontWeight": 600})]
-    if rs[0] != ts:
-        banner.append(html.Span(f"(not the newest {name} run - newest is {rs[0]:%a %d %b %Hz})",
-                                style={"fontSize": "13px", "color": "#b45309"}))
+        out += [html.Span("· dotted line:", style={"fontSize": "13px", "color": MUTED}),
+                html.Span(run_label(det), style={"fontSize": "13px", "fontWeight": 600})]
+    if rs and rs[0] != ts:
+        out.append(html.Span(f"(not the newest {name} run - newest is {rs[0]:%a %d %b %Hz})",
+                             style={"fontSize": "13px", "color": "#b45309"}))
+    return out
 
+
+def ens_det(model, ts):
+    """Deterministic run of the same model and run time (or the latest before)."""
+    df = load()
+    det_runs = [r for r in runs(df, ENS_DET[model]) if rk_ts(r) <= ts] if not df.empty else []
+    return det_runs[0] if det_runs else None
+
+
+def ens_fig(zone, model, ts, cts, det, var, units, diff):
+    """One ensemble chart: bands + mean (+ compare mean, deterministic run, normal), or change vs compare."""
+    m = meta(var, units)
+    col = ENS_COL[(var, "mw" if m["unit"] == "MW" else "weather")]
+    name = ENS_MODELS.get(model, model)
+    if ts is None:
+        return finish_fig(base_fig(f"{name} {m['label'].lower()}, {zone}", m["unit"], height=320), zone, m)
     title = f"{name} {m['label'].lower()}, {zone} · {ens_label(model, ts)}"
     if diff:
         title = f"{name} change in {m['label'].lower()}, {zone} · {ens_label(model, ts)} minus " + \
             (ens_label(model, cts) if cts is not None else "(nothing to compare)")
-    fig = base_fig(title, m["unit"], height=440)
-    if hz.empty or hz[col].isna().all():
-        msg = f"No {m['label'].lower()} for {zone} in this run" + (
-            " - no MW fit for this country." if is_mw else ".")
-        return (finish_fig(fig, zone, m), [], [], [], [], [], [], msg, banner, "", "")
-
+    fig = base_fig(title, m["unit"], height=320)
+    h = ens_hourly(model, ts)
+    hz = h[h.zone == zone].sort_values("valid_time")
+    hc = ens_hourly(model, cts) if cts is not None else None
+    hcz = hc[hc.zone == zone].sort_values("valid_time") if hc is not None else None
+    if hz.empty or col not in hz or hz[col].isna().all():
+        return finish_fig(fig, zone, m, diff=diff)
     x = hz["valid_time"]
     if diff:
         if hcz is not None and not hcz.empty:
@@ -1825,8 +1889,7 @@ def ensembles(zone, model, run, cmp, var, units, view, tab):
             fig.add_trace(go.Scatter(x=x, y=hz[hi], mode="lines", line=dict(width=0), hoverinfo="skip",
                                      showlegend=False))
             fig.add_trace(go.Scatter(x=x, y=hz[lo], mode="lines", line=dict(width=0), fill="tonexty",
-                                     fillcolor=f"rgba(42,120,214,{alpha})", name=nm,
-                                     customdata=hz[hi],
+                                     fillcolor=f"rgba(42,120,214,{alpha})", name=nm, customdata=hz[hi],
                                      hovertemplate=f"{nm}: %{{y:{m['fmt']}}} - %{{customdata:{m['fmt']}}} "
                                                    f"{m['unit']}<extra></extra>"))
         if hcz is not None and not hcz.empty:
@@ -1842,33 +1905,73 @@ def ensembles(zone, model, run, cmp, var, units, view, tab):
                    label_shift=8 if hcz is not None else 0)
         if units == "mw" or var == "temp_c":
             add_normal(fig, zone, var, units, x.min(), x.max())
-    finish_fig(fig, zone, m, diff=diff)
+    return finish_fig(fig, zone, m, diff=diff)
 
-    # tables
-    dd = ens_daily(model, ts)
-    cd = ens_daily(model, cts) if cts is not None else None
-    rows1, cols1, sty1 = _ens_day_table(dd, cd, zone, col, digits) if not dd.empty else ([], [], [])
-    t1 = (f"{zone}: daily averages across the {nmem} members ({m['unit']}) - "
-          f"P10/P90 shaded darker where the members disagree more")
-    rows2, cols2, sty2, t2 = [], [], [], ""
-    if not dd.empty and col in dd:
-        wide = dd.pivot(index="zone", columns="day", values=col)
-        lab = lambda c: pd.Timestamp(c).strftime("%a %d")
-        if diff:
-            if cd is not None and not cd.empty:
-                wide = (wide - cd.pivot(index="zone", columns="day", values=col)).dropna(axis=1, how="all")
-                rows2, cols2, sty2 = heat_table(wide, lab, digits, True)
-                t2 = f"All countries: change in daily ensemble mean vs {ens_label(model, cts)} ({m['unit']})"
-        else:
-            rows2, cols2, sty2 = heat_table(wide, lab, digits, False)
-            t2 = f"All countries: daily ensemble mean ({m['unit']})"
-    note = (f"Blue band dark = 80 % of members (P10-P90), light = all members (min-max); thick blue = ensemble "
-            f"mean; dotted black = the deterministic {MODELS[det_model]} run; orange dashed = compare run's mean. "
-            f"{nmem} members, hourly. Weather is the average of 3 land points per country, scaled to the "
-            f"{MODELS[det_model]} level; MW per member with the {MODELS[det_model]} MW fit.")
-    if cmp not in ("none",) and cts is None:
-        note += " Nothing stored to compare with yet."
-    return fig, rows1, cols1, sty1, rows2, cols2, sty2, note, banner, t1, t2
+
+ENS_FIG_OUT = [Output(f"g-ens-{k}-{v}", "figure") for k in ("e", "g") for v, _ in GRAPH_VARS]
+
+
+@app.callback(*ENS_FIG_OUT,
+              Output("t-ens", "data"), Output("t-ens", "columns"),
+              Output("t-ens", "style_data_conditional"), Output("t-ens-c", "data"), Output("t-ens-c", "columns"),
+              Output("t-ens-c", "style_data_conditional"), Output("n-note", "children"),
+              Output("n-showing", "children"), Output("n-showing-g", "children"),
+              Output("n-t1-title", "children"), Output("n-t2-title", "children"),
+              Input("zone", "value"), Input("n-run", "value"), Input("n-run-g", "value"), Input("n-cmp", "value"),
+              Input("n-model", "value"), Input("n-var", "value"), Input("units", "value"), Input("view", "value"),
+              Input("tab", "value"))
+def ensembles(zone, run_e, run_g, cmp, tmodel, var, units, view, tab):
+    """ECMWF ENS: 3 charts (solar, wind, temperature), GEFS: the same 3 below. Tables: chosen model + variable."""
+    if tab != "ens":
+        raise PreventUpdate
+    diff = view == "diff"
+    figs, banners, sel = [], [], {}
+    for model, run in (("ecmwf", run_e), ("gefs", run_g)):
+        rs = ens_runs(model)
+        ts = pd.Timestamp(run) if run else (rs[0] if rs else None)
+        cts = ens_resolve(cmp, ts, rs) if ts is not None else None
+        det = ens_det(model, ts) if ts is not None else None
+        sel[model] = (ts, cts)
+        figs += [ens_fig(zone, model, ts, cts, det, v, units, diff) for _, v in GRAPH_VARS]
+        banners.append(ens_banner(model, ts, cts, det, rs) if ts is not None else
+                       [html.Span(f"{ENS_MODELS[model]}: no runs stored yet - run ens_scraper.py",
+                                  style={"fontSize": "13px", "color": MUTED})])
+
+    # tables for the chosen model + variable
+    m = meta(var, units)
+    is_mw = m["unit"] == "MW"
+    digits = 0 if is_mw else 1
+    col = ENS_COL[(var, "mw" if is_mw else "weather")]
+    ts, cts = sel.get(tmodel, (None, None))
+    rows1 = cols1 = sty1 = rows2 = cols2 = sty2 = []
+    t1 = t2 = ""
+    if ts is not None:
+        dd = ens_daily(tmodel, ts)
+        cd = ens_daily(tmodel, cts) if cts is not None else None
+        h = ens_hourly(tmodel, ts)
+        hz = h[h.zone == zone]
+        nmem = int(hz["members"].max()) if not hz.empty else 0
+        if not dd.empty:
+            rows1, cols1, sty1 = _ens_day_table(dd, cd, zone, col, digits)
+            t1 = (f"{ens_label(tmodel, ts)}, {zone}: daily {m['label'].lower()} across the {nmem} members "
+                  f"({m['unit']}) - P10/P90 shaded darker where the members disagree more")
+            if col in dd:
+                wide = dd.pivot(index="zone", columns="day", values=col)
+                lab = lambda c: pd.Timestamp(c).strftime("%a %d")
+                if diff:
+                    if cd is not None and not cd.empty:
+                        wide = (wide - cd.pivot(index="zone", columns="day", values=col)).dropna(axis=1, how="all")
+                        rows2, cols2, sty2 = heat_table(wide, lab, digits, True)
+                        t2 = (f"All countries: change in daily ensemble mean {m['label'].lower()}, "
+                              f"{ens_label(tmodel, ts)} vs {cts:%a %d %b %Hz} ({m['unit']})")
+                else:
+                    rows2, cols2, sty2 = heat_table(wide, lab, digits, False)
+                    t2 = f"All countries: daily ensemble mean {m['label'].lower()}, {ens_label(tmodel, ts)} ({m['unit']})"
+    note = ("Each chart: dark blue band = 80 % of members (P10-P90), light band = all members (min-max), "
+            "thick blue = ensemble mean, dotted black = the deterministic run of the same model, orange dashed = "
+            "the compare run's mean, grey dotted = normal. Hourly. Weather = average of 3 land points per country, "
+            "scaled to the deterministic model's level; MW per member with that model's MW fit.")
+    return (*figs, rows1, cols1, sty1, rows2, cols2, sty2, note, banners[0], banners[1], t1, t2)
 
 
 # ---------------------------------------------------------------- main
