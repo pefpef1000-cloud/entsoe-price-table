@@ -507,6 +507,7 @@ def load_purchases_for_buyer(buyer_label: str) -> pd.DataFrame:
     df = pd.read_sql_query(
         f"""
         SELECT
+            a.identification,
             a.corridor_code,
             a.horizon_name,
             a.market_period_start,
@@ -532,14 +533,23 @@ def load_purchases_for_buyer(buyer_label: str) -> pd.DataFrame:
 
     df["period"] = (pd.to_datetime(df["market_period_start"], utc=True) + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
     df["auction_closed"] = pd.to_datetime(df["bid_gate_closure"], utc=True, errors="coerce")
+    # One row per won auction (several EIC codes of one company = 1 row).
+    # Was one row per horizon + period + corridor, which hid a peak auction
+    # won next to the base one - now that each row has its own price, both show.
     out = (
-        df[["horizon_name", "period", "corridor_code", "auction_closed"]]
-        .drop_duplicates(subset=["horizon_name", "period", "corridor_code"])
+        df[["identification", "horizon_name", "period", "corridor_code", "auction_closed"]]
+        .drop_duplicates(subset=["identification"])
         .sort_values("auction_closed", ascending=False, na_position="last")
         .reset_index(drop=True)
     )
     out["auction_closed"] = out["auction_closed"].dt.strftime("%Y-%m-%d %H:%M")
-    return out
+    # Auction price (EUR/MW) of each win (Peter, 2026-10-18: "add the auction
+    # price of the corridor in the winning list"). Bundles / peak / not yet
+    # published: see price_note.
+    details = _auction_price_details(tuple(out["identification"]))
+    out["price"] = [details[i][0] for i in out["identification"]]
+    out["price_note"] = [details[i][1] for i in out["identification"]]
+    return out.drop(columns="identification")
 
 
 @cached
@@ -743,11 +753,12 @@ def load_buyer_map_data(buyer_label: str, year_month: str, tenors: str = "All") 
     return counts.reset_index(drop=True)
 
 
-def _auction_price_texts(identifications: tuple) -> dict:
-    """{auction: its price as text} from auction_results (EUR/MW, 2
-    decimals). "-" = no result published yet. A peak auction is marked
-    "(peak)". A bundled CEEXD auction has one price per border: the borders
-    that got capacity are listed ("CZ-DE(50Hz) 1.38 · DE(50Hz)-CZ 5.15")."""
+def _auction_price_details(identifications) -> dict:
+    """{auction: (price, note)} from auction_results (EUR/MW). price is None
+    when there is no single price: no result published yet (note "no result
+    yet"), or a bundled CEEXD auction, which has one price per border (note
+    lists the borders that got capacity, "CZ-DE(50Hz) 1.38 · DE(50Hz)-CZ
+    5.15"). A peak auction gets the note "peak"."""
     ids = list(dict.fromkeys(identifications))
     rows = []
     conn = _connect()
@@ -767,18 +778,35 @@ def _auction_price_texts(identifications: tuple) -> dict:
     for ident in ids:
         results = by_auction.get(ident)
         if not results:
-            out[ident] = "-"
+            out[ident] = (None, "no result yet")
             continue
+        notes = []
         if len(results) == 1:
             price = results[0][3]
-            text = "-" if price is None else f"{price:.2f}"
+            if price is None:
+                notes.append("no result yet")
         else:
+            price = None
             parts = [f"{display_code(c)} {p:.2f}" for c, _, a, p in results
                      if p is not None and (a or 0) > 0]
-            text = " · ".join(parts) if parts else "0.00"
+            notes.append(" · ".join(parts) if parts else "all borders 0.00")
         if any("PEAK" in r[1].upper() for r in results):
-            text += " (peak)"
-        out[ident] = text
+            notes.append("peak")
+        out[ident] = (price, ", ".join(notes))
+    return out
+
+
+def _auction_price_texts(identifications: tuple) -> dict:
+    """{auction: its price as text} for the Buyer lookup map table: "12.34",
+    "12.34 (peak)", the CEEXD border list, or "-" (no result yet)."""
+    out = {}
+    for ident, (price, note) in _auction_price_details(identifications).items():
+        if price is not None:
+            out[ident] = f"{price:.2f}" + (" (peak)" if note == "peak" else "")
+        elif note == "no result yet":
+            out[ident] = "-"
+        else:
+            out[ident] = note.replace(", peak", " (peak)")
     return out
 
 
@@ -1848,12 +1876,20 @@ def buyer_lookup(buyer, tab):
                       "by when the auction actually closed (not the delivery period)."),
                  pivot_table(pivot, 0)]
     body.append(html.H3(f"Everything {buyer} has won ({len(purchases):,})"))
+    # "Price note" only when a row needs it (peak, CEEXD bundle, no result yet).
+    order = ["horizon_name", "period", "corridor_code", "price", "auction_closed"]
+    if (purchases["price_note"] != "").any():
+        order.insert(4, "price_note")
     body.append(table(
-        purchases, order=["horizon_name", "period", "corridor_code", "auction_closed"],
+        purchases, order=order,
         names={"horizon_name": "Horizon", "period": "Period", "corridor_code": "Corridor",
+               "price": "Auction price (EUR/MW)", "price_note": "Price note",
                "auction_closed": "Auction closed (UTC)"},
+        formats={"price": 2},
         tooltips={"auction_closed": "When bidding actually closed and the auction cleared - "
-                                    "not the delivery period."}))
+                                    "not the delivery period.",
+                  "price": "The auction's clearing price. A bundled CEEXD auction has one "
+                           "price per border - see Price note."}))
     return buyers, buyer, body
 
 
