@@ -681,7 +681,7 @@ def load_buyer_map_data(buyer_label: str, year_month: str, tenors: str = "All") 
         params=params,
     )
     conn.close()
-    empty = pd.DataFrame(columns=["corridor_code", "horizon_name", "wins", "win_date"])
+    empty = pd.DataFrame(columns=["corridor_code", "horizon_name", "wins", "win_date", "price"])
     if df.empty:
         return empty
 
@@ -724,10 +724,62 @@ def load_buyer_map_data(buyer_label: str, year_month: str, tenors: str = "All") 
     dates = (won.groupby(["corridor_code", "horizon_name"])["day"]
              .apply(fmt_days).reset_index(name="win_date"))
     counts = counts.merge(dates, on=["corridor_code", "horizon_name"], how="left")
+
+    # Auction price (EUR/MW) of each won auction, in the same order as the
+    # win dates (Peter, 2026-10-18: "add the auction price of the corridor in
+    # the winning list"). Several auctions on one day: " / " between them.
+    texts = _auction_price_texts(tuple(won["identification"]))
+    won["price"] = won["identification"].map(texts).fillna("-")
+
+    def fmt_prices(group):
+        return ", ".join(" / ".join(sub["price"]) for _, sub in group.groupby("day", sort=True))
+
+    prices = (won.groupby(["corridor_code", "horizon_name"])[["day", "price"]]
+              .apply(fmt_prices).reset_index(name="price"))
+    counts = counts.merge(prices, on=["corridor_code", "horizon_name"], how="left")
     rank = {t: i for i, t in enumerate(TENOR_ORDER)}
     counts["_t"] = counts["horizon_name"].map(rank).fillna(len(rank))
     counts = counts.sort_values(["corridor_code", "_t"]).drop(columns="_t")
     return counts.reset_index(drop=True)
+
+
+def _auction_price_texts(identifications: tuple) -> dict:
+    """{auction: its price as text} from auction_results (EUR/MW, 2
+    decimals). "-" = no result published yet. A peak auction is marked
+    "(peak)". A bundled CEEXD auction has one price per border: the borders
+    that got capacity are listed ("CZ-DE(50Hz) 1.38 · DE(50Hz)-CZ 5.15")."""
+    ids = list(dict.fromkeys(identifications))
+    rows = []
+    conn = _connect()
+    try:
+        for i in range(0, len(ids), 900):  # SQLite's limit on "?" per query
+            chunk = ids[i:i + 900]
+            rows += conn.execute(
+                "SELECT identification, corridor_code, product_identification, "
+                "allocated_capacity, auction_price FROM auction_results "
+                f"WHERE identification IN ({','.join('?' * len(chunk))})", chunk).fetchall()
+    finally:
+        conn.close()
+    by_auction: dict = {}
+    for ident, corridor, product, allocated, price in rows:
+        by_auction.setdefault(ident, []).append((corridor, product or "", allocated, price))
+    out = {}
+    for ident in ids:
+        results = by_auction.get(ident)
+        if not results:
+            out[ident] = "-"
+            continue
+        if len(results) == 1:
+            price = results[0][3]
+            text = "-" if price is None else f"{price:.2f}"
+        else:
+            parts = [f"{display_code(c)} {p:.2f}" for c, _, a, p in results
+                     if p is not None and (a or 0) > 0]
+            text = " · ".join(parts) if parts else "0.00"
+        if any("PEAK" in r[1].upper() for r in results):
+            text += " (peak)"
+        out[ident] = text
+    return out
 
 
 @cached
@@ -1897,12 +1949,14 @@ def buyer_lookup_map(buyer, year_month, tenor_value, tab, _refresh=None):
         render_buyer_map(counts, split),
         table(counts.assign(corridor_code=counts["corridor_code"].map(display_code))
               .sort_values("corridor_code", kind="stable"),
-              order=["corridor_code", "horizon_name", "win_date", "wins"],
+              order=["corridor_code", "horizon_name", "win_date", "price", "wins"],
               names={"corridor_code": "Corridor", "horizon_name": "Tenor",
-                     "win_date": "Win date", "wins": "Wins"},
+                     "win_date": "Win date", "price": "Auction price (EUR/MW)",
+                     "wins": "Wins"},
               page_size=None),
+        note("Auction price = the auction's clearing price, one per win, in the same "
+             "order as the win dates."),
     ]
-    return head + [body]
     return head + [body]
 
 
