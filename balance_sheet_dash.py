@@ -25,8 +25,9 @@ Data (read-only):
     settlements for the clean spark spread.
 
 Clean spark spread (hourly) = price - TTF / efficiency - EUA * carbon factor
-  carbon factor = 0.202 tCO2/MWh gas / efficiency (0.404 at 50 %), same as
-  the Energy futures app.  Gas and EUA = last ICE settlement BEFORE the
+  carbon factor = 0.184 tCO2/MWh gas (gross CV, Platts) / efficiency
+  (0.368 at 50 %), same as the Energy futures app (Peter 2026-10-19: "all
+  0,368"; was 0.202 / 0.404).  Gas and EUA = last ICE settlement BEFORE the
   delivery day (the day the day-ahead auction ran), TTF front month,
   EUA December of the delivery year.
 
@@ -811,7 +812,7 @@ def build_table(code: str, n: int, srcs: list[str], mode: str,
 
     if mode == "css":
         fuel = fuel_by_day(past)
-        cf = 0.202 / eff
+        cf = 0.184 / eff        # 0.368 at 50 % (was 0.202 / 0.404)
         css = pd.DataFrame(index=range(24))
         for d in past:
             g, e = fuel.loc[d, "ttf"], fuel.loc[d, "eua"]
