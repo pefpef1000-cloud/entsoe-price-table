@@ -28,6 +28,8 @@ services:
         - futures_vs_spot_dash.py
         - balance_sheet_dash.py
         - ecmwf_dash.py
+        - spread_dash.py
+        - spread_delivered.py
         - assets/**
         - requirements-online.txt
         - render.yaml

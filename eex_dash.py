@@ -53,15 +53,16 @@ import os
 import calendar
 import re
 import sqlite3
+import sys
 import threading
 from contextlib import closing
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import MATCH, Dash, Input, Output, State, ctx, dash_table, dcc, html, no_update
+from dash import ALL, MATCH, Dash, Input, Output, State, ctx, dash_table, dcc, html, no_update
 
 # ---------------------------------------------------------------------
 # Where the database is
@@ -145,6 +146,8 @@ def market_of(long_name: str | None, short_code: str) -> tuple[str, str]:
     """(market label, group) from EEX's long contract name."""
     if not long_name:
         return short_code, "Other"
+    if long_name.startswith("ICE UK"):
+        return ICE_UK_MARKET, "Power"
     name = re.sub(r"^EEX(-PXE)?\s+", "", long_name)
     if "Freight" in name:
         return "Capesize freight option", "Other"
@@ -174,8 +177,8 @@ def market_of(long_name: str | None, short_code: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------
 MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-DAY_CODE = re.compile(r"^D[BP](\d{2})$")
-MATURITY_ORDER = ["Year", "Quarter", "Month", "December", "Week", "Weekend", "Day"]
+DAY_CODE = re.compile(r"^[A-Z0-9]{2}(\d{2})$")   # DB16, FD16, 1D16, G316 (all countries since 2026-10-19)
+MATURITY_ORDER = ["Year", "Season", "Quarter", "Month", "December", "Week", "Weekend", "Day"]
 
 
 def delivery_date(short_code: str, delivery: str, maturity: str) -> date | None:
@@ -221,6 +224,8 @@ def delivery_label(d: date | None, maturity: str, raw: str) -> str:
         return f"Q{(d.month - 1) // 3 + 1}-{yy}"
     if maturity in ("Month", "December"):
         return f"{MON[d.month - 1]}-{yy}"
+    if maturity == "Season":                 # ICE UK: Summer Apr-Sep, Winter Oct-Mar
+        return f"{'Sum' if d.month == 4 else 'Win'}-{yy}"
     if maturity == "Week":
         return f"W{d.isocalendar()[1]:02d} · {d.day} {MON[d.month - 1]}"
     if maturity == "Weekend":
@@ -269,10 +274,99 @@ def load_gas_eua(path: Path | None) -> tuple[pd.DataFrame, pd.DataFrame]:
     return st, oh
 
 
+# ICE UK Base / Peak electricity futures (ICE Futures Europe, GBP/MWh) from
+# ice_scraper's ice_market_data.db (Peter, 2026-10-18: "add ice uk ...
+# anywhere actually"). Shown as market "GB ICE" next to EEX's thin "GB".
+ICE_UK_MARKET = "GB ICE"
+ICE_UK = {"UKB": ("Base", "ICE UK Base Electricity Future (Gregorian)"),
+          "UKP": ("Peak", "ICE UK Peak Electricity Future (Gregorian)")}
+_MON_NUM = {m: i for i, m in enumerate(MON, 1)}
+
+
+def ice_strip(strip: str):
+    """ICE strip name -> (maturity, delivery YYYYMM, code letter).
+    Nov26 / Q1 27 / Summer28 (Apr-Sep) / Winter28 (Oct-Mar) / Cal 27."""
+    t = (strip or "").replace(" ", "")
+    try:
+        if t[:3] in _MON_NUM and len(t) == 5:
+            return "Month", f"20{t[3:]}{_MON_NUM[t[:3]]:02d}", "M"
+        if t.startswith("Q") and len(t) == 4:
+            return "Quarter", f"20{t[2:]}{3 * int(t[1]) - 2:02d}", "Q"
+        if t.startswith("Sum"):
+            return "Season", f"20{int(t[-2:]):02d}04", "S"
+        if t.startswith("Win"):
+            return "Season", f"20{int(t[-2:]):02d}10", "S"
+        if t.startswith("Cal"):
+            return "Year", f"20{int(t[-2:]):02d}01", "Y"
+    except ValueError:
+        pass
+    return None
+
+
+def ice_trade_day(last_time: str | None):
+    """'10/16/2026 03:17 PM GMT' -> '2026-10-16'."""
+    try:
+        return datetime.strptime(str(last_time)[:10], "%m/%d/%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def load_ice_uk(path: Path | None) -> pd.DataFrame:
+    """ICE UK settlements shaped like eex_market_prices, plus 'ice_lots'.
+
+    Prices: ICE's daily history bars (settlements). Volume: the curve
+    snapshot the scraper takes every night lists the contracts that traded
+    on the last trading day, with lots and the time of the last trade. Only
+    rows with a trade time count - a Summer-28 trade also shows its six
+    months with the same volume and no price (the legs), which would count
+    it twice. Lots -> MWh with UK hours, so 'volume' means MWh as for EEX.
+    ICE publishes no open interest here."""
+    cols = ["short_code", "delivery", "trade_date", "product", "maturity_type",
+            "settlement_price", "volume", "gross_open_interest", "currency", "uom",
+            "fetched_at", "long_name", "ice_lots"]
+    empty = pd.DataFrame(columns=cols)
+    if path is None:
+        return empty
+    try:
+        with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+            st = pd.read_sql_query(
+                "SELECT product AS ice, strip, trade_date, price AS settlement_price, fetched_at "
+                "FROM ice_settlement WHERE product IN ('UKB', 'UKP') AND price IS NOT NULL", conn)
+            cv = pd.read_sql_query(
+                "SELECT product AS ice, strip, volume, last_time FROM ice_curve "
+                "WHERE product IN ('UKB', 'UKP') AND volume > 0 AND last_time IS NOT NULL", conn)
+    except Exception:
+        return empty
+    if st.empty:
+        return empty
+    cv["trade_date"] = cv["last_time"].map(ice_trade_day)
+    # The same day can sit in several snapshots (Sat + Sun show Friday): keep the biggest.
+    cv = cv.dropna(subset=["trade_date"]).groupby(["ice", "strip", "trade_date"])["volume"].max()
+    st = st.join(cv.rename("ice_lots"), on=["ice", "strip", "trade_date"])
+    parsed = {s_: ice_strip(s_) for s_ in st["strip"].unique()}
+    st = st[st["strip"].map(lambda x: parsed[x] is not None)].copy()
+    st["maturity_type"] = st["strip"].map(lambda x: parsed[x][0])
+    st["delivery"] = st["strip"].map(lambda x: parsed[x][1])
+    st["short_code"] = [f"ICE-{i}-{parsed[x][2]}" for i, x in zip(st["ice"], st["strip"])]
+    st["product"] = st["ice"].map(lambda i: ICE_UK[i][0])
+    st["long_name"] = st["ice"].map(lambda i: ICE_UK[i][1])
+    st["currency"], st["uom"] = "GBP", "MWh"
+    st["gross_open_interest"] = np.nan
+    hours = {}
+    for k in st[["delivery", "maturity_type", "product"]].drop_duplicates().itertuples(index=False):
+        dkey = f"{k.delivery[:4]}-{k.delivery[4:]}-01"
+        hours[tuple(k)] = delivery_hours(dkey, k.maturity_type, k.product, ICE_UK_MARKET)
+    h = [hours[k] for k in zip(st["delivery"], st["maturity_type"], st["product"])]
+    st["volume"] = st["ice_lots"] * pd.Series(h, index=st.index, dtype=float)
+    return st[cols]
+
+
 def load() -> dict:
     path = DB_PATH
     gpath = gas_db()
-    mtime = (path.stat().st_mtime, gpath.stat().st_mtime if gpath else None)
+    ipath = ice_db()
+    mtime = (path.stat().st_mtime, gpath.stat().st_mtime if gpath else None,
+             ipath.stat().st_mtime if ipath else None)
     with _lock:
         if _cache.get("key") == (str(path), mtime):
             return _cache["data"]
@@ -302,6 +396,11 @@ def load() -> dict:
             have = set(zip(prices.short_code, prices.delivery, prices.trade_date.astype(str)))
             new = [k not in have for k in zip(g_set.short_code, g_set.delivery, g_set.trade_date)]
             prices = pd.concat([prices, g_set[new]], ignore_index=True)
+        ice_uk = load_ice_uk(ipath)
+        if not ice_uk.empty:
+            prices = pd.concat([prices, ice_uk], ignore_index=True)
+        if "ice_lots" not in prices:
+            prices["ice_lots"] = np.nan
         prices["delivery"] = prices["delivery"].astype(str)
         names = {c: market_of(n, c) for c, n in
                  prices[["short_code", "long_name"]].drop_duplicates().itertuples(index=False)}
@@ -343,7 +442,7 @@ def load() -> dict:
                                              "dkey", "dlabel", "unit"])
         data = {"prices": prices, "settled": settled, "runs": runs, "older": older,
                 "markets": markets[["market", "group"]].values.tolist(),
-                "path": path, "gas_path": gpath, "mtime": mtime}
+                "path": path, "gas_path": gpath, "ice_path": ipath, "mtime": mtime}
         _cache["key"], _cache["data"] = (str(path), mtime), data
         return data
 
@@ -395,8 +494,17 @@ def table(df: pd.DataFrame, page_size=15):
         style_cell={"fontFamily": "inherit", "fontSize": 13, "padding": "4px 8px",
                     "textAlign": "right", "border": f"1px solid {INK['grid']}"},
         style_cell_conditional=[{"if": {"column_type": "text"}, "textAlign": "left"}],
+        # Today's live row (first column "2026-10-21 live 09:08"): purple.
+        style_data_conditional=[{"if": {"filter_query": f'{{{df.columns[0]}}} contains "live"'},
+                                 "color": "#7048e8", "fontWeight": 600}]
+        if len(df.columns) and df[df.columns[0]].dtype == object else [],
         style_header={"fontWeight": 600, "backgroundColor": INK["bg"]},
     )
+
+
+def live_label(t):
+    """First-column text of today's live row in the history tables."""
+    return f"{date.today().isoformat()} live {t}"
 
 
 def note(text):
@@ -515,10 +623,16 @@ h1 {{ font-size:22px; margin:0; }}
 .spread-grid .kpi-value {{ font-size:16px; }}
 .spread-grid .kpi-delta {{ font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 .spread-grid .note {{ font-size:12px; }}
+.kpi-md p {{ margin:0; }}
+.spread-grid .ctl.legs {{ flex:0 0 auto; }}
+.legs-box label {{ display:flex; align-items:center; gap:5px; height:36px; font-size:13px;
+                   white-space:nowrap; cursor:pointer; color:{INK['text']}; margin:0 !important; }}
 h3.sec {{ font-size:15px; margin:22px 0 0; }}
 .spread-grid.three {{ grid-template-columns:repeat(3, minmax(0, 1fr)); }}
 @media (max-width:1250px) {{ .spread-grid.three {{ grid-template-columns:1fr; }} }}
 details summary {{ cursor:pointer; color:{INK['muted']}; font-size:13px; margin:6px 0; }}
+details.dlv {{ border-top:1px solid {INK['grid']}; margin-top:8px; padding-top:4px; }}
+details.dlv summary.dlv-sum {{ color:{INK['text']}; line-height:1.4; }}
 """
 
 
@@ -532,24 +646,65 @@ def dd(id_, multi=False, clearable=False):
     return dcc.Dropdown(id=id_, multi=multi, clearable=clearable)
 
 
+# ---------------------------------------------------------------------
+# Live (delayed) prices on demand - "Update prices" buttons
+# (Peter, 2026-10-21: button instead of polling every 15 min; only the
+# contracts the page needs; always show when they were fetched).
+# Fetching + storage: live_prices.py -> live_prices.db. Settlements are
+# never overwritten; live prices are shown next to them, marked "live".
+# ---------------------------------------------------------------------
+try:
+    import live_prices as LP
+except Exception:            # file missing -> dashboard works as before
+    LP = None
+LIVE_ENABLED = LP is not None and not os.environ.get("RENDER")   # not on the online copy
+LIVE_MAIN_TABS = ["curve", "history", "spark"]
+# Spread tabs (2026-10-21): each has its own version store, so pressing the
+# button on one tab only redraws that tab's cards.
+LIVE_SPREAD_TABS = ["spread", "spreadm", "spreadq", "tspread", "board"]   # board: own start callback
+LIVE_TABS = LIVE_MAIN_TABS + LIVE_SPREAD_TABS
+LIVE_COLOR = "#7048e8"     # purple: not used by any other series
+LIVE_JOB = {"running": False, "tab": None, "done": 0, "total": 0, "text": "", "msg": {},
+            "vers": {t: 0 for t in ["curve", "history", "spark", "spread", "spreadm", "spreadq", "tspread",
+                                    "board"]}}
+_live_lock = threading.Lock()
+
+
+def live_bar(tab):
+    """Button + status line for a tab's control row."""
+    if not LIVE_ENABLED:
+        return html.Div()
+    return html.Div([
+        html.Label("Today (delayed)"),
+        html.Div([html.Button("Update prices", id=f"lv-btn-{tab}", className="btn",
+                              style={"height": 36, "whiteSpace": "nowrap"}),
+                  html.Span(id=f"lv-msg-{tab}", style={"fontSize": 12, "color": INK["muted"],
+                                                       "marginLeft": 8, "whiteSpace": "nowrap"})],
+                 style={"display": "flex", "alignItems": "center"}),
+    ], className="ctl", style={"minWidth": 0})
+
+
 def curve_tab():
     return html.Div([
         html.Div([
             ctl("Market", dd("c-market")), ctl("Product", dd("c-product")),
             ctl("Maturity", dd("c-maturity")), ctl("Trade date", dd("c-asof")),
             ctl("Compare with", dd("c-compare")),
+            live_bar("curve"),
         ], className="controls"),
         html.Div(id="c-body"),
     ])
 
 
-# Default pairs for the six spread charts (Peter, 2026-10-17).
+# Default pairs for the spread charts (Peter, 2026-10-17; DE-HU, DE-CH,
+# DE-AT, DE-Nordic system price added 2026-10-18).
 SPREAD_PAIRS = [("DE", "FR"), ("DE", "IT"), ("FR", "ES"),
-                ("DE", "DK1"), ("IT", "FR"), ("DE", "NL")]
+                ("DE", "DK1"), ("IT", "FR"), ("DE", "NL"),
+                ("DE", "HU"), ("DE", "CH"), ("DE", "AT"), ("DE", "Nordic SYS")]
 # Order of markets in the pair dropdowns; anything else follows A-Z.
 MARKET_PREF = ["DE", "FR", "NL", "BE", "AT", "CH", "IT", "ES", "DK1", "DK2",
                "SE1", "SE2", "SE3", "SE4", "NO1", "NO2", "NO3", "NO4", "NO5",
-               "FI", "Nordic SYS", "PL", "CZ", "SK", "HU", "RO", "GB"]
+               "FI", "Nordic SYS", "PL", "CZ", "SK", "HU", "RO", "GB", ICE_UK_MARKET]
 
 
 # Three Area spreads tabs, same layout, different default tenor (Peter, 2026-10-17):
@@ -557,6 +712,36 @@ MARKET_PREF = ["DE", "FR", "NL", "BE", "AT", "CH", "IT", "ES", "DK1", "DK2",
 SPREAD_TABS = [("spread", "", "Year", "Area spreads Cal"),
                ("spreadm", "m-", "Month", "Area spreads Month"),
                ("spreadq", "q-", "Quarter", "Area spreads Quarter")]
+# Tabs whose callbacks wait for "seen-<tab>" instead of every tab switch.
+SEEN_TABS = [k for k, _, _, _ in SPREAD_TABS] + ["tspread"]
+
+
+def legs_box(id_):
+    """Tick box on every spread card: show the two legs on a right axis.
+    Unticked by default (Peter, 2026-10-18)."""
+    return html.Div([html.Label("Legs"),
+                     dcc.Checklist(id=id_, options=[{"label": "2nd axis", "value": "on"}],
+                                   value=[], className="legs-box")],
+                    className="ctl legs")
+
+
+def add_legs(fig, w, lname, rname, unit):
+    """The two legs as dotted lines on a right-hand y axis. A deliberate
+    exception to the dashboard's no-twin-axis rule - Peter asked for it
+    (2026-10-18). Spread stays on the left axis."""
+    x = pd.to_datetime(w.index)
+    fig.data[0].name = "Spread (left)"
+    for col, name, colour in (("L", lname, SERIES[1]), ("R", rname, SERIES[2])):
+        fig.add_trace(go.Scatter(x=x, y=w[col], name=f"{name} (right)", mode="lines",
+                                 yaxis="y2", line=dict(color=colour, width=1.6, dash="dot"),
+                                 hovertemplate="%{y:.2f}"))
+    # Legend under the chart: above it, it wraps onto the title on narrow cards.
+    fig.update_layout(
+        showlegend=True, height=290, margin=dict(l=50, r=55, t=40, b=62),
+        legend=dict(orientation="h", x=0, y=-0.16, yanchor="top", bgcolor="rgba(0,0,0,0)"),
+        yaxis2=dict(overlaying="y", side="right", showgrid=False, zeroline=False,
+                    title=dict(text=unit, font=dict(size=11, color=INK["muted"])),
+                    tickfont=dict(color=INK["muted"])))
 
 
 def pair_card(P, tenor, i, left, right):
@@ -568,6 +753,7 @@ def pair_card(P, tenor, i, left, right):
             ctl("Area", pdd("ps-left", left)), ctl("minus", pdd("ps-right", right)),
             ctl("Product", pdd("ps-product", "Base")), ctl("Tenor", pdd("ps-tenor", tenor)),
             ctl("Delivery", pdd("ps-delivery")),
+            legs_box({"type": P + "ps-legs", "index": i}),
         ], className="controls"),
         html.Div(id={"type": P + "ps-body", "index": i}),
     ], className="card")
@@ -576,8 +762,9 @@ def pair_card(P, tenor, i, left, right):
 # Time spreads tab (Peter, 2026-10-17): one country, three cards -
 # front vs next month, quarter and year. Spread = near - far.
 TS_TENORS = ["Month", "Quarter", "Year"]
-# One row of three cards per country; default countries (Peter, 2026-10-17).
-TS_ROWS = ["DE", "FR", "IT", "HU"]
+# One row of three cards per country (Peter, 2026-10-17); 2026-10-18: every
+# country used in the Area spreads pairs gets a row.
+TS_ROWS = ["DE", "FR", "IT", "HU", "ES", "NL", "DK1", "AT", "CH", "Nordic SYS", "GB ICE"]
 
 
 def ts_card(R, i, tenor):
@@ -586,17 +773,21 @@ def ts_card(R, i, tenor):
                             options=opts([value]) if value else [])
     return html.Div([
         html.Div([ctl("Tenor", pdd("-tenor", tenor)), ctl("Near", pdd("-near")),
-                  ctl("minus", pdd("-far"))], className="controls"),
+                  ctl("minus", pdd("-far")),
+                  legs_box({"type": R + "-legs", "index": i})], className="controls"),
         html.Div(id={"type": R + "-body", "index": i}),
     ], className="card")
 
 
 def time_spread_tab():
-    rows = []
-    for r, _ in enumerate(TS_ROWS):
+    rows = [html.Div([live_bar("tspread")], className="controls")]
+    for r, m in enumerate(TS_ROWS):
         R = f"ts{r}"
         rows += [
-            html.Div([ctl("Country", dd(R + "-market")), ctl("Product", dd(R + "-product"))],
+            html.Div([ctl("Country", dcc.Dropdown(id=R + "-market", value=m, options=opts([m]),
+                                                  clearable=False)),
+                      ctl("Product", dcc.Dropdown(id=R + "-product", value="Base",
+                                                  options=opts(["Base"]), clearable=False))],
                      className="controls", style={"marginTop": 22 if r else 12}),
             html.Div([ts_card(R, i, t) for i, t in enumerate(TS_TENORS)],
                      className="spread-grid three"),
@@ -604,17 +795,11 @@ def time_spread_tab():
     return html.Div(rows)
 
 
-def spread_tab(P="", tenor="Year"):
+def spread_tab(P="", tenor="Year", key="spread"):
     return html.Div([
+        html.Div([live_bar(key)], className="controls"),
         html.Div([pair_card(P, tenor, i, l, r) for i, (l, r) in enumerate(SPREAD_PAIRS)],
                  className="spread-grid"),
-        html.H3("Individual markets", className="sec"),
-        html.Div([
-            ctl("Product", dd(P + "s-product")), ctl("Maturity", dd(P + "s-maturity")),
-            ctl("Delivery period", dd(P + "s-delivery")),
-            ctl(f"Markets (up to {MAX_SERIES})", dd(P + "s-markets", multi=True), wide=True),
-        ], className="controls"),
-        html.Div(id=P + "s-body"),
     ])
 
 
@@ -673,6 +858,7 @@ def spark_tab():
             ctl("Efficiency %", num_input("sp-ceff", COAL_EFFICIENCY, 0.1), narrow=True),
             ctl("tCO2/MWh", num_input("sp-ccf", coal_factor(COAL_EFFICIENCY), "any", 90), narrow=True),
             html.Div(html.Button("Reset defaults", id="sp-reset", className="btn"), className="ctl"),
+            live_bar("spark"),
         ], className="controls"),
         html.Div(f"Carbon factors follow the efficiency: {GAS_EMISSION} tCO2 per MWh gas, "
                  f"{COAL_EMISSION} per MWh coal, ÷ efficiency. Type over one to use your own.",
@@ -725,6 +911,7 @@ def history_tab():
                      className="ctl", style={"minWidth": 0}),
             html.Div([html.Button("Download CSV", id="h-csv-btn", className="btn"),
                       dcc.Download(id="h-csv")], className="ctl"),
+            live_bar("history"),
         ], className="controls"),
         html.Div(id="h-body"),
     ])
@@ -746,6 +933,17 @@ def top_tab():
                 className="seg", persistence=True, persistence_type="local")),
         ], className="controls"),
         html.Div(id="t-body"),
+    ])
+
+
+def board_tab():
+    return html.Div([
+        html.Div([
+            ctl("Country", dd("b-market")), ctl("Product", dd("b-product")),
+            ctl("Day", dd("b-day")),
+            live_bar("board"),
+        ], className="controls"),
+        html.Div(id="b-body"),
     ])
 
 
@@ -776,25 +974,32 @@ def full_layout():
         # Tabs only switch which panel is visible. All four panels stay in
         # the page, so every dropdown keeps its selection when you switch
         # tabs and callbacks never point at a component that isn't there.
-        # Opens on Price history (Peter, 2026-10-11): DE Base front month.
-        dcc.Tabs(id="tabs", value="history", children=[
+        # Opens on Board by default.
+        dcc.Tabs(id="tabs", value="board", children=[
             dcc.Tab(label=label, value=value, style=TAB_STYLE, selected_style=TAB_SELECTED)
             for value, label in TABS]),
+        # "seen-<tab>" is set only when that tab is opened, so the many card
+        # callbacks of the spread tabs don't all fire on every tab switch.
+        *[dcc.Store(id=f"seen-{k}") for k in SEEN_TABS],
+        dcc.Store(id="live-ver", data=0),
+        *[dcc.Store(id=f"live-ver-{t}", data=0) for t in LIVE_SPREAD_TABS],
+        dcc.Interval(id="live-poll", interval=1000, disabled=True),
         html.Div(curve_tab(), id="panel-curve", style={"display": "none"}),
-        *[html.Div(spread_tab(P, ten), id=f"panel-{key}", style={"display": "none"})
+        *[html.Div(spread_tab(P, ten, key), id=f"panel-{key}", style={"display": "none"})
           for key, P, ten, _ in SPREAD_TABS],
         html.Div(time_spread_tab(), id="panel-tspread", style={"display": "none"}),
         html.Div(spark_tab(), id="panel-spark", style={"display": "none"}),
         html.Div(corr_tab(), id="panel-corr", style={"display": "none"}),
-        html.Div(history_tab(), id="panel-history"),
+        html.Div(history_tab(), id="panel-history", style={"display": "none"}),
         html.Div(top_tab(), id="panel-top", style={"display": "none"}),
+        html.Div(board_tab(), id="panel-board"),
         html.Div(runs_tab(), id="panel-runs", style={"display": "none"}),
-        html.Div("Source: EEX. For information only - systematic republication "
-                 "needs EEX's permission.", className="foot"),
+        html.Div("Source: EEX; GB ICE and coal: ICE Futures Europe. For information only - "
+                 "systematic republication needs EEX's / ICE's permission.", className="foot"),
     ], className="wrap")
 
 
-TABS = [("curve", "Forward curve"), *[(key, lab) for key, _, _, lab in SPREAD_TABS], ("tspread", "Time spreads"),
+TABS = [("curve", "Forward curve"), ("board", "Board"), *[(key, lab) for key, _, _, lab in SPREAD_TABS], ("tspread", "Time spreads"),
         ("spark", "Production costs"),
         ("corr", "Correlation"), ("history", "Price history"), ("top", f"Top {TOP_N}"),
         ("runs", "Data & runs")]
@@ -851,6 +1056,228 @@ def front_delivery(f: pd.DataFrame):
     return (ahead if not ahead.empty else latest)["dkey"].min()
 
 
+
+
+def live_row_specs(rows: pd.DataFrame) -> list:
+    """EEX specs for settlement rows (short_code, delivery, maturity_type,
+    product). GB ICE rows are skipped (not on EEX)."""
+    if LP is None or rows is None or rows.empty:
+        return []
+    out = []
+    for r in rows.drop_duplicates(["short_code", "delivery"]).itertuples(index=False):
+        if str(r.short_code).startswith("ICE-") or getattr(r, "market", "") == ICE_UK_MARKET:
+            continue
+        out.append(LP.eex_spec(r.short_code, str(r.delivery), r.maturity_type, r.product))
+    return out
+
+
+def live_key(spec):
+    return (spec["source"], spec["code"], spec["delivery"])
+
+
+def live_curve_rows(market, product, maturity):
+    """Contracts of a forward curve that still trade: quoted on the latest
+    trade date, delivery not started."""
+    d = load()
+    if not market:
+        return pd.DataFrame()
+    _, _, _, _, f = chain(d["settled"], market, product, maturity)
+    if f.empty:
+        return f
+    last = f["trade_date"].max()
+    cur = f[f["trade_date"] == last]
+    return cur[cur["dkey"] > date.today().isoformat()]
+
+
+def live_history_rows(market, product, maturity, dkey):
+    if not (market and dkey):
+        return pd.DataFrame()
+    h = history_frame(market, product, maturity, dkey)
+    return h.tail(1)
+
+
+def live_spark_specs(market, product, maturity, dkey, gas_hub, coal_hub):
+    """[(role, spec)]: power + gas of the delivery, EUA December of its
+    year, coal strip(s) (several when a Cal is an average of quarters)."""
+    if not (market and dkey) or LP is None:
+        return []
+    s = load()["settled"]
+    sel = s[(s["maturity_type"] == maturity) & (s["dkey"] == dkey)]
+    p = sel[(sel["market"] == market) & (sel["product"] == product)].tail(1)
+    g = sel[(sel["market"] == (gas_hub or "Gas TTF")) & (sel["product"] == "Base")].tail(1)
+    roles = [("power", x) for x in live_row_specs(p)] + [("gas", x) for x in live_row_specs(g)]
+    year = date.fromisoformat(dkey).year
+    decs = sorted(set(s[s["market"] == "EUA"]["ddate"].map(lambda x: x.year)))
+    dec = next((y for y in decs if y >= year), decs[-1] if decs else year)
+    roles.append(("eua", LP.eex_spec("FEUA", f"{dec}12", "December", "Base")))
+    hub = coal_hub or "API2"
+    ids = LP.ice_market_ids(hub)
+    for names in coal_strips(maturity, date.fromisoformat(dkey)):
+        if all(n in ids for n in names):
+            roles += [("coal", LP.ice_spec(hub, n, ids[n])) for n in names]
+            break
+    return roles
+
+
+def _live_worker(specs, tab):
+    def prog(i, n, text):
+        with _live_lock:
+            LIVE_JOB.update(done=i, total=n, text=text)
+    try:
+        res = LP.fetch(specs, progress=prog)
+        if res["fetched"] == 0:
+            msg = (f"all {res['fresh']} fetched less than {LP.FRESH_MINUTES} min ago "
+                   "- nothing new to ask")
+        else:
+            msg = (f"{res['traded']} of {res['fetched']} traded today"
+                   + (f" ({res['fresh']} fresh, skipped)" if res["fresh"] else "")
+                   + (f", {res['errors']} failed" if res["errors"] else "")
+                   + f" · {datetime.now():%H:%M}")
+    except Exception as e:                    # never leave the button stuck
+        msg = f"failed: {type(e).__name__}"
+    with _live_lock:
+        LIVE_JOB["msg"][tab] = msg
+        LIVE_JOB["vers"][tab] = LIVE_JOB["vers"].get(tab, 0) + 1   # other apps use own tab names
+        LIVE_JOB["running"] = False
+
+
+def live_status_note(q: dict, n_specs: int):
+    """One line under a tab: when fetched, how many traded."""
+    if not q:
+        return None
+    fetched = max(v["fetched_at"] for v in q.values())[11:16]
+    traded = sum(1 for v in q.values() if v.get("last") is not None)
+    errs = sum(1 for v in q.values() if str(v.get("status", "")).startswith("error"))
+    text = (f"Live (EEX trade feed / ICE bars, ~15 min delayed): fetched {fetched}, "
+            f"{traded} of {n_specs} contracts traded today"
+            + (f", {errs} failed" if errs else "") + ". Settlements unchanged.")
+    return note(text)
+
+
+if LIVE_ENABLED:
+    @app.callback(
+        Output("live-poll", "disabled"),
+        [Input(f"lv-btn-{t}", "n_clicks") for t in LIVE_MAIN_TABS],
+        State("c-market", "value"), State("c-product", "value"), State("c-maturity", "value"),
+        State("h-market", "value"), State("h-product", "value"), State("h-maturity", "value"),
+        State("h-delivery", "value"),
+        State("sp-market", "value"), State("sp-product", "value"), State("sp-maturity", "value"),
+        State("sp-delivery", "value"), State("sp-gas", "value"), State("sp-coal", "value"),
+        prevent_initial_call=True,
+    )
+    def live_start(_c, _h, _s, cm, cp, cmat, hm, hp, hmat, hdk, sm, sp, smat, sdk, sgas, scoal):
+        tab = str(ctx.triggered_id or "").replace("lv-btn-", "")
+        if tab not in LIVE_MAIN_TABS:
+            return no_update
+        if tab == "curve":
+            specs = live_row_specs(live_curve_rows(cm, cp, cmat))
+        elif tab == "history":
+            specs = live_row_specs(live_history_rows(hm, hp, hmat, hdk))
+        else:
+            specs = [x for _, x in live_spark_specs(sm, sp, smat, sdk, sgas, scoal)]
+        return _live_begin(tab, specs)
+
+    def _live_begin(tab, specs):
+        """Start the fetch thread (one job at a time). Returns live-poll.disabled."""
+        seen, uniq = set(), []
+        for x in specs:                       # a contract used by several cards: once
+            if live_key(x) not in seen:
+                seen.add(live_key(x))
+                uniq.append(x)
+        with _live_lock:
+            if LIVE_JOB["running"]:
+                return False
+            if not uniq:
+                LIVE_JOB["msg"][tab] = "nothing to fetch (page still loading?)"
+                LIVE_JOB["vers"][tab] = LIVE_JOB["vers"].get(tab, 0) + 1
+                return False
+            LIVE_JOB.update(running=True, tab=tab, done=0, total=len(uniq),
+                            text="starting")
+        threading.Thread(target=_live_worker, args=(uniq, tab), daemon=True).start()
+        return False
+
+    def _pair_specs(lefts, rights, prods, tenors, dkeys):
+        """Both legs of every Area spreads card (EEX only; GB ICE skipped)."""
+        s = load()["settled"]
+        out = []
+        for l, r, p, t, k in zip(lefts, rights, prods, tenors, dkeys):
+            if not (l and r and p and t and k):
+                continue
+            for m in (l, r):
+                rows = s[(s["market"] == m) & (s["product"] == p) &
+                         (s["maturity_type"] == t) & (s["dkey"] == k)]
+                out += live_row_specs(rows.tail(1))
+        return out
+
+    _SP_STATES = []
+    for _k, _P, _t, _ in SPREAD_TABS:
+        _SP_STATES += [State({"type": _P + kind, "index": ALL}, "value")
+                       for kind in ("ps-left", "ps-right", "ps-product", "ps-tenor", "ps-delivery")]
+    _TS_STATES = []
+    for _r, _m in enumerate(TS_ROWS):
+        _R = f"ts{_r}"
+        _TS_STATES += [State(_R + "-market", "value"), State(_R + "-product", "value"),
+                       State({"type": _R + "-tenor", "index": ALL}, "value"),
+                       State({"type": _R + "-near", "index": ALL}, "value"),
+                       State({"type": _R + "-far", "index": ALL}, "value")]
+
+    @app.callback(
+        Output("live-poll", "disabled", allow_duplicate=True),
+        [Input(f"lv-btn-{t}", "n_clicks") for t in LIVE_SPREAD_TABS],
+        _SP_STATES + _TS_STATES,
+        prevent_initial_call=True,
+    )
+    def live_start_spreads(*args):
+        """Spread tabs: every leg of every card on that tab."""
+        tab = str(ctx.triggered_id or "").replace("lv-btn-", "")
+        if tab not in LIVE_SPREAD_TABS or tab == "board":     # board: live_start_board
+            return no_update
+        st = args[len(LIVE_SPREAD_TABS):]
+        if tab != "tspread":
+            i = [k for k, _, _, _ in SPREAD_TABS].index(tab)
+            return _live_begin(tab, _pair_specs(*st[i * 5:i * 5 + 5]))
+        ts = st[len(SPREAD_TABS) * 5:]
+        s = load()["settled"]
+        specs = []
+        for r in range(len(TS_ROWS)):
+            market, product, tenors, nears, fars = ts[r * 5:r * 5 + 5]
+            for t, a, b in zip(tenors or [], nears or [], fars or []):
+                for k in (a, b):
+                    if market and t and k:
+                        rows = s[(s["market"] == market) & (s["product"] == (product or "Base")) &
+                                 (s["maturity_type"] == t) & (s["dkey"] == k)]
+                        specs += live_row_specs(rows.tail(1))
+        return _live_begin(tab, specs)
+
+    @app.callback(
+        [Output(f"lv-btn-{t}", "children") for t in LIVE_TABS]
+        + [Output(f"lv-btn-{t}", "disabled") for t in LIVE_TABS]
+        + [Output(f"lv-msg-{t}", "children") for t in LIVE_TABS]
+        + [Output("live-ver", "data")]
+        + [Output(f"live-ver-{t}", "data") for t in LIVE_SPREAD_TABS]
+        + [Output("live-poll", "disabled", allow_duplicate=True)],
+        Input("live-poll", "n_intervals"), State("live-ver", "data"),
+        [State(f"live-ver-{t}", "data") for t in LIVE_SPREAD_TABS],
+        prevent_initial_call=True,
+    )
+    def live_progress(_, ver, *sp_vers):
+        with _live_lock:
+            job = {**LIVE_JOB, "msg": dict(LIVE_JOB["msg"]), "vers": dict(LIVE_JOB["vers"])}
+        labels = ["Update prices"] * len(LIVE_TABS)
+        msgs = [job["msg"].get(t, "") for t in LIVE_TABS]
+        keep_vers = [no_update] * (1 + len(LIVE_SPREAD_TABS))
+        if job["running"]:
+            i = LIVE_TABS.index(job["tab"])
+            labels[i] = f"Updating {job['done']}/{job['total']} …"
+            msgs[i] = job["text"]
+            return labels + [True] * len(LIVE_TABS) + msgs + keep_vers + [False]
+        main = sum(job["vers"][t] for t in LIVE_MAIN_TABS)
+        vers = [main if main != ver else no_update]
+        vers += [job["vers"][t] if job["vers"][t] != v else no_update
+                 for t, v in zip(LIVE_SPREAD_TABS, sp_vers)]
+        return labels + [False] * len(LIVE_TABS) + msgs + vers + [True]
+
+
 # ---------------------------------------------------------------------
 # Header and tab switching
 # ---------------------------------------------------------------------
@@ -859,11 +1286,18 @@ def switch_tab(tab):
     return [{"display": "block" if v == tab else "none"} for v, _ in TABS]
 
 
+@app.callback([Output(f"seen-{k}", "data") for k in SEEN_TABS], Input("tabs", "value"))
+def mark_seen(tab):
+    return [tab if tab == k else no_update for k in SEEN_TABS]
+
+
 @app.callback(Output("header-line", "children"), Input("tabs", "value"))
 def header(_):
     d = load()
     s = d["settled"]
     extra = f" + {d['gas_path'].name}" if d.get("gas_path") else ""
+    if (s["market"] == ICE_UK_MARKET).any():
+        extra += " + ice_market_data.db (GB ICE)"
     return (f"{d['path'].name}{extra} · {len(s):,} settlements · {s['short_code'].nunique()} contracts · "
             f"{s['market'].nunique()} markets · trade dates {s['trade_date'].min()} to "
             f"{s['trade_date'].max()}")
@@ -881,9 +1315,9 @@ def header(_):
     Output("c-body", "children"),
     Input("c-market", "value"), Input("c-product", "value"),
     Input("c-maturity", "value"), Input("c-asof", "value"), Input("c-compare", "value"),
-    Input("tabs", "value"),
+    Input("tabs", "value"), Input("live-ver", "data"),
 )
-def forward_curve(market, product, maturity, as_of, compare, tab):
+def forward_curve(market, product, maturity, as_of, compare, tab, _live=None):
     # Only build while visible: Plotly sizes a chart from its container, and
     # a hidden container has no width. Switching tab re-runs this.
     if tab != "curve":
@@ -933,8 +1367,37 @@ def forward_curve(market, product, maturity, as_of, compare, tab):
                      tickangle=0 if len(order) <= 14 else -45)
     end_labels(fig, xs, ys, ns, cs)
 
+    # Live (today, delayed) on top of the latest settlement curve.
+    live_tiles, live_notes, live_by_dkey = [], [], {}
+    if LIVE_ENABLED and as_of == f["trade_date"].max():
+        lrows = cur[(cur["trade_date"] == as_of) & (cur["dkey"] > date.today().isoformat())]
+        lspecs = live_row_specs(lrows)
+        q = LP.read(lspecs)
+        if q:
+            lv = []
+            for r in lrows.drop_duplicates("dkey").sort_values("dkey").itertuples(index=False):
+                v = q.get(("EEX", r.short_code, str(r.delivery)), {})
+                if v.get("last") is not None:
+                    lv.append((r.dkey, r.dlabel, v["last"], v["last_time"], r.settlement_price))
+                    live_by_dkey[r.dkey] = v["last"]
+            if lv:
+                fig.add_trace(go.Scatter(
+                    x=[a[1] for a in lv], y=[a[2] for a in lv], name="Live today",
+                    mode="lines+markers", line=dict(color=LIVE_COLOR, width=2, dash="dash"),
+                    marker=dict(size=9, symbol="diamond"),
+                    customdata=[[a[3], a[2] - a[4]] for a in lv],
+                    hovertemplate="%{y:.2f} live · last trade %{customdata[0]} · "
+                                  "%{customdata[1]:+.2f} vs settle<extra></extra>"))
+                a = lv[0]
+                live_tiles = [kpi(f"Live · {a[1]} · {a[3]}", fmt(a[2]),
+                                  f"{fmt(a[2] - a[4], sign=True)} vs settle {as_of[5:]}",
+                                  a[2] - a[4])]
+            live_notes = [live_status_note(q, len(lspecs))]
+
     wide = (cur.pivot_table(index=["dkey", "dlabel"], columns="trade_date",
                             values="settlement_price").reset_index().sort_values("dkey"))
+    if live_by_dkey:
+        wide["live"] = wide["dkey"].map(live_by_dkey)
     kpis = []
     # "Front" = first delivery actually quoted on the chosen trade date.
     # Front = first delivery not yet started on the chosen trade date
@@ -962,7 +1425,8 @@ def forward_curve(market, product, maturity, as_of, compare, tab):
     elif front is not None:
         kpis = [kpi(f"Front {maturity.lower()} · {front['dlabel']}", fmt(front[as_of]), unit)]
 
-    body = [html.Div(kpis, className="kpis"), html.Div(graph(fig), className="card"),
+    body = [*live_notes, html.Div(kpis + live_tiles, className="kpis"),
+            html.Div(graph(fig), className="card"),
             html.Details([html.Summary("Table — curve by delivery period"),
                           table(wide.drop(columns=["dkey"]).rename(columns={"dlabel": "delivery"}),
                                 page_size=40)])]
@@ -986,6 +1450,144 @@ def leg_series(f: pd.DataFrame) -> pd.Series:
     return f.groupby("trade_date")["settlement_price"].mean()
 
 
+# ---------------------------------------------------------------------
+# Spread cards: live spread + "settled vs delivered" (Peter, 2026-10-21:
+# "please do so and add also show how the spread settled and how it
+# actually delivered").
+# ---------------------------------------------------------------------
+def live_spread_info(rows_l, rows_r, w, name_l, name_r):
+    """Today's live spread for a card. rows_*: settlement rows of each leg
+    (one delivery); w: settled frame with L, R, spread. A leg without a
+    trade today keeps its last settlement. None when nothing was fetched today."""
+    if not LIVE_ENABLED or w.empty:
+        return None
+    sl, sr = live_row_specs(rows_l.tail(1)), live_row_specs(rows_r.tail(1))
+    if not sl or not sr:
+        return None
+    q = LP.read(sl + sr)
+    ql, qr = q.get(live_key(sl[0])), q.get(live_key(sr[0]))
+    if not ql and not qr:
+        return None
+    fetched = max(v["fetched_at"] for v in (ql, qr) if v)[11:16]
+    vl = ql.get("last") if ql else None
+    vr = qr.get("last") if qr else None
+    if vl is None and vr is None:
+        return {"value": None, "time": fetched, "sub": "no trades today"}
+    L = vl if vl is not None else w["L"].iloc[-1]
+    R = vr if vr is not None else w["R"].iloc[-1]
+    value = L - R
+    chg = value - w["spread"].iloc[-1]
+    one = "" if vl is not None and vr is not None else \
+        f" · only {name_l if vl is not None else name_r} traded"
+    return {"value": value, "time": fetched, "change": chg, "L": L, "R": R,
+            "sub": f"{fmt(chg, sign=True)} vs settle{one}"}
+
+
+def live_tile(info):
+    if not info:
+        return None
+    if info["value"] is None:
+        return kpi(f"Live · {info['time']}", "—", info["sub"])
+    return kpi(f"Live · {info['time']}", fmt(info["value"], sign=True), info["sub"], info["change"])
+
+
+def add_live_point(fig, info, sp):
+    """Purple diamond at today; y range widened to include it."""
+    if not info or info.get("value") is None:
+        return
+    v = info["value"]
+    fig.add_trace(go.Scatter(x=[pd.Timestamp(date.today())], y=[v], name="Live today",
+                             mode="markers", marker=dict(symbol="diamond", size=11, color=LIVE_COLOR,
+                                                         line=dict(color="white", width=1)),
+                             hovertemplate=f"live {info['time']}: %{{y:+.2f}}<extra></extra>"))
+    lo, hi = min(sp.min(), v), max(sp.max(), v)
+    pad = max((hi - lo) * 0.08, 0.5)
+    fig.update_yaxes(range=[lo - pad, hi + pad], autorange=False)
+
+
+_D = None
+
+
+def delivered_mod():
+    """spread_delivered.py (shared with the Spread analyzer app). It imports
+    eex_dash; point that at this running module, not a second copy."""
+    global _D
+    if _D is None:
+        sys.modules.setdefault("eex_dash", sys.modules[__name__])
+        import spread_delivered
+        _D = spread_delivered
+    return _D
+
+
+DELIVERED_TENORS = ("Month", "Quarter", "Year")
+
+
+def delivered_details(kind, tenor, dkey, product, a, b=None, near=None, far=None):
+    """'Settled vs delivered': the picked contract's own period in earlier
+    years (Nov-26 -> past Novembers, Q1-27 -> past Q1s, Cal-27 -> past Cals).
+    Settled = futures spread on the last day before delivery (EEX settlement,
+    else last traded price). Delivered = the same spread from day-ahead prices
+    over the delivery hours (ENTSO-E). Folded; the summary line has the gist."""
+    def box(summary, *body):
+        return html.Details([html.Summary(summary, className="dlv-sum"), *body], className="dlv")
+    if tenor not in DELIVERED_TENORS:
+        return box("Settled vs delivered: for month, quarter and year contracts only.")
+    try:
+        D = delivered_mod()
+        F = D.F
+        if F.SPOT_DB is None:
+            return box("Settled vs delivered: day-ahead database (entsoe_data.db) not found.")
+        missing = [m for m in (a, b) if m and m not in F.SPOT_ZONE]
+        if missing:
+            return box(f"Settled vs delivered: no day-ahead match for {', '.join(missing)} "
+                       "(IT futures settle on PUN, GB is in GBP).")
+        if kind == "area":
+            df = D.location(a, b, tenor, product)
+        else:
+            df = D.time_spread(a, tenor, near, tenor, far, product)
+    except Exception as e:               # never break the card
+        return box(f"Settled vs delivered: not available ({type(e).__name__}).")
+    pick = date.fromisoformat(near if kind == "time" else dkey)
+    per = {"Month": MON[pick.month - 1], "Quarter": f"Q{(pick.month - 1) // 3 + 1}", "Year": "Cal"}[tenor]
+    if df is not None and not df.empty and tenor != "Year":
+        df = df[[d.month == pick.month for d in df["start"]]]
+    if df is None or df.empty:
+        return box(f"Settled vs delivered · {per} in past years: no fully delivered {per} "
+                   "with day-ahead prices yet.")
+    d = df.sort_values("start", ascending=False)
+    dl = d["Delivered"]
+    fut = d[d["Futures"].notna()]
+    last = d.iloc[0]
+    if not fut.empty:
+        f0 = fut.iloc[0]
+        gist = (f"{f0['Period']} settled {fmt(f0['Futures'], sign=True)} → delivered "
+                f"{fmt(f0['Delivered'], sign=True)} ({fmt(f0['Diff'], sign=True)})")
+    else:
+        gist = f"{last['Period']} delivered {fmt(last['Delivered'], sign=True)}"
+    summary = (f"Settled vs delivered · {per} in past years: {gist} · "
+               f"avg delivered {fmt(dl.mean(), sign=True)} over {len(d)}")
+    tiles = [kpi("Periods", f"{len(d)}", f"from {d['Period'].iloc[-1].split(' - ')[0]}"),
+             kpi("Avg delivered", fmt(dl.mean(), sign=True), f"{(dl > 0).mean() * 100:.0f} % positive"),
+             kpi("Last delivered", fmt(last["Delivered"], sign=True), last["Period"], last["Delivered"]),
+             kpi("Avg settled", fmt(fut["Futures"].mean(), sign=True) if len(fut) else "—",
+                 f"{len(fut)} with futures before delivery"),
+             kpi("Delivered − settled", fmt(fut["Diff"].mean(), sign=True) if len(fut) else "—",
+                 "> 0: buying the spread paid", fut["Diff"].mean() if len(fut) else None)]
+    spot_cols = [c for c in d.columns if c.startswith("Spot ")]
+    tbl = pd.DataFrame({"Period": d["Period"], "Settled": d["Futures"],
+                        "Settle day": d["Futures day"].replace("", "—"),
+                        "Delivered": dl, "Delivered − settled": d["Diff"],
+                        **{c.replace("Spot ", "Day-ahead "): d[c] for c in spot_cols}})
+    notes = ["Settled = futures spread on the last trading day before delivery: EEX "
+             "settlement (from Aug 2026), else last traded price (trade data from Nov 2025). "
+             "Delivered = mean day-ahead price over the delivery hours (ENTSO-E, Base all hours, "
+             "Peak 08-20 Mon-Fri)."]
+    if kind == "time":
+        notes.append("Each row: that year's near period minus the period the same distance later.")
+    return box(summary, fast_kpis(tiles), table(tbl, page_size=10),
+               *[html.Div(n, className="note") for n in notes])
+
+
 def register_spread_tab(key, P, TENOR):
     """Callbacks for one Area spreads tab (ids prefixed with P)."""
     @app.callback(
@@ -1005,9 +1607,11 @@ def register_spread_tab(key, P, TENOR):
         Input({"type": P + "ps-product", "index": MATCH}, "value"),
         Input({"type": P + "ps-tenor", "index": MATCH}, "value"),
         Input({"type": P + "ps-delivery", "index": MATCH}, "value"),
-        Input("tabs", "value"),
+        Input({"type": P + "ps-legs", "index": MATCH}, "value"),
+        Input(f"seen-{key}", "data"),
+        Input(f"live-ver-{key}", "data"),
     )
-    def pair_spread(left, right, product, tenor, dkey, tab):
+    def pair_spread(left, right, product, tenor, dkey, legs, tab, _live=None):
         if tab != key:
             return [no_update] * 11
         d = load()
@@ -1087,6 +1691,9 @@ def register_spread_tab(key, P, TENOR):
             kpi(f"{right} {label}", fmt(lR), f"{sgn(dR)} d/d", dR),
             kpi(f"Spread % of {right}", (f"{rel:+.1f} %" if rel is not None else "—"), "relative"),
         ]
+        live = live_spread_info(a, b, w, left, right)
+        if live:
+            tiles.insert(0, live_tile(live))
         fig = fig_base(f"{left} − {right} · {product} {label} — {unit}", unit, 250)
         x = pd.to_datetime(w.index)
         fig.add_trace(go.Scatter(x=x, y=sp, name=f"{left} − {right}", mode="lines+markers",
@@ -1101,90 +1708,49 @@ def register_spread_tab(key, P, TENOR):
                       annotation_text=f"avg {mean:+.2f}", annotation_position="top left",
                       annotation_font=dict(size=11, color=INK["muted"]))
         fig.update_layout(showlegend=False, margin=dict(l=50, r=20, t=40, b=30))
+        add_live_point(fig, live, sp)
+        if legs:
+            add_legs(fig, w, f"{left} {label}", f"{right} {label}", unit)
         tbl = w.reset_index().rename(columns={"index": "trade_date", "L": left, "R": right,
                                               "spread": f"{left} − {right}"})
         tbl = tbl.rename(columns={tbl.columns[0]: "trade_date"}).sort_values("trade_date", ascending=False)
-        return out + [[html.Div(tiles, className="kpis"), graph(fig),
-                       html.Details([html.Summary("Table"), table(tbl, page_size=10)])]]
-
-
-    @app.callback(
-        Output(P + "s-product", "options"), Output(P + "s-product", "value"),
-        Output(P + "s-maturity", "options"), Output(P + "s-maturity", "value"),
-        Output(P + "s-delivery", "options"), Output(P + "s-delivery", "value"),
-        Output(P + "s-markets", "options"), Output(P + "s-markets", "value"),
-        Output(P + "s-body", "children"),
-        Input(P + "s-product", "value"), Input(P + "s-maturity", "value"),
-        Input(P + "s-delivery", "value"), Input(P + "s-markets", "value"), Input("tabs", "value"),
-    )
-    def area_spreads(product, maturity, dkey, picked, tab):
-        if tab != key:
-            return [no_update] * 9
-        d = load()
-        s = d["settled"][d["settled"]["group"] == "Power"]
-        products = [p for p in ("Base", "Peak") if p in set(s["product"])]
-        product = keep(product, products, "Base")
-        f = s[s["product"] == product]
-        maturities = [m for m in MATURITY_ORDER if m in set(f["maturity_type"])]
-        maturity = keep(maturity, maturities, TENOR)
-        f = f[f["maturity_type"] == maturity]
-
-        dels = f.drop_duplicates("dkey").sort_values("dkey")
-        del_opts = [{"label": l, "value": k} for k, l in zip(dels["dkey"], dels["dlabel"])]
-        if dkey not in set(dels["dkey"]) or ctx.triggered_id == P + "s-maturity":
-            dkey = front_delivery(f)
-        f = f[f["dkey"] == dkey]
-
-        available = sorted(f["market"].unique())
-        mk_opts = opts(available)
-        picked = [m for m in (picked or []) if m in available]
-        if not picked and ctx.triggered_id != P + "s-markets":
-            picked = [m for m in ("DE", "FR", "DK1", "IT", "ES", "NL") if m in available] \
-                or available[:4]
-        warn = []
-        if len(picked) > MAX_SERIES:
-            warn.append(html.Div(f"Showing the first {MAX_SERIES} of {len(picked)} markets — beyond six "
-                                 "the colours stop being reliably distinguishable.", className="warn"))
-            picked = picked[:MAX_SERIES]
-        if picked:
-            unit0 = f[f["market"] == picked[0]]["unit"].iloc[0]
-            other = [m for m in picked if f[f["market"] == m]["unit"].iloc[0] != unit0]
-            if other:
-                warn.append(html.Div(f"Left out {', '.join(other)}: priced in a different "
-                                     f"currency/unit than {unit0}. No FX conversion here.",
-                                     className="warn"))
-                picked = [m for m in picked if m not in other]
-        label = dels.set_index("dkey")["dlabel"].get(dkey, "")
-        out = [opts(products), product, opts(maturities), maturity, del_opts, dkey, mk_opts, picked]
-        if not picked:
-            return out + [warn + [graph(empty_fig("Pick at least one market."))]]
-
-        g = f[f["market"].isin(picked)].sort_values("trade_date")
-        unit = g["unit"].iloc[0]
-        fig = fig_base(f"{product} {label} settlement by market — {unit}", unit, 360)
-        xs, ys, cs = [], [], []
-        for i, m in enumerate(picked):
-            r = g[g["market"] == m]
-            if r.empty:
-                continue
-            fig.add_trace(go.Scatter(x=pd.to_datetime(r["trade_date"]), y=r["settlement_price"],
-                                     name=m, mode="lines+markers",
-                                     line=dict(color=SERIES[i], width=2), marker=dict(size=6),
-                                     hovertemplate="%{y:.2f}"))
-            xs.append(pd.to_datetime(r["trade_date"].iloc[-1])); ys.append(r["settlement_price"].iloc[-1])
-            cs.append(SERIES[i])
-        end_labels(fig, xs, ys, [m for m in picked if not g[g["market"] == m].empty], cs)
-        wide = g.pivot_table(index="trade_date", columns="market", values="settlement_price").reset_index()
-        return out + [warn + [html.Div(graph(fig), className="card"),
-                              html.Details([html.Summary(f"Table — {label} by market"),
-                                            table(wide.sort_values("trade_date", ascending=False))])]]
+        if live and live.get("value") is not None:
+            tbl = pd.concat([pd.DataFrame([{"trade_date": live_label(live["time"]), left: live["L"],
+                                            right: live["R"], f"{left} − {right}": live["value"]}]),
+                             tbl], ignore_index=True)
+        return out + [[fast_kpis(tiles), graph(fig),
+                       html.Details([html.Summary("Table"), table(tbl, page_size=10)]),
+                       delivered_details("area", tenor, dkey, product, left, right)]]
 
 
 for _key, _P, _ten, _ in SPREAD_TABS:
     register_spread_tab(_key, _P, _ten)
 
 
-def spread_view(w: pd.DataFrame, lname: str, rname: str, title: str, unit: str):
+def fast_kpis(tiles):
+    """KPI tiles as ONE component (raw HTML in a dcc.Markdown) instead of
+    ~4 Dash components per tile. Dash 4 costs ~5-7 ms per component in the
+    browser; 30 spread cards x 12 tiles made the Time spreads tab take 13 s
+    before the first chart showed (2026-10-18). Same classes, same look."""
+    import html as _h
+
+    def walk(c):
+        if c is None:
+            return ""
+        if isinstance(c, (list, tuple)):
+            return "".join(walk(x) for x in c)
+        if isinstance(c, (str, int, float)):
+            return _h.escape(str(c))
+        tag = type(c).__name__.lower()
+        cls = getattr(c, "className", None)
+        attr = f' class="{_h.escape(cls)}"' if cls else ""
+        return f"<{tag}{attr}>{walk(getattr(c, 'children', None))}</{tag}>"
+    return dcc.Markdown(f'<div class="kpis">{walk(tiles)}</div>',
+                        dangerously_allow_html=True, className="kpi-md")
+
+
+def spread_view(w: pd.DataFrame, lname: str, rname: str, title: str, unit: str,
+                legs: bool = False, live_rows=None, extra=None):
     """KPI tiles + chart + table for a spread. w: index trade_date,
     columns L and R (the two legs). Same tiles as the Area spreads cards."""
     w = w.copy()
@@ -1221,6 +1787,9 @@ def spread_view(w: pd.DataFrame, lname: str, rname: str, title: str, unit: str):
         kpi(rname, fmt(lR), f"{sgn(dR)} d/d", dR),
         kpi(f"Spread % of {rname}", (f"{rel:+.1f} %" if rel is not None else "—"), "relative"),
     ]
+    live = live_spread_info(*live_rows, w, lname, rname) if live_rows else None
+    if live:
+        tiles.insert(0, live_tile(live))
     fig = fig_base(title + f" — {unit}", unit, 250)
     fig.add_trace(go.Scatter(x=pd.to_datetime(w.index), y=sp, name=title, mode="lines+markers",
                              line=dict(color=SERIES[0], width=2), marker=dict(size=4),
@@ -1233,11 +1802,19 @@ def spread_view(w: pd.DataFrame, lname: str, rname: str, title: str, unit: str):
                   annotation_text=f"avg {mean:+.2f}", annotation_position="top left",
                   annotation_font=dict(size=11, color=INK["muted"]))
     fig.update_layout(showlegend=False, margin=dict(l=50, r=20, t=40, b=30))
+    add_live_point(fig, live, sp)
+    if legs:
+        add_legs(fig, w, lname, rname, unit)
     tbl = w.reset_index()
     tbl.columns = ["trade_date", lname, rname, f"{lname} − {rname}"]
-    return [html.Div(tiles, className="kpis"), graph(fig),
-            html.Details([html.Summary("Table"),
-                          table(tbl.sort_values("trade_date", ascending=False), page_size=10)])]
+    tbl = tbl.sort_values("trade_date", ascending=False)
+    if live and live.get("value") is not None:
+        tbl = pd.concat([pd.DataFrame([{"trade_date": live_label(live["time"]), lname: live["L"],
+                                        rname: live["R"], f"{lname} − {rname}": live["value"]}]),
+                         tbl], ignore_index=True)
+    return [fast_kpis(tiles), graph(fig),
+            html.Details([html.Summary("Table"), table(tbl, page_size=10)]),
+            *([extra] if extra is not None else [])]
 
 
 def register_ts_row(r, DEF):
@@ -1247,20 +1824,24 @@ def register_ts_row(r, DEF):
     @app.callback(
         Output(R + "-market", "options"), Output(R + "-market", "value"),
         Output(R + "-product", "options"), Output(R + "-product", "value"),
-        Input(R + "-market", "value"), Input(R + "-product", "value"), Input("tabs", "value"),
+        Input(R + "-market", "value"), Input(R + "-product", "value"),
+        Input("seen-tspread", "data"),
     )
-    def ts_controls(market, product, tab):
+    def ts_controls(market_in, product_in, tab):
         if tab != "tspread":
             return [no_update] * 4
         d = load()
         s = d["settled"]
         m_opts = market_options(d)
-        market = keep(market, [o["value"] for o in m_opts], DEF)
+        market = keep(market_in, [o["value"] for o in m_opts], DEF)
         f = s[s["market"] == market]
         products = ([p for p in ("Base", "Peak") if p in set(f["product"])]
                     + sorted(p for p in f["product"].unique() if p not in ("Base", "Peak")))
-        product = keep(product, products, "Base")
-        return m_opts, market, opts(products), product
+        product = keep(product_in, products, "Base")
+        # Values only sent when they change - a re-sent value would make the
+        # three cards of the row render a second time.
+        return (m_opts, market if market != market_in else no_update,
+                opts(products), product if product != product_in else no_update)
 
 
     @app.callback(
@@ -1274,9 +1855,11 @@ def register_ts_row(r, DEF):
         Input({"type": R + "-tenor", "index": MATCH}, "value"),
         Input({"type": R + "-near", "index": MATCH}, "value"),
         Input({"type": R + "-far", "index": MATCH}, "value"),
-        Input(R + "-market", "value"), Input(R + "-product", "value"), Input("tabs", "value"),
+        Input({"type": R + "-legs", "index": MATCH}, "value"),
+        Input(R + "-market", "value"), Input(R + "-product", "value"),
+        Input("seen-tspread", "data"), Input("live-ver-tspread", "data"),
     )
-    def time_spread(tenor, near, far, market, product, tab):
+    def time_spread(tenor, near, far, legs, market, product, tab, _live=None):
         if tab != "tspread":
             return [no_update] * 7
         d = load()
@@ -1312,7 +1895,9 @@ def register_ts_row(r, DEF):
             return out + [note(f"{labels[near]} and {labels[far]} never settled on the same day.")]
         return out + [spread_view(w, labels[near], labels[far],
                                   f"{market} {product} {labels[near]} − {labels[far]}",
-                                  a["unit"].iloc[0])]
+                                  a["unit"].iloc[0], legs=bool(legs), live_rows=(a, b),
+                                  extra=delivered_details("time", tenor, near, product, market,
+                                                          near=near, far=far))]
 
 
 for _r, _m in enumerate(TS_ROWS):
@@ -1480,7 +2065,32 @@ def eua_prices() -> pd.DataFrame:
         if not o.empty:
             rows.append(pd.DataFrame({"trade_date": o["trade_date"], "dec_year": y,
                                       "eua": o["last"], "eua_src": "last trade"}))
-    return pd.concat(rows, ignore_index=True)
+    # Backup (2026-10-21): ICE EUA December settlements for days EEX doesn't have
+    # yet (eex_gas_eua.db runs late in the nightly chain). ICE vs EEX ~EUR 0.01.
+    out = pd.concat(rows, ignore_index=True)
+    ice = ice_eua()
+    if not ice.empty:
+        have = set(zip(out["trade_date"], out["dec_year"]))
+        ice = ice[[k not in have for k in zip(ice["trade_date"], ice["dec_year"])]]
+        out = pd.concat([out, ice], ignore_index=True)
+    return out
+
+
+def ice_eua() -> pd.DataFrame:
+    """EUA December settlements from ice_market_data.db (strips Dec26, Dec27 ...)."""
+    cols = ["trade_date", "dec_year", "eua", "eua_src"]
+    path = ice_db()
+    if path is None:
+        return pd.DataFrame(columns=cols)
+    try:
+        with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+            x = pd.read_sql_query("SELECT strip, trade_date, price FROM ice_settlement "
+                                  "WHERE product = 'EUA' AND strip LIKE 'Dec__' AND price IS NOT NULL", conn)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame({"trade_date": x["trade_date"].astype(str),
+                         "dec_year": 2000 + x["strip"].str[3:].astype(int),
+                         "eua": x["price"].astype(float), "eua_src": "ICE settlement"})
 
 
 def pick_eua(eua: pd.DataFrame, trade_date: str, year: int):
@@ -1559,9 +2169,10 @@ def all_clean_sparks(power: pd.DataFrame, gas: pd.DataFrame, eua: pd.DataFrame,
     Input("sp-maturity", "value"), Input("sp-delivery", "value"),
     Input("sp-gas", "value"), Input("sp-eff", "value"), Input("sp-cf", "value"),
     Input("sp-coal", "value"), Input("sp-ceff", "value"), Input("sp-ccf", "value"),
-    Input("tabs", "value"),
+    Input("tabs", "value"), Input("live-ver", "data"),
 )
-def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ceff, ccf, tab):
+def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ceff, ccf, tab,
+                 _live=None):
     if tab != "spark":
         return [no_update] * 11
     d = load()
@@ -1630,10 +2241,24 @@ def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ce
     def dd(col):
         if prev is None or pd.isna(last[col]) or pd.isna(prev[col]):
             return None
+        # Do not compare different EUA/coal contracts when the reference rolls.
+        identity = {"eua": "eua_dec", "coal_usd": "coal_strip"}.get(col)
+        if identity and (pd.isna(last[identity]) or pd.isna(prev[identity])
+                         or last[identity] != prev[identity]):
+            return None
         return last[col] - prev[col]
 
     def dtxt(v, base):
         return f"{fmt(v, sign=True)} day-on-day" if v is not None else base
+
+    def settlement_tile(label, col, details, dec=2, cost=False):
+        change = dd(col)
+        text = (f"{fmt(change, dec, sign=True)} vs {prev['trade_date']}"
+                if change is not None else "Change unavailable")
+        colour = -change if cost and change is not None else change
+        card = kpi(label, fmt(last[col], dec), text, colour)
+        card.children.append(html.Div(details, className="kpi-label"))
+        return card
 
     eua_txt = (f"Dec-{last['eua_dec'] % 100:02d}" if pd.notna(last["eua_dec"]) else "—")
     tiles = [
@@ -1641,20 +2266,99 @@ def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ce
             dtxt(dd("clean_spark"), unit), dd("clean_spark")),
         kpi(f"CDS · {coal_hub}", fmt(last["cds"]),
             dtxt(dd("cds"), unit) if has_coal else "no coal price yet", dd("cds")),
-        kpi(f"{market} {product} {label}", fmt(last["power"]), "EUR/MWh"),
-        kpi(f"Gas plant · {eff:g} %", fmt(last["gas_cost"]),
-            f"{fmt(last['fuel_cost'])} + {fmt(last['carbon_cost'])} CO2",
-            None if dd("gas_cost") is None else -dd("gas_cost")),
-        kpi(f"Coal plant · {ceff:g} %", fmt(last["coal_cost"]),
-            f"{fmt(last['coal_fuel_cost'])} + {fmt(last['coal_carbon_cost'])} CO2",
-            None if dd("coal_cost") is None else -dd("coal_cost")),
-        kpi(f"{gas_name} {label}", fmt(last["gas"]), "EUR/MWh"),
-        kpi(f"{coal_hub} {last['coal_strip'] or label}", fmt(last["coal_usd"]),
-            f"USD/t = {fmt(last['coal_eur_th'])} €/MWh"),
-        kpi(f"EUA {eua_txt}", fmt(last["eua"]), "EUR/t"),
-        kpi("EUR/USD", fmt(last["fx"], 4), f"ECB {last['fx_date'] or '—'}"),
+        settlement_tile(f"{market} {product} {label}", "power", "EUR/MWh"),
+        settlement_tile(f"Gas plant · {eff:g} %", "gas_cost",
+                        f"{fmt(last['fuel_cost'])} + {fmt(last['carbon_cost'])} CO2",
+                        cost=True),
+        settlement_tile(f"Coal plant · {ceff:g} %", "coal_cost",
+                        f"{fmt(last['coal_fuel_cost'])} + {fmt(last['coal_carbon_cost'])} CO2",
+                        cost=True),
+        settlement_tile(f"{gas_name} {label}", "gas", "EUR/MWh"),
+        settlement_tile(f"{coal_hub} {last['coal_strip'] or label}", "coal_usd",
+                        f"USD/t = {fmt(last['coal_eur_th'])} €/MWh"),
+        settlement_tile(f"EUA {eua_txt}", "eua", "EUR/t"),
+        settlement_tile("EUR/USD", "fx", f"ECB {last['fx_date'] or '—'}", dec=4),
     ]
     tiles = html.Div(tiles, className="kpis")
+
+    # Live (today, delayed): CSS / CDS with today's prices where traded,
+    # else the last settlement - each tile says which.
+    live_block = []
+    live_row = None
+    if LIVE_ENABLED:
+        roles = live_spark_specs(market, product, maturity, dkey, gas_hub, coal_hub)
+        q = LP.read([x for _, x in roles])
+        if q:
+            got = {}
+            for role, x in roles:
+                got.setdefault(role, []).append(q.get(live_key(x), {}))
+
+            def pick(role, settled):
+                vs = got.get(role, [])
+                if vs and all(v.get("last") is not None for v in vs):
+                    return (sum(v["last"] for v in vs) / len(vs),
+                            max(v["last_time"] for v in vs), True)
+                return settled, None, False
+
+            pw_, pw_t, pw_l = pick("power", last["power"])
+            ga_, ga_t, ga_l = pick("gas", last["gas"])
+            eu_, eu_t, eu_l = pick("eua", last["eua"])
+            co_, co_t, co_l = pick("coal", last["coal_usd"])
+
+            def tag(is_live, t):
+                return f"live {t}" if is_live else f"settle {last['trade_date'][5:]}"
+            css_l = pw_ - ga_ / (eff / 100) - eu_ * cf if pd.notna(eu_) else None
+            fxv = last["fx"]
+            cds_l = (pw_ - co_ / fxv / COAL_MWH_PER_T / (ceff / 100) - eu_ * ccf
+                     if pd.notna(co_) and pd.notna(fxv) and pd.notna(eu_) else None)
+            if pw_l or ga_l or eu_l or co_l:
+                t_ = max(t for t in (pw_t, ga_t, eu_t, co_t) if t)
+                coal_th = co_ / fxv / COAL_MWH_PER_T if pd.notna(co_) and pd.notna(fxv) else None
+                live_row = {"trade_date": live_label(t_), "power": pw_, "gas": ga_,
+                            "fuel_cost": ga_ / (eff / 100), "coal_usd": co_, "fx": fxv,
+                            "coal_eur_th": coal_th,
+                            "coal_fuel_cost": coal_th / (ceff / 100) if coal_th is not None else None,
+                            "eua": eu_, "eua_dec": last["eua_dec"], "carbon_cost": eu_ * cf,
+                            "coal_carbon_cost": eu_ * ccf, "gas_cost": ga_ / (eff / 100) + eu_ * cf,
+                            "coal_cost": (coal_th / (ceff / 100) + eu_ * ccf) if coal_th is not None else None,
+                            "clean_spark": css_l, "cds": cds_l}
+                d_css = (css_l - last["clean_spark"]) if css_l is not None else None
+                d_cds = (cds_l - last["cds"]) if cds_l is not None and pd.notna(last["cds"]) else None
+                def live_price_tile(label, value, col, is_live, timestamp, unit):
+                    # Live quotes compare with the latest available settlement.
+                    # A settlement fallback compares with the preceding settlement,
+                    # and keeps its settlement tag so it cannot be mistaken for live.
+                    candidates = hist[hist[col].notna()]
+                    identity = {"eua": "eua_dec", "coal_usd": "coal_strip"}.get(col)
+                    if identity:
+                        candidates = candidates[candidates[identity].eq(last[identity])]
+                    if not is_live:
+                        candidates = candidates[candidates["trade_date"] < last["trade_date"]]
+                    reference = (candidates.sort_values("trade_date").iloc[-1]
+                                 if not candidates.empty else None)
+                    change = (value - reference[col] if reference is not None
+                              and pd.notna(value) else None)
+                    text = (f"{fmt(change, sign=True)} vs settle {reference['trade_date']}"
+                            if change is not None else "Change unavailable")
+                    card = kpi(label, fmt(value), text, change)
+                    card.children.append(html.Div(tag(is_live, timestamp) + " · " + unit,
+                                                  className="kpi-label"))
+                    return card
+
+                lt = [
+                    kpi("CSS live", fmt(css_l), f"{fmt(d_css, sign=True)} vs settle {last['trade_date']}"
+                        if d_css is not None else "—", d_css),
+                    kpi(f"CDS live · {coal_hub}", fmt(cds_l), f"{fmt(d_cds, sign=True)} vs settle {last['trade_date']}"
+                        if d_cds is not None else "—", d_cds),
+                    live_price_tile(f"{market} {label}", pw_, "power", pw_l, pw_t, "EUR/MWh"),
+                    live_price_tile(f"{gas_name} {label}", ga_, "gas", ga_l, ga_t, "EUR/MWh"),
+                    live_price_tile(f"EUA {eua_txt}", eu_, "eua", eu_l, eu_t, "EUR/t"),
+                    live_price_tile(f"{coal_hub}", co_, "coal_usd", co_l, co_t, "USD/t"),
+                ]
+                live_block = [html.Div("Today (live where traded)", className="grp",
+                                       style={"margin": "4px 0 2px"}),
+                              html.Div(lt, className="kpis")]
+            live_block.append(live_status_note(q, len(roles)))
 
     notes = [note(f"CSS = power − gas ÷ {eff:g} % − EUA × {cf:.3f}.   "
                   f"CDS = power − {coal_hub} (USD/t ÷ EUR/USD ÷ {COAL_MWH_PER_T} MWh/t) ÷ "
@@ -1686,31 +2390,27 @@ def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ce
     x = pd.to_datetime(hist["trade_date"])
     xs = dict(rangebreaks=[dict(bounds=["sat", "mon"])])
 
-    # --- 1. CSS + CDS (left) with production costs (right) ---------------
-    f1 = fig_base(f"{market} {product} {label}: clean spark and clean dark spread, "
-                  "with production costs", unit, 380)
-    f1.add_trace(go.Scatter(x=x, y=hist["clean_spark"], name="CSS (left)", mode="lines+markers",
-                            line=dict(color=SERIES[0], width=2.5), marker=dict(size=5),
-                            hovertemplate="%{y:.2f}"))
-    f1.add_trace(go.Scatter(x=x, y=hist["cds"], name="CDS (left)", mode="lines+markers",
-                            line=dict(color=COAL_COLOR, width=2.5), marker=dict(size=5),
-                            hovertemplate="%{y:.2f}"))
-    f1.add_hline(y=0, line=dict(color=INK["axis"], width=1))
-    f1.add_trace(go.Scatter(x=x, y=hist["gas_cost"], name="Gas plant cost (right)",
-                            mode="lines", yaxis="y2",
-                            line=dict(color=SERIES[0], width=1.5, dash="dot"),
-                            hovertemplate="%{y:.2f}"))
-    f1.add_trace(go.Scatter(x=x, y=hist["coal_cost"], name="Coal plant cost (right)",
-                            mode="lines", yaxis="y2",
-                            line=dict(color=COAL_COLOR, width=1.5, dash="dot"),
-                            hovertemplate="%{y:.2f}"))
-    f1.update_layout(
-        yaxis=dict(title=dict(text="Clean spread — EUR/MWh")),
-        yaxis2=dict(title=dict(text="Production cost — EUR/MWh power"), overlaying="y",
-                    side="right", showgrid=False, zeroline=False, linecolor=INK["axis"],
-                    tickformat=".0f"),
-        showlegend=True)
-    f1.update_xaxes(**xs)
+    # --- 1. Separate CSS and CDS histories, each with its own plant cost ---
+    def clean_spread_chart(name, spread_col, cost_col, plant, colour):
+        fig = fig_base(f"{market} {product} {label}: {name} with {plant.lower()} cost", unit, 380)
+        fig.add_trace(go.Scatter(x=x, y=hist[spread_col], name=f"{name} (left)",
+                                mode="lines+markers", line=dict(color=colour, width=2.5),
+                                marker=dict(size=5), hovertemplate="%{y:.2f}"))
+        fig.add_hline(y=0, line=dict(color=INK["axis"], width=1))
+        fig.add_trace(go.Scatter(x=x, y=hist[cost_col], name=f"{plant} cost (right)",
+                                mode="lines", yaxis="y2",
+                                line=dict(color=colour, width=1.5, dash="dot"),
+                                hovertemplate="%{y:.2f}"))
+        fig.update_layout(
+            yaxis=dict(title=dict(text=f"{name} — EUR/MWh")),
+            yaxis2=dict(title=dict(text="Production cost — EUR/MWh power"), overlaying="y",
+                        side="right", showgrid=False, zeroline=False, linecolor=INK["axis"],
+                        tickformat=".0f"), showlegend=True)
+        fig.update_xaxes(**xs)
+        return fig
+
+    f_css = clean_spread_chart("CSS", "clean_spark", "gas_cost", "Gas plant", SERIES[0])
+    f_cds = clean_spread_chart("CDS", "cds", "coal_cost", "Coal plant", COAL_COLOR)
 
     # --- 2. Production cost, stacked, one chart per plant -----------------
     def cost_chart(title, fuel, carbon, fuel_name, fuel_rgba):
@@ -1779,19 +2479,25 @@ def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ce
     tbl = hist[["trade_date", "power", "gas", "fuel_cost", "coal_usd", "fx", "coal_eur_th",
                 "coal_fuel_cost", "eua", "eua_dec", "carbon_cost", "coal_carbon_cost",
                 "gas_cost", "coal_cost", "clean_spark", "cds"]].copy()
+    tbl = tbl.sort_values("trade_date", ascending=False)
+    if live_row is not None:
+        tbl = pd.concat([pd.DataFrame([live_row]), tbl], ignore_index=True)
     tbl["eua_dec"] = tbl["eua_dec"].map(lambda v: f"Dec-{int(v) % 100:02d}" if pd.notna(v) else "")
     tbl = tbl.rename(columns={"clean_spark": "css", "fuel_cost": "gas_fuel_cost",
                               "carbon_cost": "gas_carbon_cost"})
     body = notes + [
+        *live_block,
         tiles,
-        html.Div(graph(f1), className="card"),
+        html.Div(graph(f_css), className="card"),
+        html.Div(graph(f_cds), className="card"),
         html.Div([html.Div(graph(f2a), className="card"), html.Div(graph(f2b), className="card")],
                  className="row2"),
         html.Div([html.Div(graph(f4), className="card"), html.Div(graph(f5), className="card")],
                  className="row2"),
         *grid_block,
-        html.Details([html.Summary(f"Table — {market} {product} {label}, every trade date"),
-                      table(tbl.sort_values("trade_date", ascending=False))]),
+        html.Details([html.Summary(f"Table — {market} {product} {label}, every trade date"
+                                   + (" (top row: today, live)" if live_row is not None else "")),
+                      table(tbl)]),
     ]
     return out + [body]
 
@@ -2156,20 +2862,24 @@ def load_ohlc(short_code: str, delivery: str) -> pd.DataFrame:
             .sort_values("trade_date").reset_index(drop=True))
 
 
-def delivery_hours(dkey: str, maturity: str, product: str) -> int | None:
+def delivery_hours(dkey: str, maturity: str, product: str, market: str | None = None) -> int | None:
     """Hours in the delivery period (Europe/Berlin clock, so DST days are
-    23/25 h). Peak = Mon-Fri 08-20. None if the period or product shape
-    isn't known (EUA, blocks, ...)."""
-    add = {"Year": pd.DateOffset(years=1), "Quarter": pd.DateOffset(months=3),
+    23/25 h). Peak = Mon-Fri 08-20. GB (EEX GB, ICE UK): UK clock, peak
+    Mon-Fri 07-19. None if the period or product shape isn't known (EUA,
+    blocks, ...)."""
+    uk = market in ("GB", ICE_UK_MARKET)
+    tz, h0, h1 = ("Europe/London", 7, 19) if uk else ("Europe/Berlin", 8, 20)
+    add = {"Year": pd.DateOffset(years=1), "Season": pd.DateOffset(months=6),
+           "Quarter": pd.DateOffset(months=3),
            "Month": pd.DateOffset(months=1), "Week": pd.DateOffset(days=7),
            "Weekend": pd.DateOffset(days=2), "Day": pd.DateOffset(days=1)}.get(maturity)
     if add is None or product not in ("Base", "Peak"):
         return None
     start = pd.Timestamp(dkey)
-    idx = pd.date_range(start.tz_localize("Europe/Berlin"),
-                        (start + add).tz_localize("Europe/Berlin"), freq="h", inclusive="left")
+    idx = pd.date_range(start.tz_localize(tz),
+                        (start + add).tz_localize(tz), freq="h", inclusive="left")
     if product == "Peak":
-        idx = idx[(idx.weekday < 5) & (idx.hour >= 8) & (idx.hour < 20)]
+        idx = idx[(idx.weekday < 5) & (idx.hour >= h0) & (idx.hour < h1)]
     return len(idx) or None
 
 
@@ -2217,9 +2927,9 @@ def with_ohlc(settle: pd.DataFrame, ohlc: pd.DataFrame) -> pd.DataFrame:
     Input("h-market", "value"), Input("h-product", "value"),
     Input("h-maturity", "value"), Input("h-delivery", "value"),
     Input("h-dates", "start_date"), Input("h-dates", "end_date"), Input("tabs", "value"),
-    Input("h-style", "value"), Input("h-atr", "value"),
+    Input("h-style", "value"), Input("h-atr", "value"), Input("live-ver", "data"),
 )
-def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n):
+def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n, _live=None):
     if tab != "history":
         return [no_update] * 13
     d = load()
@@ -2279,7 +2989,7 @@ def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n
     n_atr = max(2, min(250, n_atr))
     af = atr_frame(full, ohlc_all, n_atr)
     a_in = in_range(af, start, end)
-    hours = delivery_hours(dkey, maturity, product) if uom in ("MWh", "MWh/D") else None
+    hours = delivery_hours(dkey, maturity, product, market) if uom in ("MWh", "MWh/D") else None
 
     # Volume per trade date: EEX's reported volume, else the trade-feed total
     # (they match - checked on DEBY Cal-27, 2026-10-09). Shown in MW
@@ -2328,6 +3038,19 @@ def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n
             kpi("Open interest", fmt(last["gross_open_interest"], 0),
                 f"{fmt(oi_chg, 0, sign=True)} d/d" if oi_chg is not None else "lots (gross)", oi_chg),
         ]
+    # Live (today, delayed) - first tile, plus a point on the chart and an
+    # intraday line below it.
+    live_q, live_spec = None, None
+    if LIVE_ENABLED and not only_candles and not full.empty:
+        sp_ = live_row_specs(full.tail(1))
+        if sp_:
+            live_spec = sp_[0]
+            live_q = LP.read(sp_).get(live_key(live_spec))
+    if live_q and live_q.get("last") is not None:
+        lc = live_q["last"] - full["settlement_price"].iloc[-1]
+        tiles.insert(0, kpi(f"Live · {live_q['last_time']}", fmt(live_q["last"]),
+                            f"{fmt(lc, sign=True)} vs settle · H {fmt(live_q['high'])} "
+                            f"L {fmt(live_q['low'])} · {live_q['trades']} trades", lc))
     if candles and not o.empty:
         lo_row = o.iloc[-1]
         tiles.append(kpi(f"Last traded day · {lo_row['trade_date']}", fmt(lo_row["last"]),
@@ -2343,6 +3066,10 @@ def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n
         notes = [note(f"{code} — {ref['long_name'] or ''}.  Expired before settlements were "
                       "collected, so this shows daily candles from EEX's trade feed only "
                       "(eex_gas_eua_scraper.py).")]
+    elif str(code).startswith("ICE-"):
+        notes = [note(f"{code} — {ref['long_name'] or ''}.  ICE Futures Europe, from ice_scraper: "
+                      "daily settlements (~2 years with --backfill); volume = lots in screen "
+                      "trades seen in the nightly snapshot; no open interest or candles.")]
     else:
         notes = [note(f"{code} — {ref['long_name'] or ''}.  Settlements: EEX only serves ~6 weeks, "
                       "so they go as deep as your scraper's run history.")]
@@ -2381,6 +3108,15 @@ def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n
                                 mode="lines+markers", line=dict(color=SERIES[0], width=2),
                                 marker=dict(size=6), hovertemplate="%{y:.2f}"))
         pf.update_layout(showlegend=False)
+
+    if live_q and live_q.get("last") is not None:
+        pf.add_trace(go.Scatter(x=[pd.Timestamp(date.today())], y=[live_q["last"]],
+                                name=f"Live {live_q['last_time']}", mode="markers",
+                                marker=dict(color=LIVE_COLOR, size=11, symbol="diamond"),
+                                hovertemplate="%{y:.2f} live<extra></extra>"))
+        pf.update_layout(showlegend=True)
+    if live_q is not None:
+        notes.append(live_status_note({live_key(live_spec): live_q}, 1))
 
     # ATR band: close ± ATR, on the price chart (legend click hides it).
     band = a_in.dropna(subset=["atr"])
@@ -2422,6 +3158,8 @@ def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n
 
     # Same x window on all three charts, weekends squeezed out.
     shown = list(x) + (list(xo) if candles else [])
+    if live_q and live_q.get("last") is not None:
+        shown.append(pd.Timestamp(date.today()))
     span = [min(shown) - pd.Timedelta(hours=18), max(shown) + pd.Timedelta(hours=18)]
     for fig in (pf, vf, of, tf):
         fig.update_xaxes(range=span, rangebreaks=[dict(bounds=["sat", "mon"])])
@@ -2431,15 +3169,42 @@ def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n
     tbl = h[cols].rename(columns={"dlabel": "delivery"})
     if not o.empty:
         tbl = with_ohlc(tbl, o)
+    tbl = tbl.sort_values("trade_date", ascending=False)
+    if live_q and live_q.get("last") is not None:
+        lr = {"trade_date": live_label(live_q["last_time"]), "short_code": code, "delivery": label,
+              "settlement_price": live_q["last"], "unit": unit, "volume": live_q.get("volume"),
+              "fetched_at": live_q.get("fetched_at")}
+        if "last" in tbl.columns:
+            lr.update(open=live_q.get("open"), high=live_q.get("high"), low=live_q.get("low"),
+                      last=live_q["last"], trades=live_q.get("trades"))
+        tbl = pd.concat([pd.DataFrame([lr]), tbl], ignore_index=True)
+    live_fig = []
+    if live_q and live_q.get("last") is not None:
+        tk = LP.ticks(*live_key(live_spec))
+        if tk:
+            lf = fig_base(f"{code} {label} today — last price per 5 min (live, delayed) — {unit}",
+                          unit, 260, dates=False)
+            lf.add_trace(go.Scatter(x=[t for t, _ in tk], y=[v for _, v in tk], mode="lines+markers",
+                                    line=dict(color=LIVE_COLOR, width=2), marker=dict(size=4),
+                                    name="Live", hovertemplate="%{x}  %{y:.2f}<extra></extra>"))
+            lf.add_hline(y=full["settlement_price"].iloc[-1],
+                         line=dict(color=SERIES[0], width=1, dash="dot"),
+                         annotation_text=f"settle {full['trade_date'].iloc[-1][5:]}",
+                         annotation_position="top left")
+            lf.update_layout(showlegend=False)
+            lf.update_xaxes(tickangle=0, nticks=14)
+            live_fig = [html.Div(graph(lf), className="card")]
     body = notes + [
         kpis,
         html.Div(graph(pf), className="card"),
+        *live_fig,
         (html.Div([html.Div(graph(vf), className="card"), html.Div(graph(tf), className="card")],
                   className="row2") if h.empty else
          html.Div([html.Div(graph(vf), className="card"), html.Div(graph(tf), className="card"),
                    html.Div(graph(of), className="card")], className="row3")),
-        html.Details([html.Summary(f"Table — {code} {label}, every stored trading day"),
-                      table(tbl.sort_values("trade_date", ascending=False))]),
+        html.Details([html.Summary(f"Table — {code} {label}, every stored trading day"
+                                   + (" (top row: today, live)" if live_q and live_q.get("last") is not None else "")),
+                      table(tbl)]),
     ]
     return out + [body]
 
@@ -2534,14 +3299,57 @@ def top_frame(day: str) -> pd.DataFrame:
         v = sizes.get((r.short_code, r.delivery))
         if v:
             return v
-        return delivery_hours(r.dkey, r.maturity_type, r.product)   # 1 MW x hours
+        return delivery_hours(r.dkey, r.maturity_type, r.product, r.market)   # 1 MW x hours
 
     f = f.copy()
     f["lot"] = [lot(r) for r in f.itertuples(index=False)]
     f["lots"] = (f["volume"] / f["lot"]).round()
+    # ICE UK: ICE reports lots directly.
+    f["lots"] = f["ice_lots"].combine_first(f["lots"])
     f["oi"] = f["gross_open_interest"]
     f["d_oi"] = f["oi"] - f["oi_prev"]
     f["contract"] = f["market"] + " " + f["product"] + " " + f["dlabel"]
+    return f
+
+
+def live_today_eex() -> tuple[dict, str | None]:
+    """({(code, delivery): {"last", "volume"}}, last fetch "HH:MM") from
+    live_prices.db for today (filled by the "Update prices" buttons and the
+    hourly live_snapshot.py task). Empty if nothing was fetched today."""
+    if LP is None or not LP.LIVE_DB.exists():
+        return {}, None
+    day = date.today().isoformat()
+    try:
+        with closing(sqlite3.connect(f"{LP.LIVE_DB.resolve().as_uri()}?mode=ro", uri=True)) as con:
+            rows = con.execute("SELECT code, delivery, last, volume FROM live_quotes "
+                               "WHERE source = 'EEX' AND trade_date = ?", (day,)).fetchall()
+            last = con.execute("SELECT MAX(fetched_at) FROM live_fetches WHERE source = 'EEX' "
+                               "AND fetched_at >= ?", (day,)).fetchone()[0]
+    except sqlite3.Error:
+        return {}, None
+    return ({(c, str(d)): {"last": l, "volume": v} for c, d, l, v in rows},
+            last[11:16] if last else None)
+
+
+def top_frame_live(today: str) -> pd.DataFrame:
+    """Top 50 for TODAY (Peter, 2026-10-21: "make today pickable"): the
+    contracts quoted on the latest settlement date, with today's traded
+    volume from the live trade feed. Open interest = the latest published
+    one (EEX publishes today's with tonight's settlement), so no OI change."""
+    p = load()["prices"]
+    base = p.loc[p["trade_date"] < today, "trade_date"].max()
+    f = top_frame(base)
+    if f.empty:
+        return f
+    q, fetched = live_today_eex()
+    key = list(zip(f["short_code"], f["delivery"].astype(str)))
+    f["volume"] = pd.to_numeric(pd.Series([q.get(k, {}).get("volume") for k in key],
+                                          index=f.index), errors="coerce")
+    f["last"] = pd.to_numeric(pd.Series([q.get(k, {}).get("last") for k in key],
+                                        index=f.index), errors="coerce")
+    f["lots"] = (f["volume"] / f["lot"]).round()       # GB ICE: no live -> NaN
+    f["d_oi"] = np.nan
+    f.attrs.update(base=base, fetched=fetched, n_live=len(q))
     return f
 
 
@@ -2553,8 +3361,9 @@ def top_table(df: pd.DataFrame, cols: list, key: str):
     spec = {"#": ("#", None), "contract": ("Contract", None), "short_code": ("Code", None),
             "lots": ("Lots", num), "d_oi": ("Δ OI", signed),
             "oi": ("OI", num), "settlement_price": ("Settle", price),
+            "last": ("Last", price),
             "unit": ("Unit", None)}
-    widths = {"#": "34px", "contract": "175px", "lots": "70px", "d_oi": "72px",
+    widths = {"#": "34px", "contract": "175px", "lots": "70px", "d_oi": "72px", "last": "62px",
               "oi": "80px", "settlement_price": "62px"}
     columns = []
     for c in cols:
@@ -2611,14 +3420,21 @@ def top_contracts(day, group, market, maturity, delivering, tab):
                 note("No traded volume stored yet.")]
     all_days = set(p["trade_date"].unique())
     lo, hi = traded[0], traded[-1]
+    # Today is pickable too (2026-10-21): volume from the live trade feed.
+    today_s = date.today().isoformat()
+    can_today = LIVE_ENABLED and today_s not in all_days
     # Default: the last trading day with volume (Peter: "default last trading day").
     day = str(day)[:10] if day else hi
-    if day not in all_days:
+    if day not in all_days and not (can_today and day == today_s):
         day = hi
-    span = pd.date_range(p["trade_date"].min(), p["trade_date"].max(), freq="D")
-    disabled = [d.strftime("%Y-%m-%d") for d in span if d.strftime("%Y-%m-%d") not in all_days]
+    is_today = can_today and day == today_s
+    last_day = max(p["trade_date"].max(), today_s) if can_today else p["trade_date"].max()
+    span = pd.date_range(p["trade_date"].min(), last_day, freq="D")
+    disabled = [d.strftime("%Y-%m-%d") for d in span
+                if d.strftime("%Y-%m-%d") not in all_days
+                and not (can_today and d.strftime("%Y-%m-%d") == today_s)]
 
-    f = top_frame(day)
+    f = top_frame_live(today_s) if is_today else top_frame(day)
     # A contract whose delivery has started (Oct-26 on 16 Oct) no longer
     # trades and EEX freezes its open interest - hidden by default so the
     # lists show what is actually tradable.
@@ -2647,10 +3463,12 @@ def top_contracts(day, group, market, maturity, delivering, tab):
     maturity = keep(maturity, mats, "All")
     if maturity != "All":
         f = f[f["maturity_type"] == maturity]
-    out = [p["trade_date"].min(), p["trade_date"].max(), disabled, day,
+    out = [p["trade_date"].min(), last_day, disabled, day,
            opts(groups), group, market_opts, market, opts(mats), maturity]
     if f.empty:
         return out + [note(f"Nothing quoted on {day} for that selection.")]
+    if is_today:
+        return out + top_body_today(f, day)
 
     def ranked(col, by_abs=False):
         g = f[f[col].notna() & (f[col] != 0)]
@@ -2665,7 +3483,7 @@ def top_contracts(day, group, market, maturity, delivering, tab):
     tiles = html.Div([
         kpi(f"Lots traded · {day}", fmt(f["lots"].sum(), 0),
             f"{int((f['lots'] > 0).sum())} contracts traded"),
-        kpi("Open interest", fmt(f["oi"].sum(), 0), "lots, all contracts shown"),
+        kpi("Open interest", fmt(f["oi"].sum(min_count=1), 0), "lots, all contracts shown"),
         kpi("OI change", fmt(up + down, 0, sign=True),
             f"+{up:,.0f} / {down:,.0f} vs {prev_day or 'previous day'}", up + down),
         kpi("Top contract", vol["contract"].iloc[0] if not vol.empty else "—",
@@ -2697,11 +3515,288 @@ def top_contracts(day, group, market, maturity, delivering, tab):
              "lot is 12× a month lot. Δ OI = change since the contract's previous trade date. "
              + (f"{hidden} contracts already in delivery are hidden (their open interest is "
                 "frozen by EEX). " if hidden else "")
-             + "Click a column header to re-sort; hover a contract for its EEX code."
+             + ("GB ICE = ICE Futures Europe UK power: lots as ICE reports them (screen "
+                "trades seen in the nightly snapshot), no open interest published. "
+                if (f["market"] == ICE_UK_MARKET).any() else "")
+             + "Click a column header to re-sort; hover a contract for its code."
              + (f" Country list: * = no open interest on {day} "
                 f"({len(no_oi)} of {len(countries)})." if no_oi else "")),
     ]
     return out + [body]
+
+
+def top_body_today(f: pd.DataFrame, day: str) -> list:
+    """Top 50 page for today: lots traded so far (live), open interest as of
+    the latest settlement. OI change only comes with tonight's settlement."""
+    base, fetched = f.attrs.get("base"), f.attrs.get("fetched")
+    if not f.attrs.get("n_live"):
+        return [note(f"Nothing fetched for today yet. The hourly task (live_snapshot.py, "
+                     f"weekdays 08:30-18:30) or an \"Update prices\" button fills it. "
+                     f"Latest settlement day: {base}.")]
+
+    def ranked(col):
+        g = f[f[col].notna() & (f[col] != 0)]
+        g = g.loc[g[col].sort_values(ascending=False).index].head(TOP_N).copy()
+        g.insert(0, "#", range(1, len(g) + 1))
+        return g
+
+    vol, oi = ranked("lots"), ranked("oi")
+
+    def card(title, sub, df, cols, key):
+        return html.Div([html.Div(title, style={"fontWeight": 600, "fontSize": 15}),
+                         html.Div(sub, className="note", style={"margin": "2px 0 8px"}),
+                         top_table(df, cols, key) if not df.empty else note("Nothing to rank.")],
+                        className="card")
+    tiles = html.Div([
+        kpi(f"Lots traded · today so far", fmt(f["lots"].sum(min_count=1), 0),
+            f"{int((f['lots'] > 0).sum())} contracts traded · fetched {fetched or '—'}"),
+        kpi(f"Open interest · {base}", fmt(f["oi"].sum(min_count=1), 0),
+            "lots, latest published"),
+        kpi("OI change", "—", "comes with tonight's settlement"),
+        kpi("Top contract", vol["contract"].iloc[0] if not vol.empty else "—",
+            f"{vol['lots'].iloc[0]:,.0f} lots" if not vol.empty else None),
+    ], className="kpis")
+    return [[
+        tiles,
+        html.Div([
+            card(f"Top {TOP_N} by lots traded", f"Today so far (EEX trade feed, ~15 min delayed, "
+                 f"fetched {fetched or '—'}). Last = last trade, Settle = {base}.",
+                 vol, ["#", "contract", "lots", "last", "settlement_price"], "lots"),
+            card(f"Top {TOP_N} by change in open interest",
+                 "Not known yet: EEX publishes today's open interest with tonight's settlement.",
+                 vol.iloc[0:0], ["#", "contract", "d_oi", "oi", "lots"], "d_oi"),
+            card(f"Top {TOP_N} by open interest", f"Open interest on {base} (latest published), "
+                 f"with today's lots so far.",
+                 oi, ["#", "contract", "oi", "lots"], "oi"),
+        ], className="row3"),
+        note("Today = what the live fetch has collected so far: the hourly task (08:30-18:30) "
+             "and the \"Update prices\" buttons. Contracts not fetched today count as 0 lots. "
+             "Lots = traded MWh ÷ lot size, as on the other days. GB ICE has no live data."),
+    ]]
+
+
+# ---------------------------------------------------------------------
+# Board (Peter, 2026-10-21): "new tab. pick country. List all the tenor
+# chronological in groups (DA, WE, weeks, months, q, season, year) if
+# available. if possible bid/ask open high low change, mw traded,
+# yesterday settle."
+# One table per tenor group, nearest delivery first. Two modes:
+#   a settlement date - O/H/L/Last = EEX trades that day (eex_market_ohlc),
+#                       Chg = settle - previous settle.
+#   Today (live)      - O/H/L/Last/MW from the "Update prices" fetch,
+#                       Chg = live last - yesterday's settle.
+# Bid/ask: not in EEX's (or ICE's) free data, so no columns for them.
+# ---------------------------------------------------------------------
+BOARD_GROUPS = [("Day", "Day (DA)"), ("Weekend", "Weekend"), ("Week", "Weeks"),
+                ("Month", "Months"), ("Quarter", "Quarters"), ("Season", "Seasons"),
+                ("Year", "Years"), ("December", "December (EUA)")]
+BOARD_LIVE = "live"
+
+
+def board_ohlc(day: str) -> pd.DataFrame:
+    """Open/high/low/last/trades of every contract on one trade date
+    (power database + TTF/EUA from eex_gas_eua.db)."""
+    cols = ["short_code", "delivery", "open", "high", "low", "last", "trades"]
+    frames = []
+    try:
+        with closing(sqlite3.connect(f"{DB_PATH.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+            frames.append(pd.read_sql_query(
+                f"SELECT {', '.join(cols)} FROM eex_market_ohlc WHERE trade_date = ? "
+                "AND trades > 0 AND open IS NOT NULL", conn, params=(day,)))
+    except Exception:
+        pass
+    gpath = gas_db()
+    if gpath:
+        try:
+            with closing(sqlite3.connect(f"{gpath.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+                frames.append(pd.read_sql_query(
+                    f"SELECT {', '.join(cols)} FROM gas_eua_ohlc WHERE trade_date = ? "
+                    "AND trades > 0 AND open IS NOT NULL", conn, params=(day,)))
+        except Exception:
+            pass
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    o = pd.concat(frames, ignore_index=True)
+    o["delivery"] = o["delivery"].astype(str)
+    return o.drop_duplicates(["short_code", "delivery"])
+
+
+def board_rows(market, product, day):
+    """(rows, base_day, live): the contracts on the board. base_day = the
+    settlement date the rows come from (the latest one in live mode)."""
+    p = load()["prices"]
+    f = p[(p["market"] == market) & (p["product"] == product) & p["settlement_price"].notna()]
+    if f.empty:
+        return f, None, False
+    live = day == BOARD_LIVE
+    base = f["trade_date"].max() if live or not day else str(day)
+    rows = f[f["trade_date"] == base]
+    # Only what still trades: delivery not started (on the chosen day, or today when live).
+    cutoff = date.today().isoformat() if live else base
+    rows = rows[rows["dkey"] > cutoff]
+    return rows, base, live
+
+
+def board_frame(rows: pd.DataFrame, base: str, live: bool, market: str) -> pd.DataFrame:
+    p = load()["prices"]
+    keys = rows[["short_code", "delivery"]].drop_duplicates()
+    hist = p.merge(keys, on=["short_code", "delivery"])
+    hist = hist[hist["settlement_price"].notna() & (hist["trade_date"] < base)]
+    prev = (hist.sort_values("trade_date").groupby(["short_code", "delivery"])
+            .agg(prev_settle=("settlement_price", "last"), prev_day=("trade_date", "last")))
+    b = rows.join(prev, on=["short_code", "delivery"]).copy()
+    hours = [delivery_hours(r.dkey, r.maturity_type, r.product, market)
+             if str(r.uom).startswith("MWh") else None for r in b.itertuples(index=False)]
+    b["hours"] = pd.Series(hours, index=b.index, dtype=float)
+    b["oi"] = b["gross_open_interest"]
+    if live:
+        q = LP.read(live_row_specs(b)) if LIVE_ENABLED else {}
+        b.attrs["fetched"] = max((v["fetched_at"] for v in q.values()), default=None)
+        def g(r, k):
+            return q.get(("EEX", r.short_code, str(r.delivery)), {}).get(k)
+        for k in ("open", "high", "low", "last", "trades", "volume", "last_time"):
+            b[k] = [g(r, k) for r in b.itertuples(index=False)]
+        for k in ("open", "high", "low", "last", "volume"):
+            b[k] = pd.to_numeric(b[k], errors="coerce")
+        b["yest"] = b["settlement_price"]                 # yesterday's settle
+        b["chg"] = b["last"] - b["yest"]
+        b["settle"] = np.nan
+    else:
+        o = board_ohlc(base)
+        b = b.merge(o, on=["short_code", "delivery"], how="left")
+        b["yest"] = b["prev_settle"]
+        b["settle"] = b["settlement_price"]
+        b["chg"] = b["settle"] - b["yest"]
+    b["mw"] = b["volume"] / b["hours"]
+    b["mw"] = b["mw"].where(b["mw"] > 0)
+    return b.sort_values("dkey")
+
+
+def board_table(df: pd.DataFrame, key: str, live: bool):
+    from dash.dash_table.Format import Format, Group, Scheme, Sign
+    px = Format(precision=2, scheme=Scheme.fixed)
+    chg = Format(precision=2, scheme=Scheme.fixed, sign=Sign.positive)
+    num = Format(group=Group.yes, precision=0, scheme=Scheme.fixed)
+    cols = [("dlabel", "Contract", None), ("open", "Open", px), ("high", "High", px),
+            ("low", "Low", px), ("last", "Last", px), ("chg", "Chg", chg),
+            ("mw", "MW traded", num), ("trades", "Trades", num)]
+    cols += ([] if live else [("settle", "Settle", px)])
+    cols += [("yest", "Yesterday settle" if live else "Prev settle", px), ("oi", "OI (lots)", num)]
+    data = df[[c for c, _, _ in cols]].copy()
+    data["trades"] = pd.to_numeric(data["trades"], errors="coerce").where(lambda s: s > 0)
+    return dash_table.DataTable(
+        id=f"b-tab-{key}",
+        data=data.to_dict("records"),
+        columns=[{"name": n, "id": c, **({"type": "numeric", "format": f} if f else {})}
+                 for c, n, f in cols],
+        cell_selectable=False, sort_action="none", page_action="none",
+        style_table={"overflowX": "auto"},
+        style_cell={"fontFamily": "inherit", "fontSize": 13, "padding": "3px 8px",
+                    "textAlign": "right", "border": f"1px solid {INK['grid']}",
+                    "whiteSpace": "nowrap", "minWidth": "64px"},
+        style_cell_conditional=[
+            {"if": {"column_id": "dlabel"}, "textAlign": "left", "fontWeight": 600,
+             "minWidth": "120px", "width": "130px"},
+            {"if": {"column_id": "last" if live else "settle"}, "fontWeight": 600},
+        ] + ([{"if": {"column_id": "last"}, "color": LIVE_COLOR}] if live else []),
+        style_data_conditional=[
+            {"if": {"filter_query": "{chg} > 0", "column_id": "chg"}, "color": INK["up"]},
+            {"if": {"filter_query": "{chg} < 0", "column_id": "chg"}, "color": INK["down"]},
+        ],
+        style_header={"fontWeight": 600, "backgroundColor": INK["bg"]},
+    )
+
+
+@app.callback(
+    Output("b-market", "options"), Output("b-market", "value"),
+    Output("b-product", "options"), Output("b-product", "value"),
+    Output("b-day", "options"), Output("b-day", "value"),
+    Output("b-body", "children"),
+    Input("b-market", "value"), Input("b-product", "value"), Input("b-day", "value"),
+    Input("tabs", "value"), Input("live-ver-board", "data"),
+)
+def board(market, product, day, tab, _lv):
+    if tab != "board":
+        return [no_update] * 7
+    d = load()
+    s = d["settled"]
+    m_opts = market_options(d)
+    market = keep(market, [o["value"] for o in m_opts], "DE")
+    f = s[s["market"] == market]
+    products = ([x for x in ("Base", "Peak") if x in set(f["product"])]
+                + sorted(x for x in f["product"].unique() if x not in ("Base", "Peak")))
+    product = keep(product, products, "Base")
+    f = f[f["product"] == product]
+    dates = sorted(f["trade_date"].unique(), reverse=True)[:120]
+    d_opts = ([{"label": "Today (live)", "value": BOARD_LIVE}] if LIVE_ENABLED else []) + \
+        [{"label": x, "value": x} for x in dates]
+    if ctx.triggered_id == "live-ver-board" and LIVE_ENABLED:
+        day = BOARD_LIVE                      # just pressed "Update prices": show it
+    # Default: today (live) once anything was fetched today - the hourly
+    # task (live_snapshot.py, 08:30-18:30) does that without a click.
+    default_day = dates[0] if dates else None
+    if LIVE_ENABLED and day is None:
+        lrows, _b, _l = board_rows(market, product, BOARD_LIVE)
+        if any(v.get("last") is not None for v in LP.read(live_row_specs(lrows)).values()):
+            default_day = BOARD_LIVE
+    day = keep(day, [o["value"] for o in d_opts], default_day)
+    out = [m_opts, market, opts(products), product, d_opts, day]
+    rows, base, live = board_rows(market, product, day)
+    if rows.empty:
+        return out + [note(f"Nothing quoted for {market} {product}"
+                           + (f" on {base}." if base else "."))]
+    b = board_frame(rows, base, live, market)
+    unit = b["unit"].iloc[0]
+    parts = []
+    for mat, label in BOARD_GROUPS:
+        g = b[b["maturity_type"] == mat]
+        if g.empty:
+            continue
+        parts.append(html.Div([
+            html.Div(f"{label}", style={"fontWeight": 600, "fontSize": 15, "margin": "14px 0 6px"}),
+            board_table(g, mat, live)]))
+    others = sorted(set(b["maturity_type"]) - {m for m, _ in BOARD_GROUPS})
+    for mat in others:
+        g = b[b["maturity_type"] == mat]
+        parts.append(html.Div([html.Div(mat, style={"fontWeight": 600, "fontSize": 15,
+                                                    "margin": "14px 0 6px"}),
+                               board_table(g, mat, live)]))
+    if live and market == ICE_UK_MARKET:
+        head = (f"{market} {product} · {unit} · no live prices for ICE UK (the live fetch covers "
+                f"EEX only) - showing yesterday's settle ({base}). Pick a date for settlements.")
+    elif live:
+        traded = int(b["last"].notna().sum())
+        fetched = b.attrs.get("fetched")
+        head = (f"{market} {product} · {unit} · today, live (EEX trade feed, ~15 min delayed"
+                + (f", fetched {fetched[11:16]}" if fetched else "") + "): "
+                f"{traded} of {len(b)} contracts traded so far. Chg = last trade - "
+                f"yesterday's settle ({base}). Press \"Update prices\" to refresh.")
+        if traded == 0:
+            head += " Nothing fetched for today yet - press \"Update prices\"."
+    else:
+        prev_day = b["prev_day"].dropna().max() if "prev_day" in b else None
+        head = (f"{market} {product} · {unit} · settlements {base}"
+                + (f" vs {prev_day}" if isinstance(prev_day, str) else "")
+                + ". Open/High/Low/Last = EEX trades that day.")
+    foot = ("Contracts whose delivery has started are left out (they no longer trade). "
+            "MW traded = volume ÷ hours in the delivery period (= lots of 1 MW). "
+            "Bid/ask: EEX and ICE don't publish them in their free data. "
+            + ("GB ICE: no O/H/L or live (ICE gives settlements and lots only). "
+               if market == ICE_UK_MARKET else ""))
+    return out + [[note(head), *parts, note(foot)]]
+
+
+if LIVE_ENABLED:
+    @app.callback(
+        Output("live-poll", "disabled", allow_duplicate=True),
+        Input("lv-btn-board", "n_clicks"),
+        State("b-market", "value"), State("b-product", "value"),
+        prevent_initial_call=True,
+    )
+    def live_start_board(_, market, product):
+        rows, _base, _live = board_rows(market, product, BOARD_LIVE)
+        return _live_begin("board", live_row_specs(rows))
 
 
 # ---------------------------------------------------------------------
@@ -2755,7 +3850,9 @@ def data_and_runs(_, tab):
         table(by_market, page_size=25),
         note(f"Database: {d['path']}"
              + (f"  ·  TTF/EUA: {d['gas_path']}" if d.get("gas_path") else
-                "  ·  eex_gas_eua.db not found - no EUA, no TTF history before Aug 2026")),
+                "  ·  eex_gas_eua.db not found - no EUA, no TTF history before Aug 2026")
+             + (f"  ·  ICE (GB ICE): {d['ice_path']}" if d.get("ice_path") else
+                "  ·  ice_market_data.db not found - no GB ICE")),
     ]
     return body
 

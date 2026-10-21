@@ -495,6 +495,11 @@ eex = _import_under("eex_dash", "/futures/")
 fvs = _import_under("futures_vs_spot_dash", "/futures-vs-spot/")
 bs = _import_under("balance_sheet_dash", "/balance/")
 wx = _import_under("ecmwf_dash", "/weather/")
+# Spread analyzer (2026-10-21, Peter: "push all apps online"): uses the SAME
+# eex_dash and futures_vs_spot_dash modules (imported above), so it shares
+# their data and the DB paths set below. spread_delivered is imported by it.
+sp = _import_under("spread_dash", "/spreads/")
+sd = sys.modules.get("spread_delivered")
 
 pt.DB_PATH = PRICE_DB
 yc.DB_PATH = HISTORY_DB
@@ -502,6 +507,34 @@ yc.JAO_DB_FILE = JAO_DB
 ed.DB_PATH = HISTORY_DB
 jd.DB_PATH = JAO_DB
 eex.DB_PATH = EEX_DB         # gas_db() / ice_db() look next to it: EEX_GAS_DB, ICE_DB
+
+
+# Memory (2026-10-21): eex_dash keeps two almost identical frames, "prices"
+# (all rows) and "settled" (rows with a settlement) - ~100 MB each with all
+# Day futures. Online they become ONE frame (only ~1 % of the rows have no
+# settlement), which keeps the Power futures + Spread analyzer pages inside
+# the 512 MB of the free plan. Same dict object, so the app's cache holds it.
+_eex_load = eex.load
+
+
+# Text columns that are only compared / shown (never glued to other text)
+# are stored as categories: a few distinct values instead of 100,000 strings.
+_EEX_CATEGORY_COLS = ("long_name", "currency", "uom", "unit", "group",
+                      "maturity_type")
+
+
+def _eex_load_one_frame():
+    data = _eex_load()
+    if data.get("prices") is not data.get("settled"):
+        frame = data["settled"]
+        for col in _EEX_CATEGORY_COLS:
+            if col in frame.columns and frame[col].dtype != "category":
+                frame[col] = frame[col].astype("category")
+        data["settled"] = data["prices"] = frame
+    return data
+
+
+eex.load = _eex_load_one_frame
 fvs.EEX_DB = EEX_DB          # futures (EEX)
 fvs.SPOT_DB = HISTORY_DB     # day-ahead prices (ENTSO-E)
 wx.DB_PATH = WEATHER_DB
@@ -580,6 +613,7 @@ PAGES = [
     ("yc", "LTCAP tool", "/years/"),
     ("eex", "Power futures", "/futures/"),
     ("fvs", "Futures vs spot", "/futures-vs-spot/"),
+    ("sp", "Spread analyzer", "/spreads/"),
     ("wx", "Weather forecasts", "/weather/"),
 ]
 
@@ -641,6 +675,7 @@ APPS = {
     "yc": (yc, yc.serve_layout, [HISTORY_DB, JAO_DB], history_note),
     "eex": (eex, eex.make_layout, [EEX_DB], history_note),
     "fvs": (fvs, fvs.make_layout, [EEX_DB, HISTORY_DB], history_note),
+    "sp": (sp, sp.make_layout, [EEX_DB, HISTORY_DB], history_note),
     "bs": (bs, bs.layout, [BALANCE_DB], weather_note),
     "wx": (wx, wx.serve_layout, [WEATHER_DB], weather_note),
 }
@@ -680,7 +715,8 @@ def _years_validation():
 
 
 VALIDATION = {"pt": pt.validation_layout, "yc": _years_validation, "eex": eex.full_layout,
-              "fvs": fvs.full_layout, "bs": _balance_validation, "wx": wx.serve_layout}
+              "fvs": fvs.full_layout, "bs": _balance_validation, "wx": wx.serve_layout,
+              "sp": sp.make_layout}
 # Weather: the "Check for new data" button starts downloads on the PC only.
 EXTRA_CSS = {"wx": "#upd-btn { display: none; }"}
 for _key, (_module, _build, _needs, _note) in APPS.items():
@@ -740,6 +776,7 @@ _dispatch = DispatcherMiddleware(server.wsgi_app, {
     "/auctions": _moved_to("/years/"),
     "/futures": eex.app.server,
     "/futures-vs-spot": fvs.app.server,
+    "/spreads": sp.app.server,
     "/balance": bs.app.server,
     "/weather": wx.app.server,
 })
@@ -788,7 +825,8 @@ def free_memory() -> None:
     eex._coal_cache.clear()
     wx._cache.get("mw", {}).clear()
     wx._cache["acc"] = {}
-    for module in (pt, yc, ed, jd, eex, fvs):
+    sp._eua_cache.clear()
+    for module in (pt, yc, ed, jd, eex, fvs, sd):
         cache = getattr(module, "_cache", None)
         lock = getattr(module, "_cache_lock", None) or getattr(module, "_lock", None)
         if cache is None:

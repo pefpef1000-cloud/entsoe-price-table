@@ -5,7 +5,7 @@ Futures vs spot - Dash dashboard
 How did each EEX power future trade last before delivery, and what did the
 day-ahead market actually settle at during the delivery period?
 
-Pick a country, a period type (Weekend, Week, Month, Quarter, Cal) and a
+Pick a country, a period type (Day ahead, Weekend, Week, Month, Quarter, Cal) and a
 load (Base, Peak, Off-peak). One row per delivery period:
 
     Last traded      last trade price on the last day the contract traded
@@ -182,7 +182,7 @@ def market_of(long_name: str | None, code: str) -> str | None:
 # Delivery periods
 # ---------------------------------------------------------------------
 MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-PERIODS = [("Weekend", "WE"), ("Week", "Weeks"), ("Month", "Months"),
+PERIODS = [("Day", "Day ahead"), ("Weekend", "WE"), ("Week", "Weeks"), ("Month", "Months"),
            ("Quarter", "Q"), ("Year", "Cal")]
 LOADS = ["Base", "Peak", "Off-peak"]
 # Peak products whose peak runs every day, not just Mon-Fri.
@@ -195,6 +195,16 @@ def delivery_span(code: str, delivery: str, maturity: str) -> tuple[date, date] 
     if len(t) != 6 or not t.isdigit():
         return None
     y, m = int(t[:4]), int(t[4:])
+    if maturity == "Day":
+        # Day futures: code = family + 2-digit day (DB16 = 16th of the month).
+        dd = code[-2:]
+        if not dd.isdigit():
+            return None
+        try:
+            d = date(y, m, int(dd))
+        except ValueError:
+            return None
+        return d, d
     if maturity in ("Week", "Weekend"):
         n = code[-1]
         if not n.isdigit():
@@ -216,6 +226,8 @@ def delivery_span(code: str, delivery: str, maturity: str) -> tuple[date, date] 
 
 def label(start: date, maturity: str) -> str:
     yy = f"{start.year % 100:02d}"
+    if maturity == "Day":
+        return f"{start:%a} {start.day} {MON[start.month - 1]} {yy}"
     if maturity == "Year":
         return f"Cal-{yy}"
     if maturity == "Quarter":
@@ -276,7 +288,7 @@ def load_contracts() -> pd.DataFrame:
             """SELECT short_code, delivery, trade_date, product, maturity_type,
                       settlement_price, currency
                FROM eex_market_prices
-               WHERE maturity_type IN ('Weekend','Week','Month','Quarter','Year')
+               WHERE maturity_type IN ('Day','Weekend','Week','Month','Quarter','Year')
                  AND product IN ('Base','Peak')""", conn)
         ohlc = pd.read_sql_query(
             """SELECT short_code, delivery, trade_date, last, trades
@@ -293,30 +305,36 @@ def load_contracts() -> pd.DataFrame:
         span = delivery_span(c.short_code, c.delivery, c.maturity_type)
         if mkt is None or span is None:
             continue
+        # "cut" = first trade date that no longer counts as "before".
+        # Day futures settle on the day-ahead auction, which runs on D-1, so
+        # for them "before" means before the auction day (start - 1).
+        cut = span[0] - timedelta(days=1) if c.maturity_type == "Day" else span[0]
         rows.append({"code": c.short_code, "delivery": c.delivery, "market": mkt,
                      "product": c.product, "maturity": c.maturity_type,
                      "currency": c.currency, "start": span[0].isoformat(),
-                     "end": span[1].isoformat()})
+                     "end": span[1].isoformat(), "cut": cut.isoformat(),
+                     "fin_from": cut.isoformat() if c.maturity_type == "Day"
+                     else span[1].isoformat()})
     meta = pd.DataFrame(rows)
     if meta.empty:
         out = meta
     else:
         k = ["code", "delivery"]
         # Last trade before delivery started.
-        o = ohlc.merge(meta[k + ["start"]], left_on=["short_code", "delivery"],
+        o = ohlc.merge(meta[k + ["cut"]], left_on=["short_code", "delivery"],
                        right_on=k)
-        o = o[o["trade_date"] < o["start"]].sort_values("trade_date")
+        o = o[o["trade_date"] < o["cut"]].sort_values("trade_date")
         last = o.groupby(k).tail(1)[k + ["trade_date", "last", "trades"]] \
             .rename(columns={"trade_date": "last_trade_date", "last": "last_px"})
         # Settlements: last one before delivery, and the latest one after
         # delivery ended (EEX final settlement).
         s = prices[prices["settlement_price"].notna()].merge(
-            meta[k + ["start", "end"]], left_on=["short_code", "delivery"], right_on=k)
+            meta[k + ["cut", "fin_from"]], left_on=["short_code", "delivery"], right_on=k)
         s = s.sort_values("trade_date")
-        pre = s[s["trade_date"] < s["start"]]
+        pre = s[s["trade_date"] < s["cut"]]
         pre_last = pre.groupby(k).tail(1)[k + ["trade_date", "settlement_price"]] \
             .rename(columns={"trade_date": "settle_date", "settlement_price": "settle_px"})
-        fin = s[s["trade_date"] >= s["end"]].groupby(k).tail(1)[k + ["trade_date", "settlement_price"]] \
+        fin = s[s["trade_date"] >= s["fin_from"]].groupby(k).tail(1)[k + ["trade_date", "settlement_price"]] \
             .rename(columns={"trade_date": "final_date", "settlement_price": "final_px"})
         out = meta.merge(last, on=k, how="left").merge(pre_last, on=k, how="left") \
             .merge(fin, on=k, how="left")
@@ -392,7 +410,7 @@ def build(market: str, maturity: str, load: str, today: date | None = None):
         if start > today.isoformat():
             continue                                      # not delivering yet
         pcode = str(peak.loc[start, "code"]) if start in peak.index else str(r["code"])
-        every_day = maturity == "Weekend" or pcode.startswith(PEAK_EVERY_DAY)
+        every_day = maturity in ("Weekend", "Day") or pcode.startswith(PEAK_EVERY_DAY)
         avg, n_spot, n_want, n_peak, n_all = spot_stats(spot, start, r["end"], load, every_day)
 
         if load == "Off-peak":
@@ -733,11 +751,17 @@ def render(market, maturity, load, basis, other):
         html.Div([
             html.P("Last traded = last trade price (EEX trade feed) on the last day the contract "
                    "traded before delivery started. Last settle = EEX settlement on the last "
-                   "trading day before delivery."),
+                   "trading day before delivery." +
+                   (" Day ahead: EEX day futures settle on the day-ahead auction (run on the "
+                    "day before delivery), so 'before' means before the auction day - "
+                    "trades and settlements from the auction day on are left out. "
+                    "EEX final settle = the settlement from the auction day on."
+                    if maturity == "Day" else "")),
             html.P((f"Spread mode: each price is {market} minus {other}, per delivery period both "
                     "have. " if spread else "") +
                    f"Spot outcome = average day-ahead price ({zone or 'none'}, ENTSO-E) over the "
-                   "delivery hours. Peak = 08-20 Mon-Fri CET; weekend peak = 08-20 Sat-Sun. "
+                   "delivery hours. Peak = 08-20 Mon-Fri CET; weekend peak = 08-20 Sat-Sun; "
+                   "day-ahead (Day futures) peak = 08-20 of that day. "
                    "Spot − futures > 0 means spot came out above the futures price." + off),
             html.P("EEX final settle = last settlement EEX published on or after the last "
                    "delivery day (should match the spot outcome when the zone matches). "
