@@ -550,6 +550,19 @@ def graph(fig):
     return dcc.Graph(figure=fig, config={"displaylogo": False, "displayModeBar": False})
 
 
+def single_contract_graph(fig):
+    """Interactive charts with a persistent zoom/reset toolbar."""
+    fig.update_layout(dragmode="zoom")
+    fig.update_xaxes(fixedrange=False)
+    fig.update_yaxes(fixedrange=False)
+    return dcc.Graph(figure=fig, config={
+        "displaylogo": False, "displayModeBar": True,
+        "scrollZoom": True, "doubleClick": "reset", "staticPlot": False,
+        "modeBarButtons": [["zoom2d", "pan2d", "zoomIn2d", "zoomOut2d",
+                            "autoScale2d", "resetScale2d"]],
+    })
+
+
 # ---------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------
@@ -999,10 +1012,11 @@ def full_layout():
     ], className="wrap")
 
 
-TABS = [("curve", "Forward curve"), ("board", "Board"), *[(key, lab) for key, _, _, lab in SPREAD_TABS], ("tspread", "Time spreads"),
-        ("spark", "Production costs"),
-        ("corr", "Correlation"), ("history", "Price history"), ("top", f"Top {TOP_N}"),
-        ("runs", "Data & runs")]
+TABS = [("board", "Board"), ("history", "Single Contract"),
+        *[(key, lab) for key, _, _, lab in SPREAD_TABS], ("tspread", "Time spreads"),
+        ("spark", "CSS/CDS"), ("corr", "Correlation"), ("top", f"Top {TOP_N}"),
+        ("curve", "Forward curve"), ("runs", "Data & runs")]
+
 
 TAB_STYLE = {"padding": "7px 12px", "fontSize": 14, "color": INK["muted"],
              "backgroundColor": INK["bg"], "border": "none",
@@ -2401,6 +2415,29 @@ def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ce
                                 mode="lines", yaxis="y2",
                                 line=dict(color=colour, width=1.5, dash="dot"),
                                 hovertemplate="%{y:.2f}"))
+        if live_row is not None:
+            today = pd.Timestamp(date.today())
+            for col, live_name, axis in ((spread_col, f"{name} live", "y"),
+                                         (cost_col, f"{plant} cost live", "y2")):
+                value = live_row.get(col)
+                if value is None or pd.isna(value):
+                    continue
+                previous = hist[hist[col].notna() & (pd.to_datetime(hist["trade_date"]) < today)]
+                lx, ly, sizes, captions = [today], [value], [9], [f"Live {t_} (settlement fallback where not traded)"]
+                if not previous.empty:
+                    prior = previous.sort_values("trade_date").iloc[-1]
+                    lx.insert(0, pd.Timestamp(prior["trade_date"]))
+                    ly.insert(0, prior[col])
+                    sizes.insert(0, 0)
+                    captions.insert(0, "Last settlement")
+                fig.add_trace(go.Scatter(
+                    x=lx, y=ly, name=live_name, yaxis=axis, mode="lines+markers",
+                    line=dict(color=colour, width=1.5, dash="dash"),
+                    marker=dict(color=colour, symbol="diamond" if axis == "y" else "diamond-open",
+                                size=sizes), customdata=captions,
+                    hovertemplate="%{x|%d %b %Y}<br>%{y:.2f} EUR/MWh<br>%{customdata}<extra>%{fullData.name}</extra>"))
+            fig.add_annotation(x=today, y=1, yref="paper", text=f"Today · live {t_}",
+                               showarrow=False, xanchor="right", yanchor="bottom")
         fig.update_layout(
             yaxis=dict(title=dict(text=f"{name} — EUR/MWh")),
             yaxis2=dict(title=dict(text="Production cost — EUR/MWh power"), overlaying="y",
@@ -2411,25 +2448,6 @@ def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ce
 
     f_css = clean_spread_chart("CSS", "clean_spark", "gas_cost", "Gas plant", SERIES[0])
     f_cds = clean_spread_chart("CDS", "cds", "coal_cost", "Coal plant", COAL_COLOR)
-
-    # --- 2. Production cost, stacked, one chart per plant -----------------
-    def cost_chart(title, fuel, carbon, fuel_name, fuel_rgba):
-        fig = fig_base(title, unit, 320)
-        fig.add_trace(go.Scatter(x=x, y=fuel, name=fuel_name, mode="lines", stackgroup="c",
-                                 line=dict(width=1, color=fuel_rgba.replace("0.35", "1")),
-                                 fillcolor=fuel_rgba, hovertemplate="%{y:.2f}"))
-        fig.add_trace(go.Scatter(x=x, y=carbon, name="Carbon", mode="lines", stackgroup="c",
-                                 line=dict(width=1, color=SERIES[3]),
-                                 fillcolor="rgba(237,161,0,0.35)", hovertemplate="%{y:.2f}"))
-        fig.add_trace(go.Scatter(x=x, y=hist["power"], name=f"Power {market}", mode="lines",
-                                 line=dict(color=INK["text"], width=2), hovertemplate="%{y:.2f}"))
-        fig.update_xaxes(**xs)
-        return fig
-
-    f2a = cost_chart(f"Gas plant ({gas_name}, {eff:g} %) — {unit}", hist["fuel_cost"],
-                     hist["carbon_cost"], "Gas", "rgba(42,120,214,0.35)")
-    f2b = cost_chart(f"Coal plant ({coal_hub}, {ceff:g} %) — {unit}", hist["coal_fuel_cost"],
-                     hist["coal_carbon_cost"], "Coal", "rgba(110,84,64,0.35)")
 
     # --- 3. Curves on the latest trade date ------------------------------
     td = hist["trade_date"].max()
@@ -2490,8 +2508,6 @@ def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ce
         tiles,
         html.Div(graph(f_css), className="card"),
         html.Div(graph(f_cds), className="card"),
-        html.Div([html.Div(graph(f2a), className="card"), html.Div(graph(f2b), className="card")],
-                 className="row2"),
         html.Div([html.Div(graph(f4), className="card"), html.Div(graph(f5), className="card")],
                  className="row2"),
         *grid_block,
@@ -2973,7 +2989,7 @@ def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n
     out = [m_opts, market, opts(products), product, opts(maturities), maturity,
            del_opts, dkey, lo, hi, start, end]
     if ref is None or (full.empty and ohlc_all.empty):
-        return out + [graph(empty_fig("Nothing stored for that delivery."))]
+        return out + [single_contract_graph(empty_fig("Nothing stored for that delivery."))]
 
     h = in_range(full, start, end)
     o = in_range(ohlc_all, start, end)
@@ -3193,15 +3209,15 @@ def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n
                          annotation_position="top left")
             lf.update_layout(showlegend=False)
             lf.update_xaxes(tickangle=0, nticks=14)
-            live_fig = [html.Div(graph(lf), className="card")]
+            live_fig = [html.Div(single_contract_graph(lf), className="card")]
     body = notes + [
         kpis,
-        html.Div(graph(pf), className="card"),
+        html.Div(single_contract_graph(pf), className="card"),
         *live_fig,
-        (html.Div([html.Div(graph(vf), className="card"), html.Div(graph(tf), className="card")],
+        (html.Div([html.Div(single_contract_graph(vf), className="card"), html.Div(single_contract_graph(tf), className="card")],
                   className="row2") if h.empty else
-         html.Div([html.Div(graph(vf), className="card"), html.Div(graph(tf), className="card"),
-                   html.Div(graph(of), className="card")], className="row3")),
+         html.Div([html.Div(single_contract_graph(vf), className="card"), html.Div(single_contract_graph(tf), className="card"),
+                   html.Div(single_contract_graph(of), className="card")], className="row3")),
         html.Details([html.Summary(f"Table — {code} {label}, every stored trading day"
                                    + (" (top row: today, live)" if live_q and live_q.get("last") is not None else "")),
                       table(tbl)]),
