@@ -30,6 +30,7 @@ services:
         - ecmwf_dash.py
         - spread_dash.py
         - spread_delivered.py
+        - live_prices.py
         - assets/**
         - requirements-online.txt
         - render.yaml

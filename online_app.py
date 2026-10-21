@@ -103,6 +103,7 @@ EEX_GAS_DB = DATA_DIR / "eex_gas_eua.db"        # eex_dash finds it next to EEX_
 ICE_DB = DATA_DIR / "ice_market_data.db"        # eex_dash finds it next to EEX_DB
 WEATHER_DB = DATA_DIR / "ecmwf_data.db"
 BALANCE_DB = DATA_DIR / "balance_data.db"
+LIVE_DB = DATA_DIR / "live_prices.db"            # today's EEX trades (PC's hourly task)
 # (file in the release, local copy, required). The optional ones are left
 # out until the PC uploads them; their pages wait. Load forecast first, so
 # it is new before the history file (whose change refreshes the caches).
@@ -120,6 +121,11 @@ WEATHER_FILES = [
     ("ecmwf_data.db.gz", WEATHER_DB, False),
 ]
 WEATHER_STAMP_NAME = "weather_stamp.json"
+# Today's live EEX prices (2026-10-21): uploaded locked by the PC after every
+# hourly live_snapshot.py run (weekdays 08:30-18:30). Top 50 "today", Board
+# "Today (live)" and the live points in Power futures read it.
+LIVE_FILES = [("live_prices.db.gz.locked", LIVE_DB, False)]
+LIVE_STAMP_NAME = "live_stamp.json"
 FUTURES_PASSWORD = os.environ.get("FUTURES_PASSWORD", "")
 # Lock format, the same as in upload_online_data.py on the PC:
 # MAGIC + salt (16 bytes) + nonce (12 bytes) + AES-256-GCM(gzip file),
@@ -152,6 +158,7 @@ _state_lock = threading.Lock()
 _merge_lock = threading.Lock()
 _status = {"history": "not downloaded yet", "history_uploaded_at": None,
            "weather": "not downloaded yet", "weather_uploaded_at": None,
+           "live": "not downloaded yet", "live_uploaded_at": None,
            "pc_prices_uploaded_at": None, "unlock_problem": None}
 
 
@@ -331,6 +338,11 @@ def refresh_weather() -> None:
     _refresh_group("weather", WEATHER_STAMP_NAME, WEATHER_FILES)
 
 
+def refresh_live() -> None:
+    """Today's live EEX prices (small; new about every hour on weekdays)."""
+    _refresh_group("live", LIVE_STAMP_NAME, LIVE_FILES)
+
+
 def _refresh_group(group: str, stamp_name: str, files: list) -> None:
     r = _http.get(f"{RELEASE_URL}/{stamp_name}", timeout=(20, 60))
     if r.status_code == 404:
@@ -409,7 +421,8 @@ def _refresh_loop() -> None:
     next_history = 0.0
     while True:
         if time.monotonic() >= next_history:
-            for group, job in (("history", refresh_history), ("weather", refresh_weather)):
+            for group, job in (("history", refresh_history), ("weather", refresh_weather),
+                               ("live", refresh_live)):
                 try:
                     job()
                 except Exception as exc:  # noqa: BLE001
@@ -507,6 +520,8 @@ yc.JAO_DB_FILE = JAO_DB
 ed.DB_PATH = HISTORY_DB
 jd.DB_PATH = JAO_DB
 eex.DB_PATH = EEX_DB         # gas_db() / ice_db() look next to it: EEX_GAS_DB, ICE_DB
+if getattr(eex, "LP", None) is not None:   # live_prices.py: read-only online (no buttons)
+    eex.LP.LIVE_DB = LIVE_DB
 
 
 # Memory (2026-10-21): eex_dash keeps two almost identical frames, "prices"

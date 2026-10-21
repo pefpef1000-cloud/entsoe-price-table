@@ -671,6 +671,10 @@ try:
 except Exception:            # file missing -> dashboard works as before
     LP = None
 LIVE_ENABLED = LP is not None and not os.environ.get("RENDER")   # not on the online copy
+# Showing today's live prices (reading live_prices.db) also works online
+# (2026-10-21): the PC uploads that file after every hourly live_snapshot.py
+# run. Fetching (the buttons) stays PC-only.
+LIVE_READ = LP is not None
 LIVE_MAIN_TABS = ["curve", "history", "spark"]
 # Spread tabs (2026-10-21): each has its own version store, so pressing the
 # button on one tab only redraws that tab's cards.
@@ -1383,7 +1387,7 @@ def forward_curve(market, product, maturity, as_of, compare, tab, _live=None):
 
     # Live (today, delayed) on top of the latest settlement curve.
     live_tiles, live_notes, live_by_dkey = [], [], {}
-    if LIVE_ENABLED and as_of == f["trade_date"].max():
+    if LIVE_READ and as_of == f["trade_date"].max():
         lrows = cur[(cur["trade_date"] == as_of) & (cur["dkey"] > date.today().isoformat())]
         lspecs = live_row_specs(lrows)
         q = LP.read(lspecs)
@@ -1473,7 +1477,7 @@ def live_spread_info(rows_l, rows_r, w, name_l, name_r):
     """Today's live spread for a card. rows_*: settlement rows of each leg
     (one delivery); w: settled frame with L, R, spread. A leg without a
     trade today keeps its last settlement. None when nothing was fetched today."""
-    if not LIVE_ENABLED or w.empty:
+    if not LIVE_READ or w.empty:
         return None
     sl, sr = live_row_specs(rows_l.tail(1)), live_row_specs(rows_r.tail(1))
     if not sl or not sr:
@@ -2299,7 +2303,7 @@ def spark_spread(market, product, maturity, dkey, gas_hub, eff, cf, coal_hub, ce
     # else the last settlement - each tile says which.
     live_block = []
     live_row = None
-    if LIVE_ENABLED:
+    if LIVE_READ:
         roles = live_spark_specs(market, product, maturity, dkey, gas_hub, coal_hub)
         q = LP.read([x for _, x in roles])
         if q:
@@ -3057,7 +3061,7 @@ def price_history(market, product, maturity, dkey, start, end, tab, style, atr_n
     # Live (today, delayed) - first tile, plus a point on the chart and an
     # intraday line below it.
     live_q, live_spec = None, None
-    if LIVE_ENABLED and not only_candles and not full.empty:
+    if LIVE_READ and not only_candles and not full.empty:
         sp_ = live_row_specs(full.tail(1))
         if sp_:
             live_spec = sp_[0]
@@ -3438,7 +3442,7 @@ def top_contracts(day, group, market, maturity, delivering, tab):
     lo, hi = traded[0], traded[-1]
     # Today is pickable too (2026-10-21): volume from the live trade feed.
     today_s = date.today().isoformat()
-    can_today = LIVE_ENABLED and today_s not in all_days
+    can_today = LIVE_READ and today_s not in all_days
     # Default: the last trading day with volume (Peter: "default last trading day").
     day = str(day)[:10] if day else hi
     if day not in all_days and not (can_today and day == today_s):
@@ -3667,7 +3671,7 @@ def board_frame(rows: pd.DataFrame, base: str, live: bool, market: str) -> pd.Da
     b["hours"] = pd.Series(hours, index=b.index, dtype=float)
     b["oi"] = b["gross_open_interest"]
     if live:
-        q = LP.read(live_row_specs(b)) if LIVE_ENABLED else {}
+        q = LP.read(live_row_specs(b)) if LIVE_READ else {}
         b.attrs["fetched"] = max((v["fetched_at"] for v in q.values()), default=None)
         def g(r, k):
             return q.get(("EEX", r.short_code, str(r.delivery)), {}).get(k)
@@ -3745,14 +3749,14 @@ def board(market, product, day, tab, _lv):
     product = keep(product, products, "Base")
     f = f[f["product"] == product]
     dates = sorted(f["trade_date"].unique(), reverse=True)[:120]
-    d_opts = ([{"label": "Today (live)", "value": BOARD_LIVE}] if LIVE_ENABLED else []) + \
+    d_opts = ([{"label": "Today (live)", "value": BOARD_LIVE}] if LIVE_READ else []) + \
         [{"label": x, "value": x} for x in dates]
     if ctx.triggered_id == "live-ver-board" and LIVE_ENABLED:
         day = BOARD_LIVE                      # just pressed "Update prices": show it
     # Default: today (live) once anything was fetched today - the hourly
     # task (live_snapshot.py, 08:30-18:30) does that without a click.
     default_day = dates[0] if dates else None
-    if LIVE_ENABLED and day is None:
+    if LIVE_READ and day is None:
         lrows, _b, _l = board_rows(market, product, BOARD_LIVE)
         if any(v.get("last") is not None for v in LP.read(live_row_specs(lrows)).values()):
             default_day = BOARD_LIVE
@@ -3787,9 +3791,12 @@ def board(market, product, day, tab, _lv):
         head = (f"{market} {product} · {unit} · today, live (EEX trade feed, ~15 min delayed"
                 + (f", fetched {fetched[11:16]}" if fetched else "") + "): "
                 f"{traded} of {len(b)} contracts traded so far. Chg = last trade - "
-                f"yesterday's settle ({base}). Press \"Update prices\" to refresh.")
+                f"yesterday's settle ({base}). "
+                + ("Press \"Update prices\" to refresh." if LIVE_ENABLED
+                   else "Updated hourly 08:30-18:30 on weekdays."))
         if traded == 0:
-            head += " Nothing fetched for today yet - press \"Update prices\"."
+            head += (" Nothing fetched for today yet - press \"Update prices\"." if LIVE_ENABLED
+                     else " Nothing fetched for today yet (first update 08:30).")
     else:
         prev_day = b["prev_day"].dropna().max() if "prev_day" in b else None
         head = (f"{market} {product} · {unit} · settlements {base}"
