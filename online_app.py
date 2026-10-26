@@ -520,6 +520,7 @@ yc.JAO_DB_FILE = JAO_DB
 ed.DB_PATH = HISTORY_DB
 jd.DB_PATH = JAO_DB
 jd.ENTSOE_DB_PATH = HISTORY_DB   # settle next to JAO auction prices (jao_dash.SETTLE_NOTE)
+jd.EEX_DB_PATH = EEX_DB          # futures spread next to JAO auction prices (jao_dash.FUT_NOTE)
 eex.DB_PATH = EEX_DB         # gas_db() / ice_db() look next to it: EEX_GAS_DB, ICE_DB
 if getattr(eex, "LP", None) is not None:   # live_prices.py: read-only online (no buttons)
     eex.LP.LIVE_DB = LIVE_DB

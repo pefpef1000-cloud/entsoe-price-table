@@ -197,7 +197,7 @@ def db_stamp() -> tuple:
 
 def cached(fn):
     def wrapper(*args):
-        key = (fn.__name__, args, db_stamp())
+        key = (fn.__name__, args, db_stamp(), eex_stamp())
         with _cache_lock:
             hit = _cache.get(key, _cache)
         if hit is _cache:
@@ -499,7 +499,7 @@ def load_all_buyers() -> list[str]:
 
 
 @cached
-def load_purchases_for_buyer(buyer_label: str) -> pd.DataFrame:
+def load_purchases_for_buyer(buyer_label: str, show: str = "fut") -> pd.DataFrame:
     """Everything one buyer has won, newest auction close first.
     bid_gate_closure is a real timestamp - no +1 day shift."""
     frag, params = _horizon_exclusion("a.horizon_name")
@@ -546,9 +546,11 @@ def load_purchases_for_buyer(buyer_label: str) -> pd.DataFrame:
     # Auction price (EUR/MW) of each win (Peter, 2026-10-18: "add the auction
     # price of the corridor in the winning list"). Bundles / peak / not yet
     # published: see price_note.
-    # Settle in brackets next to it (Peter, 2026-10-26) - see SETTLE_NOTE.
-    details = _auction_price_details(tuple(out["identification"]))
-    out["price"] = [with_settle(details[i][0], details[i][2]) for i in out["identification"]]
+    # In brackets: futures spread and/or settle, as the tick box says
+    # (Peter, 2026-10-26) - see FUT_NOTE / SETTLE_NOTE.
+    details = _auction_price_details(tuple(out["identification"]), show)
+    out["price"] = [px_text(details[i][0], show, details[i][3], details[i][2])
+                    for i in out["identification"]]
     out["price_note"] = [details[i][1] for i in out["identification"]]
     return out.drop(columns="identification")
 
@@ -652,7 +654,8 @@ TENOR_ORDER = ["Yearly", "Seasonal", "Quarterly", "Monthly", "Weekly"]
 
 
 @cached
-def load_buyer_map_data(buyer_label: str, year_month: str, tenors: str = "All") -> pd.DataFrame:
+def load_buyer_map_data(buyer_label: str, year_month: str, tenors: str = "All",
+                        show: str = "fut") -> pd.DataFrame:
     """One row per corridor + tenor (horizon_name) this buyer HOLDS
     capacity for during the picked delivery month ("2026-10"), with the
     win count and win date(s) (the day each auction closed), filtered by
@@ -739,7 +742,7 @@ def load_buyer_map_data(buyer_label: str, year_month: str, tenors: str = "All") 
     # Auction price (EUR/MW) of each won auction, in the same order as the
     # win dates (Peter, 2026-10-18: "add the auction price of the corridor in
     # the winning list"). Several auctions on one day: " / " between them.
-    texts = _auction_price_texts(tuple(won["identification"]))
+    texts = _auction_price_texts(tuple(won["identification"]), show)
     won["price"] = won["identification"].map(texts).fillna("-")
 
     def fmt_prices(group):
@@ -915,14 +918,305 @@ def with_settle(price, settle) -> str:
     return f"{price:.2f} ({settle:.2f})"
 
 
-def _auction_price_details(identifications) -> dict:
-    """{auction: (price, note, settle)} from auction_results (EUR/MW) and the
-    day-ahead prices (settle, see SETTLE_NOTE). price is None when there is
-    no single price: no result published yet (note "no result yet"), or a
-    bundled CEEXD auction, which has one price per border (note lists the
-    borders that got capacity, with their settle: "CZ-DE(50Hz) 1.38 (0.90)
-    · DE(50Hz)-CZ 5.15 (6.02)"). A peak auction gets the note "peak" and a
-    peak-hours settle."""
+# ---------------------------------------------------------------------
+# Futures spread next to every auction price (Peter, 2026-10-26: "add also
+# the price spread of the futures contracts for the corridor countries at
+# settlement on auction day. also everywhere where auction price is. tick
+# box decides what is shown, default is spread future contracts").
+# For corridor A-B (flow A -> B): the EEX future of B minus the one of A,
+# for the auction's own delivery product (Yearly -> Cal, Quarterly -> Q,
+# Monthly -> that month; base, or peak for a peak auction), at its
+# settlement price on the day the auction's bidding closed (CET). No
+# settlement that day (weekend / holiday): the last one before, up to
+# FUT_MAX_DAYS_BACK days. EEX settlements are only stored from Aug 2026;
+# older days use that day's last traded price (eex_market_ohlc), marked "*".
+# Italy: the Italian (PUN) future for every Italian zone. No EUR future at
+# EEX for one side (GB is in GBP, Baltics, PT, ME, ...), no peak future
+# (Nordic zones, BE, GR, IE) or only a Mon-Sun peak (ES): no futures spread.
+# ---------------------------------------------------------------------
+def _default_eex_db() -> Path:
+    return Path(__file__).resolve().parent.parent / "eex_scraper" / "eex_market_data.db"
+
+
+EEX_DB_PATH = _default_eex_db()   # online_app replaces it
+FUT_MAX_DAYS_BACK = 7
+FUT_HORIZON_MATURITY = {"Yearly": "Year", "Quarterly": "Quarter", "Monthly": "Month"}
+FUT_MONTHS = {"Year": 12, "Quarter": 3, "Month": 1}
+# Market names in EEX's contract names (same list as futures_vs_spot_dash.py,
+# GB left out: GBP).
+FUT_DEMONYM = {
+    "German": "DE", "French": "FR", "Austrian": "AT", "Swiss": "CH",
+    "Italian": "IT", "Spanish": "ES", "Dutch": "NL", "Belgian": "BE",
+    "Polish": "PL", "Czech": "CZ", "Slovakian": "SK", "Hungarian": "HU",
+    "Romanian": "RO", "Bulgarian": "BG", "Croatian": "HR", "Slovenian": "SI",
+    "Serbian": "RS", "Greek": "GR", "Finnish": "FI", "Irish SEM": "IE",
+}
+FUT_ZONE_RE = re.compile(r"\b([A-Z]{2}\d)\b")     # "Danish DK1", "Norwegian NO2"
+# ENTSO-E zone (settle_zones()) -> EEX market.
+FUT_ZONE_TO_MARKET = {
+    "DE_LU": "DE", "FR": "FR", "AT": "AT", "CH": "CH", "ES": "ES", "NL": "NL",
+    "BE": "BE", "PL": "PL", "CZ": "CZ", "SK": "SK", "HU": "HU", "RO": "RO",
+    "BG": "BG", "HR": "HR", "SI": "SI", "RS": "RS", "GR": "GR", "FI": "FI",
+    "IE_SEM": "IE", "DK_1": "DK1", "DK_2": "DK2", "NO_1": "NO1", "NO_2": "NO2",
+    "NO_3": "NO3", "NO_4": "NO4", "NO_5": "NO5", "SE_1": "SE1", "SE_2": "SE2",
+    "SE_3": "SE3", "SE_4": "SE4",
+    **{z: "IT" for z in ("IT_NORD", "IT_CNOR", "IT_CSUD", "IT_SUD", "IT_SICI",
+                         "IT_SARD", "IT_CALA")},
+}
+
+
+def eex_stamp() -> tuple:
+    out = []
+    for path in (Path(EEX_DB_PATH), Path(f"{EEX_DB_PATH}-wal")):
+        try:
+            st = path.stat()
+            out.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append(None)
+    return (str(EEX_DB_PATH), *out)
+
+
+def _fut_market(long_name: str | None) -> str | None:
+    """EEX market of a plain power future name, None for anything else."""
+    if not long_name:
+        return None
+    name = re.sub(r"^EEX(-PXE)?\s+", "", long_name)
+    if " Power" not in name or any(w in name for w in (
+            "Option", "Japan", "Block", "Off-Peak", "Mon-Sun", "Week", "Day")):
+        return None
+    head = name.split(" Power")[0]
+    zone = FUT_ZONE_RE.search(head)
+    return zone.group(1) if zone else FUT_DEMONYM.get(head)
+
+
+def _fut_data():
+    """({(market, "Base"/"Peak", maturity): short code},
+    {(code, delivery): (days, prices, last_traded flags)}) - month, quarter
+    and year futures, days = days since 1970 (sorted). Kept until the EEX
+    file changes. None without the EEX database."""
+    path = Path(EEX_DB_PATH)
+    if not path.exists():
+        return None
+    key = ("fut-data", eex_stamp())
+    hit = _settle_cache_get(key)
+    if hit is not None:
+        return hit or None
+    result = ()
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+        try:
+            codes = {}
+            for code, name, product, maturity in conn.execute(
+                    "SELECT short_code, long_name, product, maturity_type FROM contracts "
+                    "ORDER BY short_code"):
+                if product in ("Base", "Peak") and maturity in FUT_MONTHS:
+                    market = _fut_market(name)
+                    if market:
+                        codes.setdefault((market, product, maturity), code)
+            wanted = sorted(set(codes.values()))
+            marks = ",".join("?" * len(wanted))
+            frames = [pd.read_sql_query(
+                "SELECT short_code, delivery, trade_date, settlement_price AS price, 0 AS last "
+                f"FROM eex_market_prices WHERE short_code IN ({marks}) "
+                "AND settlement_price IS NOT NULL AND COALESCE(currency, 'EUR') = 'EUR'",
+                conn, params=wanted)]
+            try:
+                frames.append(pd.read_sql_query(
+                    "SELECT short_code, delivery, trade_date, last AS price, 1 AS last "
+                    f"FROM eex_market_ohlc WHERE short_code IN ({marks}) "
+                    "AND trades > 0 AND last IS NOT NULL AND COALESCE(currency, 'EUR') = 'EUR'",
+                    conn, params=wanted))
+            except (sqlite3.Error, pd.errors.DatabaseError):
+                pass   # no trade table: settlements only
+        finally:
+            conn.close()
+    except (sqlite3.Error, pd.errors.DatabaseError):
+        _settle_cache_put(key, result)
+        return None
+    both = pd.concat(frames, ignore_index=True)
+    both["day"] = pd.to_datetime(both["trade_date"], errors="coerce")
+    both = both.dropna(subset=["day", "price"])
+    series = {}
+    if not both.empty:
+        both["day"] = both["day"].to_numpy().astype("datetime64[D]").astype(np.int64)
+        both["delivery"] = both["delivery"].astype(str)
+        # A settlement wins over the last trade of the same day.
+        both = (both.sort_values(["short_code", "delivery", "day", "last"])
+                    .drop_duplicates(["short_code", "delivery", "day"], keep="first"))
+        for (code, delivery), g in both.groupby(["short_code", "delivery"], sort=False):
+            series[(code, delivery)] = (g["day"].to_numpy(dtype=np.int64),
+                                        g["price"].to_numpy(dtype=float),
+                                        g["last"].to_numpy(dtype=bool))
+    result = (codes, series)
+    _settle_cache_put(key, result)
+    return result
+
+
+def _fut_product(horizon, start, stop):
+    """(maturity, delivery "YYYYMM") of the EEX future that delivers exactly
+    the auction's period, or None (Seasonal / Weekly, or a period that is not
+    a whole calendar month / quarter / year)."""
+    maturity = FUT_HORIZON_MATURITY.get(horizon)
+    if maturity is None or start is None or stop is None:
+        return None
+    try:
+        t0, t1 = (pd.Timestamp(x) for x in (start, stop))
+        t0 = (t0 if t0.tzinfo else t0.tz_localize("UTC")).tz_convert("CET")
+        t1 = (t1 if t1.tzinfo else t1.tz_localize("UTC")).tz_convert("CET")
+    except (ValueError, TypeError):
+        return None
+    if (t0.day, t0.hour, t0.minute) != (1, 0, 0) or (t1.day, t1.hour, t1.minute) != (1, 0, 0):
+        return None
+    if (t1.year * 12 + t1.month) - (t0.year * 12 + t0.month) != FUT_MONTHS[maturity]:
+        return None
+    if maturity == "Quarter" and t0.month not in (1, 4, 7, 10):
+        return None
+    if maturity == "Year" and t0.month != 1:
+        return None
+    return maturity, f"{t0.year}{t0.month:02d}"
+
+
+def _fut_leg(data, market, product, maturity, delivery, day):
+    """(price, last_traded) of one future on `day` (or the last day before,
+    up to FUT_MAX_DAYS_BACK), or None."""
+    code = data[0].get((market, product, maturity))
+    found = data[1].get((code, delivery)) if code else None
+    if found is None:
+        return None
+    days, prices, last = found
+    i = int(np.searchsorted(days, day, side="right")) - 1
+    if i < 0 or day - days[i] > FUT_MAX_DAYS_BACK:
+        return None
+    return float(prices[i]), bool(last[i])
+
+
+def futures_spread_for(corridor: str, horizon, start, stop, gate, peak: bool = False):
+    """(F_to - F_from, last_traded) in EUR/MWh for one auction - see the
+    note above - or None. start/stop = market_period_start/stop as stored by
+    JAO, gate = bid_gate_closure."""
+    product = _fut_product(horizon, start, stop)
+    if product is None or gate is None or (isinstance(gate, float) and math.isnan(gate)):
+        return None
+    zone_from, zone_to = settle_zones(corridor)
+    m_from, m_to = FUT_ZONE_TO_MARKET.get(zone_from), FUT_ZONE_TO_MARKET.get(zone_to)
+    if not m_from or not m_to or m_from == m_to:
+        return None
+    data = _fut_data()
+    if not data:
+        return None
+    try:
+        g = pd.Timestamp(gate)
+        g = (g if g.tzinfo else g.tz_localize("UTC")).tz_convert("CET")
+    except (ValueError, TypeError):
+        return None
+    day = (g.date() - pd.Timestamp("1970-01-01").date()).days
+    kind = "Peak" if peak else "Base"
+    a = _fut_leg(data, m_from, kind, *product, day)
+    b = _fut_leg(data, m_to, kind, *product, day) if a else None
+    if a is None or b is None:
+        return None
+    return round(b[0] - a[0], 2), a[1] or b[1]
+
+
+# ---- the tick box: what goes in brackets after an auction price ---------
+PX_FUT, PX_SETTLE = "fut", "settle"
+PX_OPTIONS = [{"label": "Futures spread", "value": PX_FUT},
+              {"label": "Settle", "value": PX_SETTLE}]
+PX_DEFAULT = [PX_FUT]                     # Peter: "default is spread future contracts"
+PX_TABS = {"corridor", "lookup", "bmap", "cal", "yc", "cm"}   # tabs that show auction prices
+FUT_NOTE = ("futures spread: EEX futures price of the importing country minus the exporting "
+            "one, same product (month / quarter / year, base or peak), settlement on the day "
+            "the auction closed. * = last traded price that day (EEX settlements only stored "
+            "from Aug 2026). Italy: PUN futures. None for GB, Baltics etc. (no EUR future) "
+            "and for peak where a country has no peak future.")
+
+
+def px_show(value) -> str:
+    """The tick box's value as a hashable key: "fut", "settle",
+    "fut,settle" or "" (nothing ticked). None (no tick box) = the default."""
+    if value is None:
+        value = PX_DEFAULT
+    return ",".join(k for k in (PX_FUT, PX_SETTLE) if k in value)
+
+
+def _px_keys(show: str) -> list:
+    return [k for k in (show or "").split(",") if k]
+
+
+def px_inside(show: str, fut=None, settle=None) -> str:
+    """What goes in the brackets: "4.10", "4.10*", "4.10 / 5.12", "- / 5.12"
+    or "" (nothing known). fut = (spread, last_traded) or None."""
+    parts = []
+    for k in _px_keys(show):
+        if k == PX_FUT:
+            ok = fut is not None and fut[0] is not None and not pd.isna(fut[0])
+            parts.append(f"{fut[0]:.2f}" + ("*" if fut[1] else "") if ok else None)
+        elif k == PX_SETTLE:
+            ok = settle is not None and not pd.isna(settle)
+            parts.append(f"{settle:.2f}" if ok else None)
+    if not any(parts):
+        return ""
+    return " / ".join(p or "-" for p in parts)
+
+
+def px_text(price, show: str, fut=None, settle=None) -> str:
+    """ "4.63 (4.10)" - auction price, then the tick box's pick in brackets."""
+    if price is None or pd.isna(price):
+        return ""
+    inside = px_inside(show, fut, settle)
+    return f"{price:.2f} ({inside})" if inside else f"{price:.2f}"
+
+
+def px_head(show: str) -> str:
+    """ "(futures spread)", "(settle)", "(futures spread / settle)" or ""."""
+    names = {PX_FUT: "futures spread", PX_SETTLE: "settle"}
+    keys = _px_keys(show)
+    return f"({' / '.join(names[k] for k in keys)})" if keys else ""
+
+
+def px_label(prefix: str, show: str, unit: str = ", EUR/MW") -> str:
+    head = px_head(show)
+    return f"{prefix} {head}{unit}" if head else f"{prefix}{unit}"
+
+
+def px_note(show: str) -> str:
+    keys = _px_keys(show)
+    settle_text = SETTLE_NOTE.split("= settle: ", 1)[-1]
+    if keys == [PX_FUT]:
+        return "(...) = " + FUT_NOTE
+    if keys == [PX_SETTLE]:
+        return SETTLE_NOTE
+    if keys:
+        return ("(futures spread / settle). " + FUT_NOTE[0].upper() + FUT_NOTE[1:]
+                + " Settle: " + settle_text)
+    return ""
+
+
+def px_notes(show: str) -> list:
+    text = px_note(show)
+    return [note(text)] if text else []
+
+
+def bracket_picker():
+    """The tick box (here and in the LTCAP tool, under the tabs)."""
+    return html.Div(id="px-box", className="pxbar", children=[
+        html.Span("In brackets after auction prices:", className="pxlabel"),
+        dcc.Checklist(id="px-show", options=PX_OPTIONS, value=list(PX_DEFAULT), inline=True,
+                      className="seg", persistence=True, persistence_type="local"),
+    ])
+
+
+def _auction_price_details(identifications, show: str = PX_FUT) -> dict:
+    """{auction: (price, note, settle, fut)} from auction_results (EUR/MW),
+    the day-ahead prices (settle, see SETTLE_NOTE) and the EEX futures (fut =
+    (spread, last_traded), see FUT_NOTE). Settle / fut are only worked out
+    when the tick box shows them (`show`, see px_show()), else None. price
+    is None when there is no single price: no result published yet (note
+    "no result yet"), or a bundled CEEXD auction, which has one price per
+    border (note lists the borders that got capacity, with their brackets:
+    "CZ-DE(50Hz) 1.38 (0.90) · DE(50Hz)-CZ 5.15 (6.02)"). A peak auction
+    gets the note "peak" and a peak-hours settle / peak futures."""
+    want = _px_keys(show)
     ids = list(dict.fromkeys(identifications))
     rows, periods = [], {}
     conn = _connect()
@@ -934,10 +1228,11 @@ def _auction_price_details(identifications) -> dict:
                 "SELECT identification, corridor_code, product_identification, "
                 "allocated_capacity, auction_price FROM auction_results "
                 f"WHERE identification IN ({marks})", chunk).fetchall()
-            for ident, corridor, start, stop in conn.execute(
-                    "SELECT identification, corridor_code, market_period_start, market_period_stop "
+            for ident, corridor, start, stop, horizon, gate in conn.execute(
+                    "SELECT identification, corridor_code, market_period_start, "
+                    "market_period_stop, horizon_name, bid_gate_closure "
                     f"FROM auctions WHERE identification IN ({marks})", chunk):
-                periods[ident] = (corridor, start, stop)
+                periods[ident] = (corridor, start, stop, horizon, gate)
     finally:
         conn.close()
     by_auction: dict = {}
@@ -946,41 +1241,50 @@ def _auction_price_details(identifications) -> dict:
     out = {}
     for ident in ids:
         results = by_auction.get(ident)
-        corridor, start, stop = periods.get(ident, (None, None, None))
+        corridor, start, stop, horizon, gate = periods.get(ident, (None,) * 5)
         if not results:
-            out[ident] = (None, "no result yet", None)
+            out[ident] = (None, "no result yet", None, None)
             continue
         peak = any("PEAK" in r[1].upper() for r in results)
-        notes, settle = [], None
+
+        def brackets(code):
+            return (settle_for(code, start, stop, peak) if PX_SETTLE in want else None,
+                    futures_spread_for(code, horizon, start, stop, gate, peak)
+                    if PX_FUT in want else None)
+
+        notes, settle, fut = [], None, None
         if len(results) == 1:
             price = results[0][3]
             if price is None:
                 notes.append("no result yet")
             elif corridor:
-                settle = settle_for(corridor, start, stop, peak)
+                settle, fut = brackets(corridor)
         else:
             price = None
-            parts = [f"{display_code(c)} {with_settle(p, settle_for(c, start, stop, peak))}"
-                     for c, _, a, p in results if p is not None and (a or 0) > 0]
+            parts = []
+            for c, _, a, p in results:
+                if p is not None and (a or 0) > 0:
+                    s, f = brackets(c)
+                    parts.append(f"{display_code(c)} {px_text(p, show, f, s)}")
             notes.append(" · ".join(parts) if parts else "all borders 0.00")
         if peak:
             notes.append("peak")
-        out[ident] = (price, ", ".join(notes), settle)
+        out[ident] = (price, ", ".join(notes), settle, fut)
     return out
 
 
-def _auction_price_texts(identifications: tuple) -> dict:
+def _auction_price_texts(identifications: tuple, show: str = PX_FUT) -> dict:
     """{auction: its price as text} for the Buyer lookup map table:
-    "12.34 (10.50)" (settle in brackets), "12.34 (10.50) peak", the CEEXD
-    border list, or "-" (no result yet)."""
+    "12.34 (10.50)" (tick box's pick in brackets), "12.34 (10.50) peak",
+    the CEEXD border list, or "-" (no result yet)."""
     out = {}
-    for ident, (price, note, settle) in _auction_price_details(identifications).items():
+    for ident, (price, note_, settle, fut) in _auction_price_details(identifications, show).items():
         if price is not None:
-            out[ident] = with_settle(price, settle) + (" peak" if note == "peak" else "")
-        elif note == "no result yet":
+            out[ident] = px_text(price, show, fut, settle) + (" peak" if note_ == "peak" else "")
+        elif note_ == "no result yet":
             out[ident] = "-"
         else:
-            out[ident] = note.replace(", peak", " peak")
+            out[ident] = note_.replace(", peak", " peak")
     return out
 
 
@@ -1068,7 +1372,7 @@ def delivery_label(horizon: str, start: pd.Timestamp, stop: pd.Timestamp) -> str
 
 
 @cached
-def load_auction_calendar(first_day: str) -> pd.DataFrame:
+def load_auction_calendar(first_day: str, show: str = "fut") -> pd.DataFrame:
     """Every non-daily auction (dashboard-wide exclusions) whose bid gate
     CLOSES on or after `first_day` ("2026-10-01", CET), one row per
     auction slot: same close time, open time, tenor and delivery period ->
@@ -1090,7 +1394,7 @@ def load_auction_calendar(first_day: str) -> pd.DataFrame:
         conn, params=params + (since.strftime("%Y-%m-%dT%H:%M"),))
     conn.close()
     cols = ["closes", "opens", "horizon_name", "delivery", "corridors", "cancelled",
-            "prices", "price_notes", "settles"]
+            "prices", "price_notes", "settles", "futs"]
     if df.empty:
         return pd.DataFrame(columns=cols)
     df["closes"] = pd.to_datetime(df["bid_gate_closure"], utc=True).dt.tz_convert("CET")
@@ -1102,15 +1406,16 @@ def load_auction_calendar(first_day: str) -> pd.DataFrame:
     df["dstart"] = start
     df = df.sort_values("corridor_code")
     df["cancel_code"] = df["corridor_code"].where(df["cancelled"].fillna(0).astype(int) == 1)
-    details = _auction_price_details(tuple(df["identification"]))
+    details = _auction_price_details(tuple(df["identification"]), show)
     df["price"] = [details[i][0] for i in df["identification"]]
     df["price_note"] = [details[i][1] for i in df["identification"]]
     df["settle"] = [details[i][2] for i in df["identification"]]
+    df["fut"] = [details[i][3] for i in df["identification"]]
     out = (df.groupby(["closes", "opens", "horizon_name", "delivery", "dstart"], dropna=False)
              .agg(corridors=("corridor_code", list),
                   cancelled=("cancel_code", lambda s: [c for c in s if isinstance(c, str)]),
                   prices=("price", list), price_notes=("price_note", list),
-                  settles=("settle", list))
+                  settles=("settle", list), futs=("fut", list))
              .reset_index())
     rank = {t: i for i, t in enumerate(TENOR_ORDER)}
     out["_t"] = out["horizon_name"].map(rank).fillna(len(rank))
@@ -1298,6 +1603,7 @@ def load_series(corridor: str, horizon: str, product: str) -> pd.DataFrame:
             a.market_period_start,
             a.market_period_start AS raw_start,
             a.market_period_stop AS raw_stop,
+            a.bid_gate_closure AS gate,
             a.cancelled,
             r.product_hour,
             r.offered_capacity,
@@ -1422,7 +1728,7 @@ def num(value, decimals):
     return f"{value:.{decimals}f}" if pd.notna(value) else "-"
 
 
-def _calendar_price_cell(r, now: pd.Timestamp) -> str:
+def _calendar_price_cell(r, now: pd.Timestamp, show: str = "fut") -> str:
     """Auction calendar, price column (Peter, 2026-10-18: "add the auction
     price after status"): each corridor's clearing price, "AT-DE 1.32 ·
     DE-AT 24.39", once JAO has published the result. Empty while the slot
@@ -1432,14 +1738,15 @@ def _calendar_price_cell(r, now: pd.Timestamp) -> str:
         return ""
     esc = html_escape
     parts = []
-    for code, price, note, settle in zip(r.corridors, r.prices, r.price_notes, r.settles):
+    for code, price, note, settle, fut in zip(r.corridors, r.prices, r.price_notes, r.settles,
+                                              r.futs):
         if code in r.cancelled:
             continue
         peak = " peak" if "peak" in (note or "") else ""
         if price is not None and not pd.isna(price):
-            # Settle in brackets once delivery has started (Peter, 2026-10-26).
+            # Brackets: the tick box's pick (Peter, 2026-10-26).
             parts.append(f'<span class="code pc">{esc(code)}</span> '
-                         f'{esc(with_settle(price, settle))}{peak}')
+                         f'{esc(px_text(price, show, fut, settle))}{peak}')
         elif note and not note.startswith("no result"):
             parts.append(f'<span class="code pc">{esc(code)}</span> {esc(note)}')
     if parts:
@@ -1449,7 +1756,7 @@ def _calendar_price_cell(r, now: pd.Timestamp) -> str:
     return '<span class="cnt">result pending</span>'
 
 
-def render_calendar_html(cal: pd.DataFrame, now: pd.Timestamp) -> str:
+def render_calendar_html(cal: pd.DataFrame, now: pd.Timestamp, show: str = "fut") -> str:
     """The Auction calendar as one HTML table (one text, not one Dash
     component per cell - see the dashboard standard), painted by CAL_PAINT_JS.
     A header row per day, then that day's auction slots. Days before today
@@ -1497,7 +1804,7 @@ def render_calendar_html(cal: pd.DataFrame, now: pd.Timestamp) -> str:
                 f"<td>{esc(r.delivery)}</td>"
                 f'<td class="corr">{corr} <span class="cnt">({len(r.corridors)})</span></td>'
                 f"<td>{status}</td>"
-                f'<td class="price">{_calendar_price_cell(r, now)}</td></tr>')
+                f'<td class="price">{_calendar_price_cell(r, now, show)}</td></tr>')
     out.append("</tbody></table>")
     return "".join(out)
 
@@ -1685,6 +1992,9 @@ h3 {{ font-size:16px; margin:18px 0 6px; }}
 .seg input {{ display:none; }}
 .seg label:has(input:checked) {{ background:{INK['accent']}; }}
 .seg label:has(input:checked), .seg label:has(input:checked) * {{ color:#fff !important; }}
+.pxbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 2px; }}
+.pxlabel {{ font-size:13px; color:{INK['muted']}; }}
+.pxbar .seg label {{ padding:0 12px; }}
 .updbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:2px 0 10px; }}
 .updbtn {{ padding:5px 14px; border:1px solid {INK['accent']}; background:{INK['accent']}; color:#fff;
           border-radius:6px; cursor:pointer; font-size:13px; font-family:{FONT}; }}
@@ -1831,6 +2141,7 @@ def full_layout():
         dcc.Tabs(id="tabs", value="corridor", children=[
             dcc.Tab(label=label, value=value, style=TAB_STYLE, selected_style=TAB_SELECTED)
             for value, label in TABS]),
+        bracket_picker(),
         *panels(),
     ], className="wrap")
 
@@ -1900,6 +2211,12 @@ def switch_tab(tab):
     return [{"display": "block" if v == tab else "none"} for v, _ in TABS]
 
 
+@_callback(Output("px-box", "style"), Input("tabs", "value"))
+def px_box_visible(tab):
+    """The bracket tick box only on tabs that show auction prices."""
+    return None if tab in PX_TABS else {"display": "none"}
+
+
 # ---------------------------------------------------------------------
 # 1. Corridor explorer
 # ---------------------------------------------------------------------
@@ -1909,9 +2226,9 @@ def switch_tab(tab):
     Output("c-product", "options"), Output("c-product", "value"),
     Output("c-body", "children"),
     Input("c-corridor", "value"), Input("c-horizon", "value"), Input("c-product", "value"),
-    Input("tabs", "value"),
+    Input("tabs", "value"), Input("px-show", "value"),
 )
-def corridor_explorer(corridor, horizon, product, tab):
+def corridor_explorer(corridor, horizon, product, tab, px_value=None):
     if tab != "corridor":
         return [no_update] * 7
     corridors = load_corridors()
@@ -1942,39 +2259,57 @@ def corridor_explorer(corridor, horizon, product, tab):
         else pd.DataFrame()
     )
 
-    # Settle next to every auction price (Peter, 2026-10-26) - see SETTLE_NOTE.
+    # In brackets next to every auction price: futures spread and/or settle,
+    # as the tick box says (Peter, 2026-10-26) - see FUT_NOTE / SETTLE_NOTE.
     peak = "PEAK" in str(product).upper()
+    show = px_show(px_value)
+    want = _px_keys(show)
 
-    def add_settle(frame, code):
+    def add_brackets(frame, code):
         if frame.empty:
             return frame
         frame = frame.copy()
-        frame["settle"] = np.array(
-            [np.nan if v is None else v for v in
-             (settle_for(code, a, b, peak) for a, b in zip(frame["raw_start"], frame["raw_stop"]))],
-            dtype=float)
-        frame["price_text"] = [with_settle(p, st) for p, st in
-                               zip(frame["auction_price"], frame["settle"])]
+        spans = list(zip(frame["raw_start"], frame["raw_stop"], frame["gate"]))
+        settles = [settle_for(code, a, b, peak) if PX_SETTLE in want else None
+                   for a, b, _ in spans]
+        futs = [futures_spread_for(code, horizon, a, b, g, peak) if PX_FUT in want else None
+                for a, b, g in spans]
+        frame["settle"] = np.array([np.nan if v is None else v for v in settles], dtype=float)
+        frame["fut"] = np.array([np.nan if f is None else f[0] for f in futs], dtype=float)
+        frame["fut_last"] = np.array([np.nan if f is None else float(f[1]) for f in futs],
+                                     dtype=float)
+        frame["price_text"] = [px_text(p, show, f, st)
+                               for p, f, st in zip(frame["auction_price"], futs, settles)]
         return frame
 
-    df = add_settle(df, corridor)
-    opp_df = add_settle(opp_df, opposite) if opposite else opp_df
+    df = add_brackets(df, corridor)
+    opp_df = add_brackets(opp_df, opposite) if opposite else opp_df
+
+    def cell(pivot, r, c):
+        return pivot.at[r, c] if r in pivot.index and c in pivot.columns else np.nan
+
+    def monthly(frame, col):
+        if frame[col].notna().any():
+            return render_monthly_pivot(frame, col)
+        return pd.DataFrame(index=MONTH_ORDER)
 
     def price_pivot(frame):
         prices = render_monthly_pivot(frame, "auction_price")
-        settles = render_monthly_pivot(frame, "settle")
+        settles, futs, lasts = (monthly(frame, c) for c in ("settle", "fut", "fut_last"))
         out = prices.copy().astype(object)
         for r in prices.index:
             for c in prices.columns:
-                out.at[r, c] = with_settle(prices.at[r, c], settles.at[r, c]) or "-"
+                f = cell(futs, r, c)
+                fut = None if pd.isna(f) else (f, cell(lasts, r, c) > 0)
+                out.at[r, c] = px_text(prices.at[r, c], show, fut, cell(settles, r, c)) or "-"
         return out
 
+    price_name = px_label("Price", show)
     body = []
     latest = df.iloc[-1]
     if opp_df.empty:
         body.append(html.Div([
-            kpi(f"{corridor} latest price (settle), EUR/MW",
-                with_settle(latest["auction_price"], latest["settle"]) or "-"),
+            kpi(px_label(f"{corridor} latest price", show), latest["price_text"] or "-"),
             kpi(f"{corridor} latest allocated (MW)", num(latest["allocated_capacity"], 0)),
             kpi("Auctions shown", str(len(df))),
         ], className="kpis"))
@@ -1984,16 +2319,15 @@ def corridor_explorer(corridor, horizon, product, tab):
     else:
         opp_latest = opp_df.iloc[-1]
         body.append(html.Div([
-            kpi(f"{corridor} latest price (settle), EUR/MW",
-                with_settle(latest["auction_price"], latest["settle"]) or "-"),
-            kpi(f"{opposite} latest price (settle), EUR/MW",
-                with_settle(opp_latest["auction_price"], opp_latest["settle"]) or "-"),
+            kpi(px_label(f"{corridor} latest price", show), latest["price_text"] or "-"),
+            kpi(px_label(f"{opposite} latest price", show), opp_latest["price_text"] or "-"),
             kpi(f"{corridor} latest allocated (MW)", num(latest["allocated_capacity"], 0)),
             kpi(f"{opposite} latest allocated (MW)", num(opp_latest["allocated_capacity"], 0)),
         ], className="kpis"))
 
     if horizon == "Monthly":
-        for title, col, dec in (("Price (settle) by month/year (EUR/MW)", "auction_price", 2),
+        for title, col, dec in ((px_label("Price", show, "") + " by month/year (EUR/MW)",
+                                 "auction_price", 2),
                                 ("Allocated volume by month/year (MW)", "allocated_capacity", 0)):
             body.append(html.H3(title))
             make = price_pivot if col == "auction_price" else \
@@ -2014,10 +2348,10 @@ def corridor_explorer(corridor, horizon, product, tab):
             names={"period": "Period", "product_hour": "Product hour",
                    "offered_capacity": "Offered (MW)", "requested_capacity": "Requested (MW)",
                    "allocated_capacity": "Allocated (MW)",
-                   "price_text": "Price (settle), EUR/MW", "cancelled": "Cancelled"},
+                   "price_text": price_name, "cancelled": "Cancelled"},
             formats={"offered_capacity": 2, "requested_capacity": 2,
                      "allocated_capacity": 2}))
-        body.append(note(SETTLE_NOTE))
+        body += px_notes(show)
         return out + [body]
 
     # Both directions, paired metric by metric. Outer join on
@@ -2039,8 +2373,8 @@ def corridor_explorer(corridor, horizon, product, tab):
                "allocated_capacity_a", "allocated_capacity_b",
                "offered_capacity_a", "offered_capacity_b"],
         names={"period": "Period", "product_hour": "Product hour",
-               "price_text_a": f"Price (settle) {corridor}",
-               "price_text_b": f"Price (settle) {opposite}",
+               "price_text_a": px_label("Price", show, f" {corridor}"),
+               "price_text_b": px_label("Price", show, f" {opposite}"),
                "allocated_capacity_a": f"Allocated {corridor}",
                "allocated_capacity_b": f"Allocated {opposite}",
                "offered_capacity_a": f"Offered {corridor}",
@@ -2048,7 +2382,7 @@ def corridor_explorer(corridor, horizon, product, tab):
         formats={c: 2 for c in ("allocated_capacity_a",
                                 "allocated_capacity_b", "offered_capacity_a",
                                 "offered_capacity_b")}))
-    body.append(note(SETTLE_NOTE))
+    body += px_notes(show)
     return out + [body]
 
 
@@ -2111,9 +2445,9 @@ def buyers_by_month(horizon, year_month, buyers_corridor, tab):
 # ---------------------------------------------------------------------
 @_callback(
     Output("l-buyer", "options"), Output("l-buyer", "value"), Output("l-body", "children"),
-    Input("l-buyer", "value"), Input("tabs", "value"),
+    Input("l-buyer", "value"), Input("tabs", "value"), Input("px-show", "value"),
 )
-def buyer_lookup(buyer, tab):
+def buyer_lookup(buyer, tab, px_value=None):
     if tab != "lookup":
         return no_update, no_update, no_update
     buyers = load_all_buyers()
@@ -2121,7 +2455,8 @@ def buyer_lookup(buyer, tab):
         return [], None, note("No winners recorded yet - run python eic_lookup.py after a "
                               "backfill.", "info")
     buyer = keep(buyer, buyers, default_buyer(buyers))
-    purchases = load_purchases_for_buyer(buyer)
+    show = px_show(px_value)
+    purchases = load_purchases_for_buyer(buyer, show)
     if purchases.empty:
         return buyers, buyer, note(f"No purchases found for {buyer}.", "info")
 
@@ -2139,13 +2474,14 @@ def buyer_lookup(buyer, tab):
     body.append(table(
         purchases, order=order,
         names={"horizon_name": "Horizon", "period": "Period", "corridor_code": "Corridor",
-               "price": "Auction price (settle), EUR/MW", "price_note": "Price note",
+               "price": px_label("Auction price", show), "price_note": "Price note",
                "auction_closed": "Auction closed (UTC)"},
         tooltips={"auction_closed": "When bidding actually closed and the auction cleared - "
                                     "not the delivery period.",
-                  "price": "The auction's clearing price, settle in brackets. A bundled "
-                           "CEEXD auction has one price per border - see Price note."}))
-    body.append(note(SETTLE_NOTE))
+                  "price": "The auction's clearing price; in brackets what the tick box "
+                           "picks (futures spread / settle). A bundled CEEXD auction has one "
+                           "price per border - see Price note."}))
+    body += px_notes(show)
     return buyers, buyer, body
 
 
@@ -2182,8 +2518,9 @@ def bm_tenor_pick(value, prev):
     Output("bm-body", "children"),
     Input("bm-buyer", "value"), Input("bm-month", "value"),
     Input("bm-tenor", "value"), Input("tabs", "value"), Input("db-refresh", "data"),
+    Input("px-show", "value"),
 )
-def buyer_lookup_map(buyer, year_month, tenor_value, tab, _refresh=None):
+def buyer_lookup_map(buyer, year_month, tenor_value, tab, _refresh=None, px_value=None):
     if tab != "bmap":
         return [no_update] * 5
     buyers = load_all_buyers()
@@ -2215,7 +2552,8 @@ def buyer_lookup_map(buyer, year_month, tenor_value, tab, _refresh=None):
         tenors_arg, tenor_clause = "All", ""
 
     head = [buyers, buyer, year_months, year_month]
-    counts = load_buyer_map_data(buyer, year_month, tenors_arg)
+    show = px_show(px_value)
+    counts = load_buyer_map_data(buyer, year_month, tenors_arg, show)
 
     if counts.empty:
         return head + [note(f"No corridors held by {buyer} in {year_month}"
@@ -2243,11 +2581,11 @@ def buyer_lookup_map(buyer, year_month, tenor_value, tab, _refresh=None):
               .sort_values("corridor_code", kind="stable"),
               order=["corridor_code", "horizon_name", "win_date", "price", "wins"],
               names={"corridor_code": "Corridor", "horizon_name": "Tenor",
-                     "win_date": "Win date", "price": "Auction price (settle), EUR/MW",
+                     "win_date": "Win date", "price": px_label("Auction price", show),
                      "wins": "Wins"},
               page_size=None),
         note("Auction price = the auction's clearing price, one per win, in the same "
-             "order as the win dates. " + SETTLE_NOTE),
+             "order as the win dates. " + px_note(show)),
     ]
     return head + [body]
 
@@ -2343,8 +2681,8 @@ def update_database(n_clicks, _tick, last_state, refresh):
 
 
 @_callback(Output("cal-head", "children"), Output("cal-html", "data"),
-              Input("tabs", "value"), Input("db-refresh", "data"))
-def auction_calendar(tab, _refresh):
+              Input("tabs", "value"), Input("db-refresh", "data"), Input("px-show", "value"))
+def auction_calendar(tab, _refresh, px_value=None):
     """All non-daily auctions from the 1st of this month on (Peter,
     2026-10-13: "all nondaily auctions starting with today on onwards. you
     can scroll back to earlier auctions but only for current month"). The
@@ -2354,7 +2692,8 @@ def auction_calendar(tab, _refresh):
         return no_update, no_update
     now = pd.Timestamp.now(tz="CET")
     first_day = now.normalize().replace(day=1)
-    cal = load_auction_calendar(first_day.strftime("%Y-%m-%d"))
+    show = px_show(px_value)
+    cal = load_auction_calendar(first_day.strftime("%Y-%m-%d"), show)
     if cal.empty:
         return note("No auctions in the database from this month on.", "info"), ""
     upcoming = cal[cal["closes"] >= now.normalize()]
@@ -2366,8 +2705,9 @@ def auction_calendar(tab, _refresh):
         f"grouped by when the bidding closes. Opens on today - scroll up for "
         f"earlier this month (from {first_day.day} {_MONTH_ABBR[first_day.month - 1]}). "
         f"Times CET. Daily and intraday not included. Struck-through corridors "
-        f"were cancelled by JAO.{fetched} Auction price: {SETTLE_NOTE}")
-    return head, render_calendar_html(cal, now)
+        f"were cancelled by JAO.{fetched}" + (f" Auction price {px_note(show)}"
+                                               if px_note(show) else ""))
+    return head, render_calendar_html(cal, now, show)
 
 
 CAL_PAINT_JS = """
