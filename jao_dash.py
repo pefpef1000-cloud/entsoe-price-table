@@ -546,8 +546,9 @@ def load_purchases_for_buyer(buyer_label: str) -> pd.DataFrame:
     # Auction price (EUR/MW) of each win (Peter, 2026-10-18: "add the auction
     # price of the corridor in the winning list"). Bundles / peak / not yet
     # published: see price_note.
+    # Settle in brackets next to it (Peter, 2026-10-26) - see SETTLE_NOTE.
     details = _auction_price_details(tuple(out["identification"]))
-    out["price"] = [details[i][0] for i in out["identification"]]
+    out["price"] = [with_settle(details[i][0], details[i][2]) for i in out["identification"]]
     out["price_note"] = [details[i][1] for i in out["identification"]]
     return out.drop(columns="identification")
 
@@ -753,22 +754,190 @@ def load_buyer_map_data(buyer_label: str, year_month: str, tenors: str = "All") 
     return counts.reset_index(drop=True)
 
 
+# ---------------------------------------------------------------------
+# Settle next to every auction price (Peter, 2026-10-26: "whenever auction
+# price is shown, put settlement price in parentis next to it" - "in general
+# in LTCAP tool"). Shown as "4.63 (5.12)": auction price, then in brackets
+# what that capacity settled at in the day-ahead market over the auction's
+# own delivery period. Settle = the Corridor margins tab's definition: for
+# corridor A-B (flow A -> B), the hours B was pricier than A (B minus A,
+# else 0), averaged over ALL hours of the period both zones have a price.
+# Peak products: only Mon-Fri 08:00-20:00 (CET) hours. A delivery period
+# still running: so far. Not started yet: no bracket.
+# Prices come from entsoe_data.db (the day-ahead prices); the zone mapping
+# is the one year_comparison_dash.py uses (_corridor_zones) - keep in sync.
+# ---------------------------------------------------------------------
+def _default_entsoe_db() -> Path:
+    folder = Path(__file__).resolve().parent.parent / "entsoe_scraper"
+    try:
+        if str(folder) not in sys.path:
+            sys.path.append(str(folder))  # appended: never shadows this folder's modules
+        from entsoe_db import entsoe_db_path
+        return Path(entsoe_db_path())
+    except Exception:  # noqa: BLE001 - online copy / no entsoe_scraper next to it
+        return folder / "entsoe_data.db"
+
+
+ENTSOE_DB_PATH = _default_entsoe_db()   # the LTCAP tool / online_app may replace it
+SETTLE_TOKEN_TO_ZONE = {"DE": "DE_LU", "D1": "DK_1", "D2": "DK_2", "DK": "DK_1",
+                        "N2": "NO_2", "IE": "IE_SEM", "IT": "IT_NORD"}
+SETTLE_ZONE_OVERRIDES = {"GR-IT": ("GR", "IT_SUD"), "IT-GR": ("IT_SUD", "GR"),
+                         "ME-IT": ("ME", "IT_CSUD"), "IT-ME": ("IT_CSUD", "ME")}
+SETTLE_NOTE = ("(...) = settle: what that capacity earned in the day-ahead market over "
+               "its delivery period - hours the importing side was pricier, averaged over "
+               "all hours (peak products: peak hours). Running periods: so far. Not "
+               "delivered yet: no bracket.")
+_SETTLE_EPOCH = pd.Timestamp("2019-12-31", tz="UTC").as_unit("ns").value // 3_600_000_000_000  # hours
+
+
+def settle_zones(corridor: str) -> tuple:
+    """(from, to) ENTSO-E zones of a JAO corridor code, or (None, None)."""
+    if corridor in SETTLE_ZONE_OVERRIDES:
+        return SETTLE_ZONE_OVERRIDES[corridor]
+    parts = [part.split("(")[0] for part in corridor.split("-")]
+    if len(parts) == 3:
+        parts = parts[1:]
+    if len(parts) != 2:
+        return None, None
+    return (SETTLE_TOKEN_TO_ZONE.get(parts[0], parts[0]),
+            SETTLE_TOKEN_TO_ZONE.get(parts[1], parts[1]))
+
+
+def _entsoe_stamp() -> tuple:
+    out = []
+    for path in (Path(ENTSOE_DB_PATH), Path(f"{ENTSOE_DB_PATH}-wal")):
+        try:
+            st = path.stat()
+            out.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append(None)
+    return (str(ENTSOE_DB_PATH), *out)
+
+
+def _zone_prices(zone: str) -> pd.Series:
+    """Hourly day-ahead prices of one zone (UTC index). Empty if none."""
+    conn = sqlite3.connect(Path(ENTSOE_DB_PATH).resolve().as_uri() + "?mode=ro", uri=True,
+                           timeout=30)
+    try:
+        df = pd.read_sql_query(
+            "SELECT timestamp, price_eur_mwh FROM day_ahead_prices "
+            "WHERE zone = ? AND timestamp >= '2019-12-31'", conn, params=(zone,))
+    finally:
+        conn.close()
+    if df.empty:
+        return pd.Series(dtype=float)
+    idx = pd.to_datetime(df["timestamp"], utc=True)
+    return pd.Series(df["price_eur_mwh"].to_numpy(dtype=float), index=idx).groupby(level=0).mean()
+
+
+def _settle_cache_get(key):
+    # Kept in the same _cache dict as @cached, so the online app's memory
+    # guard (which empties each app's _cache) covers these too.
+    with _cache_lock:
+        return _cache.get(key)
+
+
+def _settle_cache_put(key, value):
+    with _cache_lock:
+        if len(_cache) > 300:
+            _cache.clear()
+        _cache[key] = value
+
+
+def _zone_prices_cached(zone: str) -> pd.Series:
+    """_zone_prices(), kept until entsoe_data.db changes (a zone is in many corridors)."""
+    key = ("settle-zone", zone, _entsoe_stamp())
+    series = _settle_cache_get(key)
+    if series is None:
+        series = _zone_prices(zone)
+        _settle_cache_put(key, series)
+    return series
+
+
+def _spread_hours(corridor: str):
+    """The corridor's hourly max(P_to - P_from, 0) over the hours both zones
+    have a price, compact: (hour numbers int32, spread float32, peak-hour
+    flags). None if the corridor has no two priced zones."""
+    zone_from, zone_to = settle_zones(corridor)
+    if not zone_from or not zone_to or not Path(ENTSOE_DB_PATH).exists():
+        return None
+    key = ("settle-pair", zone_from, zone_to, _entsoe_stamp())
+    hit = _settle_cache_get(key)
+    if hit is not None:
+        return hit or None
+    try:
+        a, b = _zone_prices_cached(zone_from), _zone_prices_cached(zone_to)
+    except (sqlite3.Error, pd.errors.DatabaseError):
+        return None
+    both = pd.concat([a.rename("a"), b.rename("b")], axis=1, join="inner").dropna()
+    if both.empty:
+        result = ()
+    else:
+        local = both.index.tz_convert("CET")
+        # as_unit("ns"): pandas 3 parses to microseconds - asi8 must be ns here.
+        result = ((both.index.as_unit("ns").asi8 // 3_600_000_000_000 - _SETTLE_EPOCH)
+                  .astype(np.int32),
+                  (both["b"] - both["a"]).clip(lower=0).to_numpy(dtype=np.float32),
+                  np.asarray((local.weekday < 5) & (local.hour >= 8) & (local.hour < 20)))
+    _settle_cache_put(key, result)
+    return result or None
+
+
+def settle_for(corridor: str, start, stop, peak: bool = False):
+    """Settle (EUR/MWh) of `corridor` over [start, stop) - market_period_
+    start/stop as stored by JAO (UTC instants of local midnight). None when
+    nothing of the period has a price yet (or the corridor has no zones)."""
+    data = _spread_hours(corridor)
+    if data is None or start is None or stop is None:
+        return None
+    try:
+        t0, t1 = (pd.Timestamp(x) for x in (start, stop))
+        t0 = t0.tz_convert("UTC") if t0.tzinfo else t0.tz_localize("UTC")
+        t1 = t1.tz_convert("UTC") if t1.tzinfo else t1.tz_localize("UTC")
+    except (ValueError, TypeError):
+        return None
+    hours, spread, peak_hours = data
+    h0 = t0.as_unit("ns").value // 3_600_000_000_000 - _SETTLE_EPOCH
+    h1 = t1.as_unit("ns").value // 3_600_000_000_000 - _SETTLE_EPOCH
+    i, j = np.searchsorted(hours, [h0, h1])
+    chunk = spread[i:j]
+    if peak:
+        chunk = chunk[peak_hours[i:j]]
+    return float(chunk.astype(np.float64).mean()) if len(chunk) else None
+
+
+def with_settle(price, settle) -> str:
+    """ "4.63 (5.12)" - auction price, settle in brackets (none if unknown)."""
+    if price is None or pd.isna(price):
+        return ""
+    if settle is None or pd.isna(settle):
+        return f"{price:.2f}"
+    return f"{price:.2f} ({settle:.2f})"
+
+
 def _auction_price_details(identifications) -> dict:
-    """{auction: (price, note)} from auction_results (EUR/MW). price is None
-    when there is no single price: no result published yet (note "no result
-    yet"), or a bundled CEEXD auction, which has one price per border (note
-    lists the borders that got capacity, "CZ-DE(50Hz) 1.38 · DE(50Hz)-CZ
-    5.15"). A peak auction gets the note "peak"."""
+    """{auction: (price, note, settle)} from auction_results (EUR/MW) and the
+    day-ahead prices (settle, see SETTLE_NOTE). price is None when there is
+    no single price: no result published yet (note "no result yet"), or a
+    bundled CEEXD auction, which has one price per border (note lists the
+    borders that got capacity, with their settle: "CZ-DE(50Hz) 1.38 (0.90)
+    · DE(50Hz)-CZ 5.15 (6.02)"). A peak auction gets the note "peak" and a
+    peak-hours settle."""
     ids = list(dict.fromkeys(identifications))
-    rows = []
+    rows, periods = [], {}
     conn = _connect()
     try:
         for i in range(0, len(ids), 900):  # SQLite's limit on "?" per query
             chunk = ids[i:i + 900]
+            marks = ",".join("?" * len(chunk))
             rows += conn.execute(
                 "SELECT identification, corridor_code, product_identification, "
                 "allocated_capacity, auction_price FROM auction_results "
-                f"WHERE identification IN ({','.join('?' * len(chunk))})", chunk).fetchall()
+                f"WHERE identification IN ({marks})", chunk).fetchall()
+            for ident, corridor, start, stop in conn.execute(
+                    "SELECT identification, corridor_code, market_period_start, market_period_stop "
+                    f"FROM auctions WHERE identification IN ({marks})", chunk):
+                periods[ident] = (corridor, start, stop)
     finally:
         conn.close()
     by_auction: dict = {}
@@ -777,36 +946,41 @@ def _auction_price_details(identifications) -> dict:
     out = {}
     for ident in ids:
         results = by_auction.get(ident)
+        corridor, start, stop = periods.get(ident, (None, None, None))
         if not results:
-            out[ident] = (None, "no result yet")
+            out[ident] = (None, "no result yet", None)
             continue
-        notes = []
+        peak = any("PEAK" in r[1].upper() for r in results)
+        notes, settle = [], None
         if len(results) == 1:
             price = results[0][3]
             if price is None:
                 notes.append("no result yet")
+            elif corridor:
+                settle = settle_for(corridor, start, stop, peak)
         else:
             price = None
-            parts = [f"{display_code(c)} {p:.2f}" for c, _, a, p in results
-                     if p is not None and (a or 0) > 0]
+            parts = [f"{display_code(c)} {with_settle(p, settle_for(c, start, stop, peak))}"
+                     for c, _, a, p in results if p is not None and (a or 0) > 0]
             notes.append(" · ".join(parts) if parts else "all borders 0.00")
-        if any("PEAK" in r[1].upper() for r in results):
+        if peak:
             notes.append("peak")
-        out[ident] = (price, ", ".join(notes))
+        out[ident] = (price, ", ".join(notes), settle)
     return out
 
 
 def _auction_price_texts(identifications: tuple) -> dict:
-    """{auction: its price as text} for the Buyer lookup map table: "12.34",
-    "12.34 (peak)", the CEEXD border list, or "-" (no result yet)."""
+    """{auction: its price as text} for the Buyer lookup map table:
+    "12.34 (10.50)" (settle in brackets), "12.34 (10.50) peak", the CEEXD
+    border list, or "-" (no result yet)."""
     out = {}
-    for ident, (price, note) in _auction_price_details(identifications).items():
+    for ident, (price, note, settle) in _auction_price_details(identifications).items():
         if price is not None:
-            out[ident] = f"{price:.2f}" + (" (peak)" if note == "peak" else "")
+            out[ident] = with_settle(price, settle) + (" peak" if note == "peak" else "")
         elif note == "no result yet":
             out[ident] = "-"
         else:
-            out[ident] = note.replace(", peak", " (peak)")
+            out[ident] = note.replace(", peak", " peak")
     return out
 
 
@@ -916,7 +1090,7 @@ def load_auction_calendar(first_day: str) -> pd.DataFrame:
         conn, params=params + (since.strftime("%Y-%m-%dT%H:%M"),))
     conn.close()
     cols = ["closes", "opens", "horizon_name", "delivery", "corridors", "cancelled",
-            "prices", "price_notes"]
+            "prices", "price_notes", "settles"]
     if df.empty:
         return pd.DataFrame(columns=cols)
     df["closes"] = pd.to_datetime(df["bid_gate_closure"], utc=True).dt.tz_convert("CET")
@@ -931,10 +1105,12 @@ def load_auction_calendar(first_day: str) -> pd.DataFrame:
     details = _auction_price_details(tuple(df["identification"]))
     df["price"] = [details[i][0] for i in df["identification"]]
     df["price_note"] = [details[i][1] for i in df["identification"]]
+    df["settle"] = [details[i][2] for i in df["identification"]]
     out = (df.groupby(["closes", "opens", "horizon_name", "delivery", "dstart"], dropna=False)
              .agg(corridors=("corridor_code", list),
                   cancelled=("cancel_code", lambda s: [c for c in s if isinstance(c, str)]),
-                  prices=("price", list), price_notes=("price_note", list))
+                  prices=("price", list), price_notes=("price_note", list),
+                  settles=("settle", list))
              .reset_index())
     rank = {t: i for i, t in enumerate(TENOR_ORDER)}
     out["_t"] = out["horizon_name"].map(rank).fillna(len(rank))
@@ -1120,6 +1296,8 @@ def load_series(corridor: str, horizon: str, product: str) -> pd.DataFrame:
         """
         SELECT
             a.market_period_start,
+            a.market_period_start AS raw_start,
+            a.market_period_stop AS raw_stop,
             a.cancelled,
             r.product_hour,
             r.offered_capacity,
@@ -1220,8 +1398,12 @@ def pivot_table(pivot: pd.DataFrame, decimals: int):
         first = "month"
     df.columns = ids
     df = df.reset_index().rename(columns={df.index.name or "index": "month"})
+    text_cols = {i for i in ids if df[i].dtype == object}   # e.g. "4.63 (5.12)"
+    for i in text_cols:
+        df[i] = df[i].fillna("-").replace("", "-")
     columns = [{"name": first, "id": "month", "type": "text"}] + [
-        {"name": h, "id": i, "type": "numeric", "format": fixed(decimals, "-")}
+        ({"name": h, "id": i, "type": "text"} if i in text_cols else
+         {"name": h, "id": i, "type": "numeric", "format": fixed(decimals, "-")})
         for h, i in zip(heads, ids)]
     return html.Div(style={"display": "inline-block", "maxWidth": "100%"}, children=dash_table.DataTable(
         data=df.to_dict("records"), columns=columns, merge_duplicate_headers=multi,
@@ -1250,12 +1432,14 @@ def _calendar_price_cell(r, now: pd.Timestamp) -> str:
         return ""
     esc = html_escape
     parts = []
-    for code, price, note in zip(r.corridors, r.prices, r.price_notes):
+    for code, price, note, settle in zip(r.corridors, r.prices, r.price_notes, r.settles):
         if code in r.cancelled:
             continue
         peak = " peak" if "peak" in (note or "") else ""
         if price is not None and not pd.isna(price):
-            parts.append(f'<span class="code pc">{esc(code)}</span> {price:.2f}{peak}')
+            # Settle in brackets once delivery has started (Peter, 2026-10-26).
+            parts.append(f'<span class="code pc">{esc(code)}</span> '
+                         f'{esc(with_settle(price, settle))}{peak}')
         elif note and not note.startswith("no result"):
             parts.append(f'<span class="code pc">{esc(code)}</span> {esc(note)}')
     if parts:
@@ -1276,7 +1460,7 @@ def render_calendar_html(cal: pd.DataFrame, now: pd.Timestamp) -> str:
     today = now.normalize()
     out = ['<table class="cal"><thead><tr><th>Closes</th><th>Opens</th><th>Tenor</th>'
            '<th>Delivery</th><th>Corridors</th><th>Status</th>'
-           '<th>Auction price (EUR/MW)</th></tr></thead><tbody>']
+           '<th>Auction price (settle), EUR/MW</th></tr></thead><tbody>']
     anchored = False
     for day, rows in cal.groupby(cal["closes"].dt.normalize(), sort=True):
         cls = ["day"]
@@ -1758,11 +1942,39 @@ def corridor_explorer(corridor, horizon, product, tab):
         else pd.DataFrame()
     )
 
+    # Settle next to every auction price (Peter, 2026-10-26) - see SETTLE_NOTE.
+    peak = "PEAK" in str(product).upper()
+
+    def add_settle(frame, code):
+        if frame.empty:
+            return frame
+        frame = frame.copy()
+        frame["settle"] = np.array(
+            [np.nan if v is None else v for v in
+             (settle_for(code, a, b, peak) for a, b in zip(frame["raw_start"], frame["raw_stop"]))],
+            dtype=float)
+        frame["price_text"] = [with_settle(p, st) for p, st in
+                               zip(frame["auction_price"], frame["settle"])]
+        return frame
+
+    df = add_settle(df, corridor)
+    opp_df = add_settle(opp_df, opposite) if opposite else opp_df
+
+    def price_pivot(frame):
+        prices = render_monthly_pivot(frame, "auction_price")
+        settles = render_monthly_pivot(frame, "settle")
+        out = prices.copy().astype(object)
+        for r in prices.index:
+            for c in prices.columns:
+                out.at[r, c] = with_settle(prices.at[r, c], settles.at[r, c]) or "-"
+        return out
+
     body = []
     latest = df.iloc[-1]
     if opp_df.empty:
         body.append(html.Div([
-            kpi(f"{corridor} latest price (EUR/MW)", num(latest["auction_price"], 2)),
+            kpi(f"{corridor} latest price (settle), EUR/MW",
+                with_settle(latest["auction_price"], latest["settle"]) or "-"),
             kpi(f"{corridor} latest allocated (MW)", num(latest["allocated_capacity"], 0)),
             kpi("Auctions shown", str(len(df))),
         ], className="kpis"))
@@ -1772,43 +1984,48 @@ def corridor_explorer(corridor, horizon, product, tab):
     else:
         opp_latest = opp_df.iloc[-1]
         body.append(html.Div([
-            kpi(f"{corridor} latest price (EUR/MW)", num(latest["auction_price"], 2)),
-            kpi(f"{opposite} latest price (EUR/MW)", num(opp_latest["auction_price"], 2)),
+            kpi(f"{corridor} latest price (settle), EUR/MW",
+                with_settle(latest["auction_price"], latest["settle"]) or "-"),
+            kpi(f"{opposite} latest price (settle), EUR/MW",
+                with_settle(opp_latest["auction_price"], opp_latest["settle"]) or "-"),
             kpi(f"{corridor} latest allocated (MW)", num(latest["allocated_capacity"], 0)),
             kpi(f"{opposite} latest allocated (MW)", num(opp_latest["allocated_capacity"], 0)),
         ], className="kpis"))
 
     if horizon == "Monthly":
-        for title, col, dec in (("Price by month/year (EUR/MW)", "auction_price", 2),
+        for title, col, dec in (("Price (settle) by month/year (EUR/MW)", "auction_price", 2),
                                 ("Allocated volume by month/year (MW)", "allocated_capacity", 0)):
             body.append(html.H3(title))
+            make = price_pivot if col == "auction_price" else \
+                (lambda frame, c=col: render_monthly_pivot(frame, c))
             if opp_df.empty:
-                body.append(pivot_table(render_monthly_pivot(df, col), dec))
+                body.append(pivot_table(make(df), dec))
             else:
                 body.append(html.Div([
-                    html.Div([note(corridor), pivot_table(render_monthly_pivot(df, col), dec)]),
-                    html.Div([note(opposite), pivot_table(render_monthly_pivot(opp_df, col), dec)]),
+                    html.Div([note(corridor), pivot_table(make(df), dec)]),
+                    html.Div([note(opposite), pivot_table(make(opp_df), dec)]),
                 ], className="pair"))
 
     body.append(html.H3("All auctions"))
     if opp_df.empty:
         body.append(table(
             df, order=["period", "product_hour", "offered_capacity", "requested_capacity",
-                       "allocated_capacity", "auction_price", "cancelled"],
+                       "allocated_capacity", "price_text", "cancelled"],
             names={"period": "Period", "product_hour": "Product hour",
                    "offered_capacity": "Offered (MW)", "requested_capacity": "Requested (MW)",
-                   "allocated_capacity": "Allocated (MW)", "auction_price": "Price (EUR/MW)",
-                   "cancelled": "Cancelled"},
+                   "allocated_capacity": "Allocated (MW)",
+                   "price_text": "Price (settle), EUR/MW", "cancelled": "Cancelled"},
             formats={"offered_capacity": 2, "requested_capacity": 2,
-                     "allocated_capacity": 2, "auction_price": 2}))
+                     "allocated_capacity": 2}))
+        body.append(note(SETTLE_NOTE))
         return out + [body]
 
     # Both directions, paired metric by metric. Outer join on
     # period+product_hour so a period only one direction auctioned still
     # shows up (blank on the other side).
     merged = pd.merge(
-        df[["period", "product_hour", "offered_capacity", "allocated_capacity", "auction_price"]],
-        opp_df[["period", "product_hour", "offered_capacity", "allocated_capacity", "auction_price"]],
+        df[["period", "product_hour", "offered_capacity", "allocated_capacity", "price_text"]],
+        opp_df[["period", "product_hour", "offered_capacity", "allocated_capacity", "price_text"]],
         on=["period", "product_hour"],
         how="outer",
         suffixes=("_a", "_b"),
@@ -1818,18 +2035,20 @@ def corridor_explorer(corridor, horizon, product, tab):
                      "side by side."))
     body.append(table(
         merged,
-        order=["period", "product_hour", "auction_price_a", "auction_price_b",
+        order=["period", "product_hour", "price_text_a", "price_text_b",
                "allocated_capacity_a", "allocated_capacity_b",
                "offered_capacity_a", "offered_capacity_b"],
         names={"period": "Period", "product_hour": "Product hour",
-               "auction_price_a": f"Price {corridor}", "auction_price_b": f"Price {opposite}",
+               "price_text_a": f"Price (settle) {corridor}",
+               "price_text_b": f"Price (settle) {opposite}",
                "allocated_capacity_a": f"Allocated {corridor}",
                "allocated_capacity_b": f"Allocated {opposite}",
                "offered_capacity_a": f"Offered {corridor}",
                "offered_capacity_b": f"Offered {opposite}"},
-        formats={c: 2 for c in ("auction_price_a", "auction_price_b", "allocated_capacity_a",
+        formats={c: 2 for c in ("allocated_capacity_a",
                                 "allocated_capacity_b", "offered_capacity_a",
                                 "offered_capacity_b")}))
+    body.append(note(SETTLE_NOTE))
     return out + [body]
 
 
@@ -1920,13 +2139,13 @@ def buyer_lookup(buyer, tab):
     body.append(table(
         purchases, order=order,
         names={"horizon_name": "Horizon", "period": "Period", "corridor_code": "Corridor",
-               "price": "Auction price (EUR/MW)", "price_note": "Price note",
+               "price": "Auction price (settle), EUR/MW", "price_note": "Price note",
                "auction_closed": "Auction closed (UTC)"},
-        formats={"price": 2},
         tooltips={"auction_closed": "When bidding actually closed and the auction cleared - "
                                     "not the delivery period.",
-                  "price": "The auction's clearing price. A bundled CEEXD auction has one "
-                           "price per border - see Price note."}))
+                  "price": "The auction's clearing price, settle in brackets. A bundled "
+                           "CEEXD auction has one price per border - see Price note."}))
+    body.append(note(SETTLE_NOTE))
     return buyers, buyer, body
 
 
@@ -2024,11 +2243,11 @@ def buyer_lookup_map(buyer, year_month, tenor_value, tab, _refresh=None):
               .sort_values("corridor_code", kind="stable"),
               order=["corridor_code", "horizon_name", "win_date", "price", "wins"],
               names={"corridor_code": "Corridor", "horizon_name": "Tenor",
-                     "win_date": "Win date", "price": "Auction price (EUR/MW)",
+                     "win_date": "Win date", "price": "Auction price (settle), EUR/MW",
                      "wins": "Wins"},
               page_size=None),
         note("Auction price = the auction's clearing price, one per win, in the same "
-             "order as the win dates."),
+             "order as the win dates. " + SETTLE_NOTE),
     ]
     return head + [body]
 
@@ -2147,7 +2366,7 @@ def auction_calendar(tab, _refresh):
         f"grouped by when the bidding closes. Opens on today - scroll up for "
         f"earlier this month (from {first_day.day} {_MONTH_ABBR[first_day.month - 1]}). "
         f"Times CET. Daily and intraday not included. Struck-through corridors "
-        f"were cancelled by JAO.{fetched}")
+        f"were cancelled by JAO.{fetched} Auction price: {SETTLE_NOTE}")
     return head, render_calendar_html(cal, now)
 
 

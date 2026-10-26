@@ -226,6 +226,8 @@ def _load_jao_tabs():
 
 
 jd = _load_jao_tabs()
+if jd is not None:
+    jd.ENTSOE_DB_PATH = DB_PATH   # settle next to JAO auction prices (see jao_dash.SETTLE_NOTE)
 
 # A handful of this project's ENTSO-E zone codes don't match JAO's own
 # corridor-code country tokens directly -- confirmed against JAO's real
@@ -1650,14 +1652,29 @@ def _sign_backgrounds(values: np.ndarray, bound: float) -> np.ndarray:
     return out
 
 
-def pivot_model(pivot: pd.DataFrame, resolution: str, spread: bool = False, fmt: str = "%.2f") -> dict:
+def pivot_model(pivot: pd.DataFrame, resolution: str, spread: bool = False, fmt: str = "%.2f",
+                paren: pd.DataFrame | None = None) -> dict:
     """The model of one period x year table (tabs 1 and 2): Q1-Q4 / Year
     rows for Monthly, fixed column widths, heatmap colours, and a height
-    cap so a long Daily table scrolls inside its own box."""
+    cap so a long Daily table scrolls inside its own box. `paren` (same
+    shape, e.g. the settle next to a JAO auction price) is shown in
+    brackets after each value: "4.63 (5.12)". Colours stay on the value."""
     if resolution == "Monthly" and not pivot.empty:
         pivot = _append_quarter_year_rows(pivot)
+        if paren is not None and not paren.empty:
+            paren = _append_quarter_year_rows(paren)
     values = pivot.to_numpy(dtype=float)
-    shown = [fmt % v for v in values.ravel() if np.isfinite(v)]
+    extra = (paren.reindex(index=pivot.index, columns=pivot.columns).to_numpy(dtype=float)
+             if paren is not None and not paren.empty else np.full(values.shape, np.nan))
+
+    def text(r, c):
+        if not np.isfinite(values[r, c]):
+            return ""
+        main = fmt % values[r, c]
+        return f"{main} ({fmt % extra[r, c]})" if np.isfinite(extra[r, c]) else main
+
+    shown = [text(r, c) for r in range(values.shape[0]) for c in range(values.shape[1])
+             if np.isfinite(values[r, c])]
     columns = [str(c) for c in pivot.columns]
     if spread:
         backgrounds = _sign_backgrounds(values, _heatmap_sign_bound(pivot))
@@ -1666,8 +1683,7 @@ def pivot_model(pivot: pd.DataFrame, resolution: str, spread: bool = False, fmt:
     rows = []
     for r, label in enumerate(pivot.index):
         cells = [
-            {"text": fmt % values[r, c] if np.isfinite(values[r, c]) else "",
-             "bg": backgrounds[r, c], "css": {}}
+            {"text": text(r, c), "bg": backgrounds[r, c], "css": {}}
             for c in range(values.shape[1])
         ]
         # Monthly: a fat line under December and under Q4.
@@ -1723,15 +1739,18 @@ def hours_below_view(zone, resolution, threshold, label=None):
     return title, pivot_model(pivot, resolution, fmt="%d"), None
 
 
-def jao_corridor_view(corridor, label):
-    """JAO Monthly auction price for one direction. Always Monthly."""
-    title = f"{label}  —  JAO auction price, EUR/MW"
+def jao_corridor_view(corridor, label, settle_pivot=None):
+    """JAO Monthly auction price for one direction. Always Monthly. The
+    settle (that direction's capture value, the same months) in brackets
+    next to each price (Peter, 2026-10-26: "whenever auction price is
+    shown, put settlement price in parentis next to it")."""
+    title = f"{label}  —  JAO auction price (settle), EUR/MW"
     if corridor is None:
         return title, None, "No matching JAO corridor for this pair/direction."
     pivot = load_jao_monthly_price(corridor)
     if pivot.empty:
         return title, None, f"No Monthly JAO auctions saved for {corridor} yet."
-    return title, pivot_model(pivot, "Monthly"), None
+    return title, pivot_model(pivot, "Monthly", paren=settle_pivot), None
 
 
 def margin_view(capture_pivot, corridor, label):
@@ -1762,8 +1781,8 @@ def year_comparison_views(country_1: str, country_2: str, resolution: str) -> li
     row_2 = [
         capture_view(zone_1, zone_2, resolution, positive=True, label1=country_1, label2=country_2),
         capture_view(zone_1, zone_2, resolution, positive=False, label1=country_1, label2=country_2),
-        jao_corridor_view(corridor_2_1, label_2_1),
-        jao_corridor_view(corridor_1_2, label_1_2),
+        jao_corridor_view(corridor_2_1, label_2_1, capture_positive),
+        jao_corridor_view(corridor_1_2, label_1_2, capture_negative),
     ]
     row_3 = [
         country_view(zone_1, resolution, peak=True, label=country_1),
@@ -1778,6 +1797,7 @@ def corridor_table_model(
     table: pd.DataFrame, view: str, fmt: str = "{:.2f}",
     no_auction: pd.DataFrame | None = None,
     held: list | None = None, bold_held: bool = False,
+    paren: pd.DataFrame | None = None,
 ) -> dict:
     """Corridors down, Jan..Dec + Year across, with a "Sum" row on top
     (and for Margin a "Positive" row: how many corridors are above 0).
@@ -1786,6 +1806,15 @@ def corridor_table_model(
     `held` = (corridor, month) cells that get a fat black frame."""
     total = table.sum(axis=0, min_count=1).round(2)
     summary = [(CORRIDOR_SUM_LABEL, total)]
+    # Settle in brackets after each Auction price (Peter, 2026-10-26).
+    if paren is not None:
+        paren = paren.reindex(index=table.index, columns=table.columns).astype(float)
+        paren_total = paren.sum(axis=0, min_count=1).round(2)
+
+    def with_paren(text, value):
+        if paren is None or value is None or not np.isfinite(value):
+            return text
+        return f"{text} ({fmt.format(value)})"
     positive_text: dict[str, str] = {}
     if view == "Margin":
         n_positive = (table > 0).sum(axis=0)
@@ -1833,6 +1862,8 @@ def corridor_table_model(
                 text = positive_text[col]
             else:
                 text = fmt.format(value) if np.isfinite(value) else ""
+                if text and paren is not None:
+                    text = with_paren(text, paren_total[col])
             css = {"fontWeight": "bold"}
             if last:
                 css["borderBottom"] = "3px solid #000000"
@@ -1848,6 +1879,8 @@ def corridor_table_model(
             css = {}
             if np.isfinite(value):
                 text = fmt.format(value)
+                if paren is not None:
+                    text = with_paren(text, paren.iat[r, c])
                 shown.append(text)
             else:
                 text = CORRIDOR_NO_AUCTION_TEXT if (corridor, col) in grey_cells else ""
@@ -1938,6 +1971,15 @@ def corridor_margins_view(
     table.columns = CORRIDOR_MONTH_LABELS
     # Plain average of the months shown -- for Margin only months with BOTH numbers.
     table["Year"] = table.mean(axis=1, skipna=True).round(2)
+    # Auction price view: the Settle of the same cell in brackets (Peter,
+    # 2026-10-26: "whenever auction price is shown, put settlement price in
+    # parentis next to it"). Only where there is an auction price.
+    paren = None
+    if view == "Auction price":
+        paren = settle.copy()
+        paren.columns = CORRIDOR_MONTH_LABELS
+        paren = paren.where(table[CORRIDOR_MONTH_LABELS].notna())
+        paren["Year"] = paren.mean(axis=1, skipna=True).round(2)
 
     held = None
     if winner:
@@ -1952,6 +1994,10 @@ def corridor_margins_view(
         table[CORRIDOR_MONTH_LABELS] = table[CORRIDOR_MONTH_LABELS].where(held_cells)
         no_auction = None
         table["Year"] = table[CORRIDOR_MONTH_LABELS].mean(axis=1, skipna=True).round(2)
+        if paren is not None:
+            paren = paren.reindex(table.index)
+            paren[CORRIDOR_MONTH_LABELS] = paren[CORRIDOR_MONTH_LABELS].where(held_cells)
+            paren["Year"] = paren[CORRIDOR_MONTH_LABELS].mean(axis=1, skipna=True).round(2)
         if table.empty:
             result["message"] = f"{winner} holds no {tenor} capacity in {year}."
             return result
@@ -1971,7 +2017,7 @@ def corridor_margins_view(
         result["caption"] = f"{winner}: {tenor} capacity on {corridors_held} corridor(s) in {year} -- {how}"
         result["stats"] = winner_stats(_corridor_winner_stats(settle, auction, held))
     result["model"] = corridor_table_model(
-        table, view, no_auction=no_auction, held=held, bold_held=winner_show_all
+        table, view, no_auction=no_auction, held=held, bold_held=winner_show_all, paren=paren
     )
     return result
 
@@ -2146,7 +2192,8 @@ CM_CAPTION = (
     "months). Settle = what the corridor's direction settled at "
     "day-ahead (hours the importing side was pricier, averaged over all "
     "hours of the month). Margin = Settle minus Auction price. The "
-    "current month's Settle is month-to-date. Pick a Winner to put a "
+    "current month's Settle is month-to-date. Auction price view: the "
+    "Settle of the same cell in brackets, \"4.63 (5.12)\". Pick a Winner to put a "
     "fat line around every corridor/month where they won capacity of "
     "that tenor."
 )
@@ -2692,6 +2739,8 @@ def main():
 
     if args.db:
         DB_PATH = find_db(args.db)
+        if jd is not None:
+            jd.ENTSOE_DB_PATH = DB_PATH
     if args.jao_db:
         JAO_DB_FILE = Path(args.jao_db).expanduser().resolve()
         if jd is not None:
