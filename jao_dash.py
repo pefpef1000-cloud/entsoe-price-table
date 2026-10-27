@@ -546,10 +546,10 @@ def load_purchases_for_buyer(buyer_label: str, show: str = "fut") -> pd.DataFram
     # Auction price (EUR/MW) of each win (Peter, 2026-10-18: "add the auction
     # price of the corridor in the winning list"). Bundles / peak / not yet
     # published: see price_note.
-    # In brackets: futures spread and/or settle, as the tick box says
-    # (Peter, 2026-10-26) - see FUT_NOTE / SETTLE_NOTE.
+    # In brackets: the futures spread, when the tick box is on (Peter,
+    # 2026-10-26/27) - see FUT_NOTE.
     details = _auction_price_details(tuple(out["identification"]), show)
-    out["price"] = [px_text(details[i][0], show, details[i][3], details[i][2])
+    out["price"] = [px_text(details[i][0], show, details[i][2])
                     for i in out["identification"]]
     out["price_note"] = [details[i][1] for i in out["identification"]]
     return out.drop(columns="identification")
@@ -758,164 +758,42 @@ def load_buyer_map_data(buyer_label: str, year_month: str, tenors: str = "All",
 
 
 # ---------------------------------------------------------------------
-# Settle next to every auction price (Peter, 2026-10-26: "whenever auction
-# price is shown, put settlement price in parentis next to it" - "in general
-# in LTCAP tool"). Shown as "4.63 (5.12)": auction price, then in brackets
-# what that capacity settled at in the day-ahead market over the auction's
-# own delivery period. Settle = the Corridor margins tab's definition: for
-# corridor A-B (flow A -> B), the hours B was pricier than A (B minus A,
-# else 0), averaged over ALL hours of the period both zones have a price.
-# Peak products: only Mon-Fri 08:00-20:00 (CET) hours. A delivery period
-# still running: so far. Not started yet: no bracket.
-# Prices come from entsoe_data.db (the day-ahead prices); the zone mapping
-# is the one year_comparison_dash.py uses (_corridor_zones) - keep in sync.
+# JAO corridor -> its two ENTSO-E zones (same mapping as
+# year_comparison_dash.py _corridor_zones - keep in sync); the futures
+# spread below maps them on to EEX markets. (A day-ahead "settle" in
+# brackets was added 2026-10-26 and taken out again 2026-10-27 - Peter:
+# "delete the settle part again. only future spread settlement is relevant".)
 # ---------------------------------------------------------------------
-def _default_entsoe_db() -> Path:
-    folder = Path(__file__).resolve().parent.parent / "entsoe_scraper"
-    try:
-        if str(folder) not in sys.path:
-            sys.path.append(str(folder))  # appended: never shadows this folder's modules
-        from entsoe_db import entsoe_db_path
-        return Path(entsoe_db_path())
-    except Exception:  # noqa: BLE001 - online copy / no entsoe_scraper next to it
-        return folder / "entsoe_data.db"
+ZONE_TOKEN = {"DE": "DE_LU", "D1": "DK_1", "D2": "DK_2", "DK": "DK_1",
+              "N2": "NO_2", "IE": "IE_SEM", "IT": "IT_NORD"}
+ZONE_OVERRIDES = {"GR-IT": ("GR", "IT_SUD"), "IT-GR": ("IT_SUD", "GR"),
+                  "ME-IT": ("ME", "IT_CSUD"), "IT-ME": ("IT_CSUD", "ME")}
 
 
-ENTSOE_DB_PATH = _default_entsoe_db()   # the LTCAP tool / online_app may replace it
-SETTLE_TOKEN_TO_ZONE = {"DE": "DE_LU", "D1": "DK_1", "D2": "DK_2", "DK": "DK_1",
-                        "N2": "NO_2", "IE": "IE_SEM", "IT": "IT_NORD"}
-SETTLE_ZONE_OVERRIDES = {"GR-IT": ("GR", "IT_SUD"), "IT-GR": ("IT_SUD", "GR"),
-                         "ME-IT": ("ME", "IT_CSUD"), "IT-ME": ("IT_CSUD", "ME")}
-SETTLE_NOTE = ("(...) = settle: what that capacity earned in the day-ahead market over "
-               "its delivery period - hours the importing side was pricier, averaged over "
-               "all hours (peak products: peak hours). Running periods: so far. Not "
-               "delivered yet: no bracket.")
-_SETTLE_EPOCH = pd.Timestamp("2019-12-31", tz="UTC").as_unit("ns").value // 3_600_000_000_000  # hours
-
-
-def settle_zones(corridor: str) -> tuple:
+def corridor_zones(corridor: str) -> tuple:
     """(from, to) ENTSO-E zones of a JAO corridor code, or (None, None)."""
-    if corridor in SETTLE_ZONE_OVERRIDES:
-        return SETTLE_ZONE_OVERRIDES[corridor]
+    if corridor in ZONE_OVERRIDES:
+        return ZONE_OVERRIDES[corridor]
     parts = [part.split("(")[0] for part in corridor.split("-")]
     if len(parts) == 3:
         parts = parts[1:]
     if len(parts) != 2:
         return None, None
-    return (SETTLE_TOKEN_TO_ZONE.get(parts[0], parts[0]),
-            SETTLE_TOKEN_TO_ZONE.get(parts[1], parts[1]))
+    return ZONE_TOKEN.get(parts[0], parts[0]), ZONE_TOKEN.get(parts[1], parts[1])
 
 
-def _entsoe_stamp() -> tuple:
-    out = []
-    for path in (Path(ENTSOE_DB_PATH), Path(f"{ENTSOE_DB_PATH}-wal")):
-        try:
-            st = path.stat()
-            out.append((st.st_mtime_ns, st.st_size))
-        except OSError:
-            out.append(None)
-    return (str(ENTSOE_DB_PATH), *out)
-
-
-def _zone_prices(zone: str) -> pd.Series:
-    """Hourly day-ahead prices of one zone (UTC index). Empty if none."""
-    conn = sqlite3.connect(Path(ENTSOE_DB_PATH).resolve().as_uri() + "?mode=ro", uri=True,
-                           timeout=30)
-    try:
-        df = pd.read_sql_query(
-            "SELECT timestamp, price_eur_mwh FROM day_ahead_prices "
-            "WHERE zone = ? AND timestamp >= '2019-12-31'", conn, params=(zone,))
-    finally:
-        conn.close()
-    if df.empty:
-        return pd.Series(dtype=float)
-    idx = pd.to_datetime(df["timestamp"], utc=True)
-    return pd.Series(df["price_eur_mwh"].to_numpy(dtype=float), index=idx).groupby(level=0).mean()
-
-
-def _settle_cache_get(key):
+def _cache_get(key):
     # Kept in the same _cache dict as @cached, so the online app's memory
     # guard (which empties each app's _cache) covers these too.
     with _cache_lock:
         return _cache.get(key)
 
 
-def _settle_cache_put(key, value):
+def _cache_put(key, value):
     with _cache_lock:
         if len(_cache) > 300:
             _cache.clear()
         _cache[key] = value
-
-
-def _zone_prices_cached(zone: str) -> pd.Series:
-    """_zone_prices(), kept until entsoe_data.db changes (a zone is in many corridors)."""
-    key = ("settle-zone", zone, _entsoe_stamp())
-    series = _settle_cache_get(key)
-    if series is None:
-        series = _zone_prices(zone)
-        _settle_cache_put(key, series)
-    return series
-
-
-def _spread_hours(corridor: str):
-    """The corridor's hourly max(P_to - P_from, 0) over the hours both zones
-    have a price, compact: (hour numbers int32, spread float32, peak-hour
-    flags). None if the corridor has no two priced zones."""
-    zone_from, zone_to = settle_zones(corridor)
-    if not zone_from or not zone_to or not Path(ENTSOE_DB_PATH).exists():
-        return None
-    key = ("settle-pair", zone_from, zone_to, _entsoe_stamp())
-    hit = _settle_cache_get(key)
-    if hit is not None:
-        return hit or None
-    try:
-        a, b = _zone_prices_cached(zone_from), _zone_prices_cached(zone_to)
-    except (sqlite3.Error, pd.errors.DatabaseError):
-        return None
-    both = pd.concat([a.rename("a"), b.rename("b")], axis=1, join="inner").dropna()
-    if both.empty:
-        result = ()
-    else:
-        local = both.index.tz_convert("CET")
-        # as_unit("ns"): pandas 3 parses to microseconds - asi8 must be ns here.
-        result = ((both.index.as_unit("ns").asi8 // 3_600_000_000_000 - _SETTLE_EPOCH)
-                  .astype(np.int32),
-                  (both["b"] - both["a"]).clip(lower=0).to_numpy(dtype=np.float32),
-                  np.asarray((local.weekday < 5) & (local.hour >= 8) & (local.hour < 20)))
-    _settle_cache_put(key, result)
-    return result or None
-
-
-def settle_for(corridor: str, start, stop, peak: bool = False):
-    """Settle (EUR/MWh) of `corridor` over [start, stop) - market_period_
-    start/stop as stored by JAO (UTC instants of local midnight). None when
-    nothing of the period has a price yet (or the corridor has no zones)."""
-    data = _spread_hours(corridor)
-    if data is None or start is None or stop is None:
-        return None
-    try:
-        t0, t1 = (pd.Timestamp(x) for x in (start, stop))
-        t0 = t0.tz_convert("UTC") if t0.tzinfo else t0.tz_localize("UTC")
-        t1 = t1.tz_convert("UTC") if t1.tzinfo else t1.tz_localize("UTC")
-    except (ValueError, TypeError):
-        return None
-    hours, spread, peak_hours = data
-    h0 = t0.as_unit("ns").value // 3_600_000_000_000 - _SETTLE_EPOCH
-    h1 = t1.as_unit("ns").value // 3_600_000_000_000 - _SETTLE_EPOCH
-    i, j = np.searchsorted(hours, [h0, h1])
-    chunk = spread[i:j]
-    if peak:
-        chunk = chunk[peak_hours[i:j]]
-    return float(chunk.astype(np.float64).mean()) if len(chunk) else None
-
-
-def with_settle(price, settle) -> str:
-    """ "4.63 (5.12)" - auction price, settle in brackets (none if unknown)."""
-    if price is None or pd.isna(price):
-        return ""
-    if settle is None or pd.isna(settle):
-        return f"{price:.2f}"
-    return f"{price:.2f} ({settle:.2f})"
 
 
 # ---------------------------------------------------------------------
@@ -952,7 +830,7 @@ FUT_DEMONYM = {
     "Serbian": "RS", "Greek": "GR", "Finnish": "FI", "Irish SEM": "IE",
 }
 FUT_ZONE_RE = re.compile(r"\b([A-Z]{2}\d)\b")     # "Danish DK1", "Norwegian NO2"
-# ENTSO-E zone (settle_zones()) -> EEX market.
+# ENTSO-E zone (corridor_zones()) -> EEX market.
 FUT_ZONE_TO_MARKET = {
     "DE_LU": "DE", "FR": "FR", "AT": "AT", "CH": "CH", "ES": "ES", "NL": "NL",
     "BE": "BE", "PL": "PL", "CZ": "CZ", "SK": "SK", "HU": "HU", "RO": "RO",
@@ -998,7 +876,7 @@ def _fut_data():
     if not path.exists():
         return None
     key = ("fut-data", eex_stamp())
-    hit = _settle_cache_get(key)
+    hit = _cache_get(key)
     if hit is not None:
         return hit or None
     result = ()
@@ -1031,7 +909,7 @@ def _fut_data():
         finally:
             conn.close()
     except (sqlite3.Error, pd.errors.DatabaseError):
-        _settle_cache_put(key, result)
+        _cache_put(key, result)
         return None
     both = pd.concat(frames, ignore_index=True)
     both["day"] = pd.to_datetime(both["trade_date"], errors="coerce")
@@ -1048,7 +926,7 @@ def _fut_data():
                                         g["price"].to_numpy(dtype=float),
                                         g["last"].to_numpy(dtype=bool))
     result = (codes, series)
-    _settle_cache_put(key, result)
+    _cache_put(key, result)
     return result
 
 
@@ -1097,7 +975,7 @@ def futures_spread_for(corridor: str, horizon, start, stop, gate, peak: bool = F
     product = _fut_product(horizon, start, stop)
     if product is None or gate is None or (isinstance(gate, float) and math.isnan(gate)):
         return None
-    zone_from, zone_to = settle_zones(corridor)
+    zone_from, zone_to = corridor_zones(corridor)
     m_from, m_to = FUT_ZONE_TO_MARKET.get(zone_from), FUT_ZONE_TO_MARKET.get(zone_to)
     if not m_from or not m_to or m_from == m_to:
         return None
@@ -1118,10 +996,9 @@ def futures_spread_for(corridor: str, horizon, start, stop, gate, peak: bool = F
     return round(b[0] - a[0], 2), a[1] or b[1]
 
 
-# ---- the tick box: what goes in brackets after an auction price ---------
-PX_FUT, PX_SETTLE = "fut", "settle"
-PX_OPTIONS = [{"label": "Futures spread", "value": PX_FUT},
-              {"label": "Settle", "value": PX_SETTLE}]
+# ---- the tick box: futures spread in brackets after an auction price, on / off
+PX_FUT = "fut"
+PX_OPTIONS = [{"label": "Futures spread", "value": PX_FUT}]
 PX_DEFAULT = [PX_FUT]                     # Peter: "default is spread future contracts"
 PX_TABS = {"corridor", "lookup", "bmap", "cal", "yc", "cm"}   # tabs that show auction prices
 FUT_NOTE = ("futures spread: EEX futures price of the importing country minus the exporting "
@@ -1132,46 +1009,28 @@ FUT_NOTE = ("futures spread: EEX futures price of the importing country minus th
 
 
 def px_show(value) -> str:
-    """The tick box's value as a hashable key: "fut", "settle",
-    "fut,settle" or "" (nothing ticked). None (no tick box) = the default."""
+    """The tick box's value as a hashable key: "fut" (ticked) or "" (not).
+    None (no tick box) = the default. Anything else in it (an old "settle"
+    still saved in the browser) is ignored."""
     if value is None:
         value = PX_DEFAULT
-    return ",".join(k for k in (PX_FUT, PX_SETTLE) if k in value)
+    return PX_FUT if PX_FUT in value else ""
 
 
-def _px_keys(show: str) -> list:
-    return [k for k in (show or "").split(",") if k]
-
-
-def px_inside(show: str, fut=None, settle=None) -> str:
-    """What goes in the brackets: "4.10", "4.10*", "4.10 / 5.12", "- / 5.12"
-    or "" (nothing known). fut = (spread, last_traded) or None."""
-    parts = []
-    for k in _px_keys(show):
-        if k == PX_FUT:
-            ok = fut is not None and fut[0] is not None and not pd.isna(fut[0])
-            parts.append(f"{fut[0]:.2f}" + ("*" if fut[1] else "") if ok else None)
-        elif k == PX_SETTLE:
-            ok = settle is not None and not pd.isna(settle)
-            parts.append(f"{settle:.2f}" if ok else None)
-    if not any(parts):
-        return ""
-    return " / ".join(p or "-" for p in parts)
-
-
-def px_text(price, show: str, fut=None, settle=None) -> str:
-    """ "4.63 (4.10)" - auction price, then the tick box's pick in brackets."""
+def px_text(price, show: str, fut=None) -> str:
+    """ "4.63 (4.10)" - auction price, futures spread in brackets ("4.10*" =
+    last traded); just "4.63" when unticked or unknown. fut = (spread,
+    last_traded) or None."""
     if price is None or pd.isna(price):
         return ""
-    inside = px_inside(show, fut, settle)
-    return f"{price:.2f} ({inside})" if inside else f"{price:.2f}"
+    if show != PX_FUT or fut is None or fut[0] is None or pd.isna(fut[0]):
+        return f"{price:.2f}"
+    return f"{price:.2f} ({fut[0]:.2f}{'*' if fut[1] else ''})"
 
 
 def px_head(show: str) -> str:
-    """ "(futures spread)", "(settle)", "(futures spread / settle)" or ""."""
-    names = {PX_FUT: "futures spread", PX_SETTLE: "settle"}
-    keys = _px_keys(show)
-    return f"({' / '.join(names[k] for k in keys)})" if keys else ""
+    """ "(futures spread)" or ""."""
+    return "(futures spread)" if show == PX_FUT else ""
 
 
 def px_label(prefix: str, show: str, unit: str = ", EUR/MW") -> str:
@@ -1180,16 +1039,7 @@ def px_label(prefix: str, show: str, unit: str = ", EUR/MW") -> str:
 
 
 def px_note(show: str) -> str:
-    keys = _px_keys(show)
-    settle_text = SETTLE_NOTE.split("= settle: ", 1)[-1]
-    if keys == [PX_FUT]:
-        return "(...) = " + FUT_NOTE
-    if keys == [PX_SETTLE]:
-        return SETTLE_NOTE
-    if keys:
-        return ("(futures spread / settle). " + FUT_NOTE[0].upper() + FUT_NOTE[1:]
-                + " Settle: " + settle_text)
-    return ""
+    return "(...) = " + FUT_NOTE if show == PX_FUT else ""
 
 
 def px_notes(show: str) -> list:
@@ -1207,16 +1057,15 @@ def bracket_picker():
 
 
 def _auction_price_details(identifications, show: str = PX_FUT) -> dict:
-    """{auction: (price, note, settle, fut)} from auction_results (EUR/MW),
-    the day-ahead prices (settle, see SETTLE_NOTE) and the EEX futures (fut =
-    (spread, last_traded), see FUT_NOTE). Settle / fut are only worked out
-    when the tick box shows them (`show`, see px_show()), else None. price
-    is None when there is no single price: no result published yet (note
-    "no result yet"), or a bundled CEEXD auction, which has one price per
-    border (note lists the borders that got capacity, with their brackets:
-    "CZ-DE(50Hz) 1.38 (0.90) · DE(50Hz)-CZ 5.15 (6.02)"). A peak auction
-    gets the note "peak" and a peak-hours settle / peak futures."""
-    want = _px_keys(show)
+    """{auction: (price, note, fut)} from auction_results (EUR/MW) and the
+    EEX futures (fut = (spread, last_traded), see FUT_NOTE - only worked out
+    when the tick box is on, else None). price is None when there is no
+    single price: no result published yet (note "no result yet"), or a
+    bundled CEEXD auction, which has one price per border (note lists the
+    borders that got capacity, with their brackets: "CZ-DE(50Hz) 1.38
+    (0.90) · DE(50Hz)-CZ 5.15 (6.02)"). A peak auction gets the note "peak"
+    and the peak futures."""
+    want = show == PX_FUT
     ids = list(dict.fromkeys(identifications))
     rows, periods = [], {}
     conn = _connect()
@@ -1243,44 +1092,39 @@ def _auction_price_details(identifications, show: str = PX_FUT) -> dict:
         results = by_auction.get(ident)
         corridor, start, stop, horizon, gate = periods.get(ident, (None,) * 5)
         if not results:
-            out[ident] = (None, "no result yet", None, None)
+            out[ident] = (None, "no result yet", None)
             continue
         peak = any("PEAK" in r[1].upper() for r in results)
 
-        def brackets(code):
-            return (settle_for(code, start, stop, peak) if PX_SETTLE in want else None,
-                    futures_spread_for(code, horizon, start, stop, gate, peak)
-                    if PX_FUT in want else None)
+        def bracket(code):
+            return futures_spread_for(code, horizon, start, stop, gate, peak) if want else None
 
-        notes, settle, fut = [], None, None
+        notes, fut = [], None
         if len(results) == 1:
             price = results[0][3]
             if price is None:
                 notes.append("no result yet")
             elif corridor:
-                settle, fut = brackets(corridor)
+                fut = bracket(corridor)
         else:
             price = None
-            parts = []
-            for c, _, a, p in results:
-                if p is not None and (a or 0) > 0:
-                    s, f = brackets(c)
-                    parts.append(f"{display_code(c)} {px_text(p, show, f, s)}")
+            parts = [f"{display_code(c)} {px_text(p, show, bracket(c))}"
+                     for c, _, a, p in results if p is not None and (a or 0) > 0]
             notes.append(" · ".join(parts) if parts else "all borders 0.00")
         if peak:
             notes.append("peak")
-        out[ident] = (price, ", ".join(notes), settle, fut)
+        out[ident] = (price, ", ".join(notes), fut)
     return out
 
 
 def _auction_price_texts(identifications: tuple, show: str = PX_FUT) -> dict:
     """{auction: its price as text} for the Buyer lookup map table:
-    "12.34 (10.50)" (tick box's pick in brackets), "12.34 (10.50) peak",
+    "12.34 (10.50)" (futures spread in brackets), "12.34 (10.50) peak",
     the CEEXD border list, or "-" (no result yet)."""
     out = {}
-    for ident, (price, note_, settle, fut) in _auction_price_details(identifications, show).items():
+    for ident, (price, note_, fut) in _auction_price_details(identifications, show).items():
         if price is not None:
-            out[ident] = px_text(price, show, fut, settle) + (" peak" if note_ == "peak" else "")
+            out[ident] = px_text(price, show, fut) + (" peak" if note_ == "peak" else "")
         elif note_ == "no result yet":
             out[ident] = "-"
         else:
@@ -1394,7 +1238,7 @@ def load_auction_calendar(first_day: str, show: str = "fut") -> pd.DataFrame:
         conn, params=params + (since.strftime("%Y-%m-%dT%H:%M"),))
     conn.close()
     cols = ["closes", "opens", "horizon_name", "delivery", "corridors", "cancelled",
-            "prices", "price_notes", "settles", "futs"]
+            "prices", "price_notes", "futs"]
     if df.empty:
         return pd.DataFrame(columns=cols)
     df["closes"] = pd.to_datetime(df["bid_gate_closure"], utc=True).dt.tz_convert("CET")
@@ -1409,13 +1253,12 @@ def load_auction_calendar(first_day: str, show: str = "fut") -> pd.DataFrame:
     details = _auction_price_details(tuple(df["identification"]), show)
     df["price"] = [details[i][0] for i in df["identification"]]
     df["price_note"] = [details[i][1] for i in df["identification"]]
-    df["settle"] = [details[i][2] for i in df["identification"]]
-    df["fut"] = [details[i][3] for i in df["identification"]]
+    df["fut"] = [details[i][2] for i in df["identification"]]
     out = (df.groupby(["closes", "opens", "horizon_name", "delivery", "dstart"], dropna=False)
              .agg(corridors=("corridor_code", list),
                   cancelled=("cancel_code", lambda s: [c for c in s if isinstance(c, str)]),
                   prices=("price", list), price_notes=("price_note", list),
-                  settles=("settle", list), futs=("fut", list))
+                  futs=("fut", list))
              .reset_index())
     rank = {t: i for i, t in enumerate(TENOR_ORDER)}
     out["_t"] = out["horizon_name"].map(rank).fillna(len(rank))
@@ -1738,15 +1581,14 @@ def _calendar_price_cell(r, now: pd.Timestamp, show: str = "fut") -> str:
         return ""
     esc = html_escape
     parts = []
-    for code, price, note, settle, fut in zip(r.corridors, r.prices, r.price_notes, r.settles,
-                                              r.futs):
+    for code, price, note, fut in zip(r.corridors, r.prices, r.price_notes, r.futs):
         if code in r.cancelled:
             continue
         peak = " peak" if "peak" in (note or "") else ""
         if price is not None and not pd.isna(price):
-            # Brackets: the tick box's pick (Peter, 2026-10-26).
+            # Futures spread in brackets (Peter, 2026-10-26/27).
             parts.append(f'<span class="code pc">{esc(code)}</span> '
-                         f'{esc(px_text(price, show, fut, settle))}{peak}')
+                         f'{esc(px_text(price, show, fut))}{peak}')
         elif note and not note.startswith("no result"):
             parts.append(f'<span class="code pc">{esc(code)}</span> {esc(note)}')
     if parts:
@@ -1767,7 +1609,7 @@ def render_calendar_html(cal: pd.DataFrame, now: pd.Timestamp, show: str = "fut"
     today = now.normalize()
     out = ['<table class="cal"><thead><tr><th>Closes</th><th>Opens</th><th>Tenor</th>'
            '<th>Delivery</th><th>Corridors</th><th>Status</th>'
-           '<th>Auction price (settle), EUR/MW</th></tr></thead><tbody>']
+           f'<th>{esc(px_label("Auction price", show))}</th></tr></thead><tbody>']
     anchored = False
     for day, rows in cal.groupby(cal["closes"].dt.normalize(), sort=True):
         cls = ["day"]
@@ -2259,27 +2101,22 @@ def corridor_explorer(corridor, horizon, product, tab, px_value=None):
         else pd.DataFrame()
     )
 
-    # In brackets next to every auction price: futures spread and/or settle,
-    # as the tick box says (Peter, 2026-10-26) - see FUT_NOTE / SETTLE_NOTE.
+    # Futures spread in brackets next to every auction price, when the tick
+    # box is on (Peter, 2026-10-26/27) - see FUT_NOTE.
     peak = "PEAK" in str(product).upper()
     show = px_show(px_value)
-    want = _px_keys(show)
 
     def add_brackets(frame, code):
         if frame.empty:
             return frame
         frame = frame.copy()
         spans = list(zip(frame["raw_start"], frame["raw_stop"], frame["gate"]))
-        settles = [settle_for(code, a, b, peak) if PX_SETTLE in want else None
-                   for a, b, _ in spans]
-        futs = [futures_spread_for(code, horizon, a, b, g, peak) if PX_FUT in want else None
+        futs = [futures_spread_for(code, horizon, a, b, g, peak) if show else None
                 for a, b, g in spans]
-        frame["settle"] = np.array([np.nan if v is None else v for v in settles], dtype=float)
         frame["fut"] = np.array([np.nan if f is None else f[0] for f in futs], dtype=float)
         frame["fut_last"] = np.array([np.nan if f is None else float(f[1]) for f in futs],
                                      dtype=float)
-        frame["price_text"] = [px_text(p, show, f, st)
-                               for p, f, st in zip(frame["auction_price"], futs, settles)]
+        frame["price_text"] = [px_text(p, show, f) for p, f in zip(frame["auction_price"], futs)]
         return frame
 
     df = add_brackets(df, corridor)
@@ -2295,13 +2132,13 @@ def corridor_explorer(corridor, horizon, product, tab, px_value=None):
 
     def price_pivot(frame):
         prices = render_monthly_pivot(frame, "auction_price")
-        settles, futs, lasts = (monthly(frame, c) for c in ("settle", "fut", "fut_last"))
+        futs, lasts = monthly(frame, "fut"), monthly(frame, "fut_last")
         out = prices.copy().astype(object)
         for r in prices.index:
             for c in prices.columns:
                 f = cell(futs, r, c)
                 fut = None if pd.isna(f) else (f, cell(lasts, r, c) > 0)
-                out.at[r, c] = px_text(prices.at[r, c], show, fut, cell(settles, r, c)) or "-"
+                out.at[r, c] = px_text(prices.at[r, c], show, fut) or "-"
         return out
 
     price_name = px_label("Price", show)
@@ -2478,9 +2315,9 @@ def buyer_lookup(buyer, tab, px_value=None):
                "auction_closed": "Auction closed (UTC)"},
         tooltips={"auction_closed": "When bidding actually closed and the auction cleared - "
                                     "not the delivery period.",
-                  "price": "The auction's clearing price; in brackets what the tick box "
-                           "picks (futures spread / settle). A bundled CEEXD auction has one "
-                           "price per border - see Price note."}))
+                  "price": "The auction's clearing price; in brackets the futures spread "
+                           "(tick box). A bundled CEEXD auction has one price per border - "
+                           "see Price note."}))
     body += px_notes(show)
     return buyers, buyer, body
 

@@ -227,8 +227,6 @@ def _load_jao_tabs():
 
 
 jd = _load_jao_tabs()
-if jd is not None:
-    jd.ENTSOE_DB_PATH = DB_PATH   # settle next to JAO auction prices (see jao_dash.SETTLE_NOTE)
 
 # A handful of this project's ENTSO-E zone codes don't match JAO's own
 # corridor-code country tokens directly -- confirmed against JAO's real
@@ -1087,22 +1085,17 @@ def load_jao_monthly_futures(corridor: str) -> tuple[pd.DataFrame, pd.DataFrame]
     return _jao_month_pivot(df, "fut"), _jao_month_pivot(df, "fut_last", "max")
 
 
-# ---- what goes in brackets after a JAO auction price (Peter, 2026-10-26: tick
-# box, "default is spread future contracts"); same keys as jao_dash.px_show().
+# ---- futures spread in brackets after a JAO auction price, tick box on / off
+# (Peter, 2026-10-26: "default is spread future contracts"; 2026-10-27 the
+# settle option taken out again). Same key as jao_dash.px_show(): "fut" / "".
 def _px_show(value) -> str:
     if value is None:
         value = ["fut"]
-    return ",".join(k for k in ("fut", "settle") if k in value)
-
-
-def _px_keys(show: str) -> list:
-    return [k for k in (show or "").split(",") if k]
+    return "fut" if "fut" in value else ""
 
 
 def _px_head(show: str) -> str:
-    names = {"fut": "futures spread", "settle": "settle"}
-    keys = _px_keys(show)
-    return f" ({' / '.join(names[k] for k in keys)})" if keys else ""
+    return " (futures spread)" if show == "fut" else ""
 
 
 def _paren_parts(values) -> str:
@@ -1839,24 +1832,17 @@ def hours_below_view(zone, resolution, threshold, label=None):
     return title, pivot_model(pivot, resolution, fmt="%d"), None
 
 
-def jao_corridor_view(corridor, label, settle_pivot=None, show="fut"):
+def jao_corridor_view(corridor, label, show="fut"):
     """JAO Monthly auction price for one direction. Always Monthly. The
-    settle (that direction's capture value, the same months) in brackets
-    next to each price (Peter, 2026-10-26: "whenever auction price is
-    shown, put settlement price in parentis next to it"). Now the tick box
-    decides: futures spread (default) and/or settle (Peter, 2026-10-26)."""
+    futures spread of each auction in brackets when the tick box is on
+    (Peter, 2026-10-26/27 - see jao_dash.FUT_NOTE)."""
     title = f"{label}  —  JAO auction price{_px_head(show)}, EUR/MW"
     if corridor is None:
         return title, None, "No matching JAO corridor for this pair/direction."
     pivot = load_jao_monthly_price(corridor)
     if pivot.empty:
         return title, None, f"No Monthly JAO auctions saved for {corridor} yet."
-    parens = []
-    for key in _px_keys(show):
-        if key == "fut":
-            parens.append(load_jao_monthly_futures(corridor))
-        else:
-            parens.append((settle_pivot, None))
+    parens = [load_jao_monthly_futures(corridor)] if show == "fut" else []
     return title, pivot_model(pivot, "Monthly", parens=parens), None
 
 
@@ -1889,8 +1875,8 @@ def year_comparison_views(country_1: str, country_2: str, resolution: str,
     row_2 = [
         capture_view(zone_1, zone_2, resolution, positive=True, label1=country_1, label2=country_2),
         capture_view(zone_1, zone_2, resolution, positive=False, label1=country_1, label2=country_2),
-        jao_corridor_view(corridor_2_1, label_2_1, capture_positive, show),
-        jao_corridor_view(corridor_1_2, label_1_2, capture_negative, show),
+        jao_corridor_view(corridor_2_1, label_2_1, show),
+        jao_corridor_view(corridor_1_2, label_1_2, show),
     ]
     row_3 = [
         country_view(zone_1, resolution, peak=True, label=country_1),
@@ -2095,25 +2081,22 @@ def corridor_margins_view(
     # Auction price view: the Settle of the same cell in brackets (Peter,
     # 2026-10-26: "whenever auction price is shown, put settlement price in
     # parentis next to it"). Only where there is an auction price.
-    # 2026-10-26 later: a tick box picks what goes in the brackets - futures
-    # spread (default) and/or Settle. parens = [(values, last-traded flags)].
+    # Auction price view: the futures spread of each auction in brackets when
+    # the tick box is on (Peter, 2026-10-26; the settle that was here first
+    # was taken out 2026-10-27). parens = [(values, last-traded flags)].
     parens = None
     if view == "Auction price":
         parens = []
-        for key in _px_keys(show):
-            if key == "fut":
-                values, flags = load_corridor_futures(year, tenor)
-            else:
-                values, flags = settle, None
+        if show == "fut":
+            values, flags = load_corridor_futures(year, tenor)
             values = values.reindex(index=auction.index, columns=range(1, 13)).astype(float)
             values.columns = CORRIDOR_MONTH_LABELS
             values = values.where(table[CORRIDOR_MONTH_LABELS].notna())
             values["Year"] = values.mean(axis=1, skipna=True).round(2)
-            if flags is not None:
-                flags = flags.reindex(index=auction.index, columns=range(1, 13)).astype(float)
-                flags.columns = CORRIDOR_MONTH_LABELS
-                flags = flags.where(values[CORRIDOR_MONTH_LABELS].notna())
-                flags["Year"] = flags.max(axis=1, skipna=True)
+            flags = flags.reindex(index=auction.index, columns=range(1, 13)).astype(float)
+            flags.columns = CORRIDOR_MONTH_LABELS
+            flags = flags.where(values[CORRIDOR_MONTH_LABELS].notna())
+            flags["Year"] = flags.max(axis=1, skipna=True)
             parens.append((values, flags))
 
     held = None
@@ -2335,11 +2318,11 @@ CM_CAPTION = (
     "months). Settle = what the corridor's direction settled at "
     "day-ahead (hours the importing side was pricier, averaged over all "
     "hours of the month). Margin = Settle minus Auction price. The "
-    "current month's Settle is month-to-date. Auction price view: in "
-    "brackets what the tick box picks - the futures spread (EEX futures of "
-    "the importing minus the exporting country, same product, settlement on "
-    "the day the auction closed; * = last traded price, EEX settlements only "
-    "from Aug 2026) and/or the Settle of the same cell: \"4.63 (4.10 / 5.12)\". "
+    "current month's Settle is month-to-date. Auction price view: the "
+    "futures spread in brackets (tick box): EEX futures of the importing "
+    "minus the exporting country, same product, settlement on the day the "
+    "auction closed; * = last traded price, EEX settlements only from Aug "
+    "2026: \"4.63 (4.10)\". "
     "Pick a Winner to put a "
     "fat line around every corridor/month where they won capacity of "
     "that tenor."
@@ -2512,7 +2495,7 @@ def serve_layout():
         ]),
         # What goes in brackets after every JAO auction price (Peter, 2026-10-26).
         (jd.bracket_picker() if jd is not None else
-         dcc.Checklist(id="px-show", options=[], value=["settle"], style={"display": "none"})),
+         dcc.Checklist(id="px-show", options=[], value=[], style={"display": "none"})),
         tab_yc, tab_hb, tab_cm, tab_mv, tab_ov,
         *(jd.panels(first_visible=False) if jao_ok else []),
         # Description, JAO note and "Update database" at the bottom of the
@@ -2659,7 +2642,7 @@ def render_year_comparison(active, country_1, country_2, resolution, px_value=No
     show = _px_show(px_value)
     rows = year_comparison_views(country_1, country_2, resolution, show)
     body = '<hr class="yc-rule">'.join(tables_row(row) for row in rows)
-    if "fut" in _px_keys(show) and jd is not None:
+    if show == "fut" and jd is not None:
         body = caption_box("JAO auction price tables, in brackets: " + jd.FUT_NOTE) + body
     return body
 
@@ -2897,8 +2880,6 @@ def main():
 
     if args.db:
         DB_PATH = find_db(args.db)
-        if jd is not None:
-            jd.ENTSOE_DB_PATH = DB_PATH
     if args.jao_db:
         JAO_DB_FILE = Path(args.jao_db).expanduser().resolve()
         if jd is not None:
