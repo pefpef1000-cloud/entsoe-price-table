@@ -362,43 +362,70 @@ def _flow_arrow(lat_c, lon_c, ux, uy, half_len, head_len, side, n_parts=1):
     return parts, head
 
 
+# The CEEXD bundle split into its real borders (Peter, 2026-10-27: "i see no
+# PL in our corridor explorer"). "CEEXD" is ONE JAO auction that sells 8
+# borders at once - CZ-DE(50Hz), DE(50Hz)-CZ, PL-CZ, CZ-PL, PL-DE(50Hz),
+# DE(50Hz)-PL, PL-SK, SK-PL - each with its own result row and price, and the
+# PL borders are ONLY sold that way. So the Corridor explorer lists those
+# borders instead of "CEEXD". A border with nothing on offer that month
+# (offered and allocated 0) still gets a 0.00 result row: that is "no
+# auction", not a free one, so it is left out (same idea as the Corridor
+# margins tab). JAO called two of them "PL-DE" / "DE-PL" Jun-Nov 2022.
+CEEXD = "CEEXD"
+CEEXD_BORDER_SQL = ("CASE r.corridor_code WHEN 'PL-DE' THEN 'PL-DE(50Hz)' "
+                    "WHEN 'DE-PL' THEN 'DE(50Hz)-PL' ELSE r.corridor_code END")
+CEEXD_OFFERED_SQL = "(COALESCE(r.offered_capacity, 0) > 0 OR COALESCE(r.allocated_capacity, 0) > 0)"
+# Rows of `corridor`: its own auctions, or its border inside the CEEXD bundle.
+CORRIDOR_MATCH_SQL = (f"(a.corridor_code = ? OR (a.corridor_code = '{CEEXD}' "
+                      f"AND {CEEXD_BORDER_SQL} = ? AND {CEEXD_OFFERED_SQL}))")
+
+
 @cached
 def load_corridors() -> list[str]:
+    """Corridor explorer's list: every corridor code JAO auctions, with
+    "CEEXD" replaced by its borders that ever had capacity on offer."""
     frag, params = _horizon_exclusion()
+    efrag, _ = _horizon_exclusion("a.horizon_name")
     conn = _connect()
     rows = conn.execute(
-        f"SELECT DISTINCT corridor_code FROM auctions WHERE {frag} ORDER BY corridor_code",
-        params,
+        f"SELECT DISTINCT corridor_code FROM auctions WHERE {frag} AND corridor_code <> ? "
+        f"UNION SELECT DISTINCT {CEEXD_BORDER_SQL} FROM auction_results r "
+        "JOIN auctions a ON a.identification = r.identification "
+        f"WHERE a.corridor_code = ? AND {efrag} AND {CEEXD_OFFERED_SQL}",
+        (*params, CEEXD, CEEXD, *params),
     ).fetchall()
     conn.close()
-    return [r[0] for r in rows]
+    return sorted(r[0] for r in rows)
 
 
 @cached
 def load_horizons(corridor: str) -> list[str]:
-    frag, params = _horizon_exclusion()
+    frag, params = _horizon_exclusion("a.horizon_name")
     conn = _connect()
     rows = conn.execute(
-        f"SELECT DISTINCT horizon_name FROM auctions WHERE corridor_code = ? AND {frag} "
-        "ORDER BY horizon_name",
-        (corridor, *params),
+        f"SELECT DISTINCT a.horizon_name FROM auctions a WHERE a.corridor_code = ? AND {frag} "
+        f"UNION SELECT DISTINCT a.horizon_name FROM auction_results r "
+        "JOIN auctions a ON a.identification = r.identification "
+        f"WHERE a.corridor_code = ? AND {CEEXD_BORDER_SQL} = ? AND {CEEXD_OFFERED_SQL} "
+        f"AND {frag}",
+        (corridor, *params, CEEXD, corridor, *params),
     ).fetchall()
     conn.close()
-    return [r[0] for r in rows]
+    return sorted(r[0] for r in rows)
 
 
 @cached
 def load_products(corridor: str, horizon: str) -> list[str]:
     conn = _connect()
     rows = conn.execute(
-        """
+        f"""
         SELECT DISTINCT r.product_identification
         FROM auction_results r
         JOIN auctions a ON a.identification = r.identification
-        WHERE a.corridor_code = ? AND a.horizon_name = ?
+        WHERE {CORRIDOR_MATCH_SQL} AND a.horizon_name = ?
         ORDER BY r.product_identification
         """,
-        (corridor, horizon),
+        (corridor, corridor, horizon),
     ).fetchall()
     conn.close()
     return [r[0] for r in rows]
@@ -1438,10 +1465,11 @@ def load_top_buyers(scope: str, value: str | None) -> pd.DataFrame:
 @cached
 def load_series(corridor: str, horizon: str, product: str) -> pd.DataFrame:
     """Every auction for this corridor+horizon+product, oldest first. Period
-    shifted +1 day (market_period_start is stored one day early)."""
+    shifted +1 day (market_period_start is stored one day early). A CEEXD
+    border (see CORRIDOR_MATCH_SQL): its own rows of the bundle."""
     conn = _connect()
     df = pd.read_sql_query(
-        """
+        f"""
         SELECT
             a.market_period_start,
             a.market_period_start AS raw_start,
@@ -1455,11 +1483,11 @@ def load_series(corridor: str, horizon: str, product: str) -> pd.DataFrame:
             r.auction_price
         FROM auction_results r
         JOIN auctions a ON a.identification = r.identification
-        WHERE a.corridor_code = ? AND a.horizon_name = ? AND r.product_identification = ?
+        WHERE {CORRIDOR_MATCH_SQL} AND a.horizon_name = ? AND r.product_identification = ?
         ORDER BY a.market_period_start ASC
         """,
         conn,
-        params=(corridor, horizon, product),
+        params=(corridor, corridor, horizon, product),
     )
     conn.close()
     if df.empty:
